@@ -18,7 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use notify::{RecursiveMode, Watcher};
@@ -318,12 +319,28 @@ pub fn run(session: Session) -> Result<()> {
     let mut terminal = ratatui::init();
     // Mouse capture and bracketed paste are best-effort: the UI is usable
     // without them, but they make navigation and pasting comments pleasant.
+    // Bracketed paste in particular is what keeps a multi-line paste from
+    // triggering the composer's Enter-to-save (it arrives as one Paste event).
     let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
+    // The Kitty keyboard protocol lets the terminal disambiguate Shift+Enter
+    // from a bare Enter, so the composer can bind one to newline and the other
+    // to save. Only push it where supported; elsewhere Alt+Enter is the newline
+    // fallback. Remember whether we pushed, so teardown pops exactly what we set.
+    let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if enhanced {
+        let _ = execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     let result = app.event_loop(
         &mut terminal,
         updates,
         control.as_ref().map(|c| &c.requests),
     );
+    if enhanced {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(
         std::io::stdout(),
         DisableBracketedPaste,
@@ -1593,9 +1610,38 @@ impl App {
                     compose.confirming_discard = true;
                 }
             }
-            KeyCode::Char('s') if ctrl => self.submit_compose(),
-            _ if ctrl => {} // ignore other control combos
+            // Enter saves the comment; a newline needs a modifier — Shift+Enter
+            // where the terminal reports it (Kitty protocol), else Alt+Enter.
+            KeyCode::Enter if mods.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+                compose.area.on_key(KeyCode::Enter);
+            }
+            KeyCode::Enter => self.submit_compose(),
+            // Ctrl combos (including the app's Ctrl-S submit) do nothing here —
+            // the composer saves with Enter, and submit is a whole-review action.
+            _ if ctrl => {}
             _ => compose.area.on_key(code),
+        }
+    }
+
+    /// What the composer's Enter will save, phrased for the current context: a
+    /// plain review has no local/draft split ("save comment"); on a pull request
+    /// the word tracks the resulting kind — "save draft" (queued for submit) or
+    /// "save note" (kept local).
+    fn compose_save_label(&self) -> &'static str {
+        if self.pr.is_none() {
+            return "save comment";
+        }
+        let Some(compose) = self.input.as_ref() else {
+            return "save";
+        };
+        let kind = match &compose.kind {
+            ComposeKind::New(_) => self.human_new_kind(),
+            ComposeKind::Reply(id) => self.reply_kind(id),
+        };
+        if kind == CommentKind::Draft {
+            "save draft"
+        } else {
+            "save note"
         }
     }
 
@@ -3997,7 +4043,10 @@ impl App {
             )
         } else {
             TextSpan::styled(
-                "Enter newline · Ctrl-S submit · Esc cancel",
+                format!(
+                    "Enter {} · Shift/Alt+Enter newline · Esc cancel",
+                    self.compose_save_label()
+                ),
                 Style::default().fg(Color::DarkGray),
             )
         };
@@ -6353,6 +6402,65 @@ mod tests {
         );
         let (_, _, _, foreign) = solo.draft_summary();
         assert!(!foreign, "only the human's own drafts — no warning");
+    }
+
+    #[test]
+    fn composer_enter_saves_and_modified_enter_makes_a_newline() {
+        let mut app = sample_app();
+        app.mode = Mode::Unified;
+        app.cursor = 1; // a content line, not the file header
+        app.start_compose();
+        assert!(app.input.is_some(), "the composer opened");
+
+        app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        // Shift+Enter (Kitty protocol) inserts a newline and keeps composing.
+        app.on_key(KeyCode::Enter, KeyModifiers::SHIFT);
+        app.on_key(KeyCode::Char('b'), KeyModifiers::NONE);
+        assert!(app.input.is_some(), "Shift+Enter is a newline, not save");
+        // Alt+Enter is the fallback newline for terminals without the protocol.
+        app.on_key(KeyCode::Enter, KeyModifiers::ALT);
+        app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(app.input.is_some(), "Alt+Enter is a newline, not save");
+        // A bare Enter saves the comment and closes the composer.
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.input.is_none(), "Enter saves and closes the composer");
+
+        let body = app
+            .review
+            .threads
+            .last()
+            .unwrap()
+            .root()
+            .unwrap()
+            .body
+            .clone();
+        assert_eq!(body, "a\nb\nc", "the saved comment kept both newlines");
+    }
+
+    #[test]
+    fn composer_save_label_tracks_context() {
+        // A plain review has no local/draft split.
+        let mut plain = sample_app();
+        plain.cursor = 1;
+        plain.start_compose();
+        assert_eq!(plain.compose_save_label(), "save comment");
+
+        // On a pull request, a new comment is a draft (queued for submit).
+        let mut pr = pr_app();
+        pr.cursor = 1;
+        pr.start_compose();
+        assert_eq!(pr.compose_save_label(), "save draft");
+
+        // A reply under a local note stays a note, even on a pull request.
+        let mut reply = pr_app();
+        reply.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "agent",
+            "note",
+            CommentKind::Local,
+        );
+        reply.open_reply(0);
+        assert_eq!(reply.compose_save_label(), "save note");
     }
 
     #[test]
