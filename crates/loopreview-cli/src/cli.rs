@@ -325,11 +325,21 @@ pub enum CommentAction {
         json: bool,
     },
     /// Withdraw a draft comment or thread (drafts only; never published).
+    #[command(group(
+        clap::ArgGroup::new("rm_target")
+            .required(true)
+            .args(["comment", "thread"]),
+    ))]
     Rm {
         #[command(flatten)]
         target: Target,
-        /// A comment id (removes that draft) or a thread id (removes the thread).
-        id: String,
+        /// The comment to withdraw (a comment id; its thread goes too if it
+        /// empties).
+        #[arg(long)]
+        comment: Option<String>,
+        /// The thread to withdraw (a thread id; removes the whole draft thread).
+        #[arg(long)]
+        thread: Option<String>,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
@@ -599,5 +609,45 @@ mod tests {
             },
             _ => panic!("expected a session dispatch"),
         }
+    }
+
+    #[test]
+    fn session_comment_rm_parses_a_named_target() {
+        // Regression: the target must be named. A positional id sat after
+        // Target's optional positional `session`, which clap rejects (a
+        // non-required positional before a required one) — a parse-time panic.
+        let rm = |args: &[&str]| {
+            let mut full = vec!["lr", "session", "comment", "rm"];
+            full.extend_from_slice(args);
+            match Cli::parse_from(full).dispatch() {
+                Dispatch::Session(a) => match a.verb {
+                    SessionVerb::Comment {
+                        action:
+                            CommentAction::Rm {
+                                comment, thread, ..
+                            },
+                    } => (comment, thread),
+                    other => panic!("expected comment rm, got {other:?}"),
+                },
+                _ => panic!("expected a session dispatch"),
+            }
+        };
+        assert_eq!(rm(&["--comment", "c1"]), (Some("c1".to_string()), None));
+        assert_eq!(rm(&["--thread", "t1"]), (None, Some("t1".to_string())));
+        // Exactly one target is required.
+        assert!(Cli::try_parse_from(["lr", "session", "comment", "rm"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "lr",
+                "session",
+                "comment",
+                "rm",
+                "--comment",
+                "c",
+                "--thread",
+                "t",
+            ])
+            .is_err()
+        );
     }
 }

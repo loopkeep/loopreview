@@ -287,7 +287,15 @@ fn comment(action: CommentAction) -> Result<()> {
                 Ok(())
             }
         }
-        CommentAction::Rm { target, id, json } => {
+        CommentAction::Rm {
+            target,
+            comment,
+            thread,
+            json,
+        } => {
+            // Clap's arg group guarantees exactly one of comment/thread; either
+            // id resolves to its comment or thread on the server side.
+            let id = comment.or(thread).unwrap_or_default();
             let request = Request::CommentRm(protocol::CommentRm { id });
             let Reply::Removed(result) = call(&target, request)? else {
                 bail!("unexpected reply");
