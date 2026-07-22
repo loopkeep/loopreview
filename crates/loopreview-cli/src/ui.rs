@@ -4858,6 +4858,7 @@ impl App {
     fn file_row_spans(
         &self,
         entry: &FileEntry,
+        label: &str,
         width: usize,
         base: Style,
         matched: &[u32],
@@ -4883,8 +4884,8 @@ impl App {
         }
         right_aligned_row(
             left,
-            &entry.path,
-            |shown| path_highlight_spans(shown, &entry.path, matched, base.fg(Color::Gray)),
+            label,
+            |shown| path_highlight_spans(shown, label, matched, base.fg(Color::Gray)),
             right,
             width,
             base,
@@ -4899,6 +4900,11 @@ impl App {
             return;
         }
         let entries = self.file_entries();
+        // Group by directory: the first file in each directory shows its full
+        // path; a run of files sharing that directory shows an indented basename,
+        // so the list reads as a shallow tree without separate header rows (which
+        // would break the file-indexed cursor and scroll).
+        let labels = grouped_labels(&entries);
         let width = area.width as usize;
         let height = area.height as usize;
         let current = self.current_file();
@@ -4912,7 +4918,9 @@ impl App {
         // the body — the sidebar's resting cursor (a faint fill + a dim bar).
         let lines: Vec<TextLine> = entries[start..end]
             .iter()
-            .map(|e| {
+            .enumerate()
+            .map(|(k, e)| {
+                let label = &labels[start + k];
                 let is_sel = e.index == self.sidebar_cursor;
                 let is_current = e.index == current;
                 let (base, marker, marker_fg) = if sidebar_focused && is_sel {
@@ -4936,7 +4944,7 @@ impl App {
                     marker.to_string(),
                     base.fg(marker_fg).add_modifier(Modifier::BOLD),
                 )];
-                spans.extend(self.file_row_spans(e, width.saturating_sub(1), base, &[]));
+                spans.extend(self.file_row_spans(e, label, width.saturating_sub(1), base, &[]));
                 TextLine::from(spans)
             })
             .collect();
@@ -5061,9 +5069,14 @@ impl App {
                 Style::default().bg(Color::Rgb(20, 22, 28))
             };
             if let Some(entry) = entries.get(*file) {
-                lines.push(TextLine::from(
-                    self.file_row_spans(entry, width, base, indices),
-                ));
+                // The finder shows full paths (they carry the fuzzy-match spans).
+                lines.push(TextLine::from(self.file_row_spans(
+                    entry,
+                    &entry.path,
+                    width,
+                    base,
+                    indices,
+                )));
             }
         }
         if finder.matches.is_empty() {
@@ -5481,6 +5494,33 @@ fn status_color(status: loopreview_core::ChangeStatus) -> Color {
         Modified => Color::Yellow,
         Renamed | Copied => Color::Magenta,
     }
+}
+
+/// The directory portion of a path (through the last `/`), or `""` at the root.
+fn dir_of(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(i) => &path[..=i],
+        None => "",
+    }
+}
+
+/// The sidebar label for each file, grouping by directory: the first file in a
+/// directory keeps its full path; a following file in the same directory shows
+/// its basename indented, so a run reads as one group. Index-aligned to
+/// `entries`.
+fn grouped_labels(entries: &[FileEntry]) -> Vec<String> {
+    let mut labels = Vec::with_capacity(entries.len());
+    let mut prev_dir = "";
+    for entry in entries {
+        let dir = dir_of(&entry.path);
+        if !dir.is_empty() && dir == prev_dir {
+            labels.push(format!("  {}", &entry.path[dir.len()..]));
+        } else {
+            labels.push(entry.path.clone());
+        }
+        prev_dir = dir;
+    }
+    labels
 }
 
 /// The one-character status marker for a file's change kind (`A`/`D`/`M`/`R`/`C`).
@@ -8503,6 +8543,32 @@ mod tests {
         assert_eq!(app.sidebar_width(200), Some(SIDEBAR_MAX));
         app.sidebar_width_cfg = Some(1);
         assert_eq!(app.sidebar_width(200), Some(SIDEBAR_MIN));
+    }
+
+    #[test]
+    fn grouped_labels_indent_runs_within_a_directory() {
+        let mk = |i: usize, p: &str| FileEntry {
+            index: i,
+            path: p.into(),
+            status: ChangeStatus::Modified,
+            added: 0,
+            removed: 0,
+            comments: 0,
+            collapsed: false,
+        };
+        let entries = vec![
+            mk(0, "src/a.rs"),
+            mk(1, "src/b.rs"),
+            mk(2, "tests/c.rs"),
+            mk(3, "top.rs"),
+        ];
+        let labels = grouped_labels(&entries);
+        assert_eq!(labels[0], "src/a.rs", "first of its directory: full path");
+        assert_eq!(labels[1], "  b.rs", "same directory: indented basename");
+        assert_eq!(labels[2], "tests/c.rs", "a new directory: full path again");
+        assert_eq!(labels[3], "top.rs", "a root file keeps its name");
+        assert_eq!(dir_of("src/a.rs"), "src/");
+        assert_eq!(dir_of("top.rs"), "");
     }
 
     #[test]
