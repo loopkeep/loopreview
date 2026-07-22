@@ -625,6 +625,9 @@ struct App {
     conv_order: Vec<usize>,
     /// Thread ids whose inline/Conversation body is collapsed to its header.
     collapsed: HashSet<String>,
+    /// Thread ids the reviewer has folded/unfolded by hand this session; their
+    /// state is kept as-is when defaults (resolved = collapsed) are re-derived.
+    manual_fold: HashSet<String>,
     /// File display paths that are collapsed to their header (contents hidden;
     /// highlighting is skipped for them).
     collapsed_files: HashSet<String>,
@@ -703,7 +706,13 @@ impl App {
         highlighter: Highlighter,
         repo_dir: Option<PathBuf>,
     ) -> App {
-        let collapsed = HashSet::new();
+        // Resolved threads start collapsed (open ones expanded); manual folds win.
+        let collapsed: HashSet<String> = review
+            .threads
+            .iter()
+            .filter(|t| t.is_resolved())
+            .map(|t| t.id.clone())
+            .collect();
         let comment_blocks = build_comment_blocks(&review, &highlighter, &collapsed);
         let block_lens: Vec<usize> = comment_blocks.iter().map(Vec::len).collect();
         let layout = Layouts::build(&diff, &review, &block_lens, &HashSet::new());
@@ -756,7 +765,8 @@ impl App {
             conv_blocks,
             thread_outdated: outdated,
             conv_order,
-            collapsed: HashSet::new(),
+            collapsed,
+            manual_fold: HashSet::new(),
             collapsed_files: HashSet::new(),
             auto_collapse_files: 50,
             auto_collapse_lines: 20_000,
@@ -890,6 +900,10 @@ impl App {
                         ThreadState::Open
                     };
                     changed = Some(thread.id.clone());
+                }
+                // Fold on resolve / expand on reopen, via the default-fold pass.
+                if let Some(id) = &changed {
+                    self.manual_fold.remove(id);
                 }
                 self.emit(EventKind::Resolve, changed);
                 self.status = Some(
@@ -1133,7 +1147,28 @@ impl App {
 
     /// Recompute the layout and inline comment blocks from `diff` and the
     /// current review, replacing derived state. The caller restores the cursor.
+    /// Re-derive the default fold state (resolved = collapsed) for every thread
+    /// the reviewer has not folded by hand — so a refresh/pull that brings new or
+    /// newly-resolved threads folds them correctly.
+    fn apply_default_folds(&mut self) {
+        let updates: Vec<(String, bool)> = self
+            .review
+            .threads
+            .iter()
+            .filter(|t| !self.manual_fold.contains(&t.id))
+            .map(|t| (t.id.clone(), t.is_resolved()))
+            .collect();
+        for (id, resolved) in updates {
+            if resolved {
+                self.collapsed.insert(id);
+            } else {
+                self.collapsed.remove(&id);
+            }
+        }
+    }
+
     fn apply_layout(&mut self, diff: Diff) {
+        self.apply_default_folds();
         self.comment_blocks =
             build_comment_blocks(&self.review, &self.highlighter, &self.collapsed);
         let block_lens: Vec<usize> = self.comment_blocks.iter().map(Vec::len).collect();
@@ -1627,6 +1662,9 @@ impl App {
             ThreadState::Resolved
         };
         let resolved = thread.is_resolved();
+        // Resolving folds the thread, reopening expands it: clear any manual
+        // override so the relayout's default-fold pass follows the new state.
+        self.manual_fold.remove(&id);
         self.emit(EventKind::Resolve, Some(id));
         self.status = self.persist(if resolved { "resolved" } else { "reopened" });
         self.relayout();
@@ -2055,6 +2093,8 @@ impl App {
     }
 
     fn toggle_collapse(&mut self, id: String) {
+        // A hand fold/unfold sticks for the session (defaults won't override it).
+        self.manual_fold.insert(id.clone());
         if !self.collapsed.remove(&id) {
             self.collapsed.insert(id);
         }
@@ -2089,11 +2129,43 @@ impl App {
             }
             Action::CloseReview if self.has_review() => self.confirming_close = true,
             Action::Fold => self.toggle_collapse_conv(),
-            // `h` steps out to the thread index (same cascade grammar as Files).
-            Action::NavOut if self.sidebar_width(self.body_width.get()).is_some() => {
-                self.focus_sidebar()
+            // l: a collapsed thread expands; an open one scrolls to its top.
+            Action::NavIn => {
+                if self.selected_collapsed() {
+                    self.fold_selected(false);
+                }
+                self.follow_conv();
+            }
+            // h: an open thread collapses; a collapsed one steps out to the
+            // thread index — the same cascade as a file header in the Files view.
+            Action::NavOut => {
+                if self.selected_thread().is_some() && !self.selected_collapsed() {
+                    self.fold_selected(true);
+                } else if self.sidebar_width(self.body_width.get()).is_some() {
+                    self.focus_sidebar();
+                }
             }
             _ => {}
+        }
+    }
+
+    /// Whether the selected Conversation thread is collapsed.
+    fn selected_collapsed(&self) -> bool {
+        self.selected_thread()
+            .is_some_and(|t| self.collapsed.contains(&self.review.threads[t].id))
+    }
+
+    /// Fold or unfold the selected thread (a manual override for the session).
+    fn fold_selected(&mut self, collapse: bool) {
+        if let Some(t) = self.selected_thread() {
+            let id = self.review.threads[t].id.clone();
+            self.manual_fold.insert(id.clone());
+            if collapse {
+                self.collapsed.insert(id);
+            } else {
+                self.collapsed.remove(&id);
+            }
+            self.relayout();
         }
     }
 
@@ -3415,20 +3487,40 @@ impl App {
 
     fn draw_conversation(&self, f: &mut Frame, area: Rect) {
         let select_bg = Color::Rgb(40, 46, 60);
+        let width = area.width as usize;
         let mut lines: Vec<TextLine> = Vec::new();
         for (pos, &ti) in self.conv_order.iter().enumerate() {
             let block = &self.conv_blocks[ti];
             let selected = pos == self.conv_cursor;
-            for line in block {
-                if selected {
-                    let spans: Vec<TextSpan> = line
-                        .spans
-                        .iter()
-                        .map(|s| TextSpan::styled(s.content.clone(), s.style.bg(select_bg)))
-                        .collect();
-                    lines.push(TextLine::from(spans));
+            for (li, line) in block.iter().enumerate() {
+                // The header (first line of a block) gets a full-width band, like
+                // a file header; the selected thread tints its whole block.
+                let bg = if selected {
+                    Some(select_bg)
+                } else if li == 0 {
+                    Some(HEADER_BG)
                 } else {
-                    lines.push(line.clone());
+                    None
+                };
+                match bg {
+                    Some(c) => {
+                        let mut spans: Vec<TextSpan> = line
+                            .spans
+                            .iter()
+                            .map(|s| TextSpan::styled(s.content.clone(), s.style.bg(c)))
+                            .collect();
+                        if li == 0 {
+                            let used = span_width(&spans);
+                            if used < width {
+                                spans.push(TextSpan::styled(
+                                    " ".repeat(width - used),
+                                    Style::default().bg(c),
+                                ));
+                            }
+                        }
+                        lines.push(TextLine::from(spans));
+                    }
+                    None => lines.push(line.clone()),
                 }
             }
             lines.push(TextLine::from(""));
@@ -3600,7 +3692,7 @@ impl App {
             let help = if self.focus == Focus::Sidebar {
                 "j/k move · l open · o fold · esc body · ^p find · q quit"
             } else if self.view == View::Conversation {
-                "j/k thread · o fold · r reply · x resolve · X close · b files · tab diff · q quit"
+                "j/k thread · l open · h fold · r reply · x resolve · b index · tab diff · q quit"
             } else if self.cursor_is_header() {
                 "h fold · l open · j/k move · b sidebar · ^p find · q quit"
             } else {
@@ -4555,20 +4647,33 @@ fn build_conversation(
             let is_outdated = outdated.get(ti).copied().unwrap_or(false);
             let is_collapsed = collapsed.contains(&thread.id);
             let mut lines = Vec::new();
+            // An informative one-line header (the thread index's vocabulary): a
+            // fold chevron, the status glyph, the anchor, the author, and the
+            // reply count — so a collapsed thread still says what it is.
+            let (glyph, glyph_fg) = thread_status(thread, is_outdated);
+            let author = thread.root().map(|c| c.author.clone()).unwrap_or_default();
+            let replies = thread.replies().len();
             let mut header = vec![
                 TextSpan::styled(
                     if is_collapsed { "▸ " } else { "▾ " },
                     Style::default().fg(Color::DarkGray),
                 ),
+                TextSpan::styled(format!("{glyph} "), Style::default().fg(glyph_fg)),
                 TextSpan::styled(
                     anchor_label(&thread.anchor),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Gray),
+                ),
+                TextSpan::styled(
+                    format!("  {author}"),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ];
-            if thread.is_resolved() {
+            if replies > 0 {
                 header.push(TextSpan::styled(
-                    "  [resolved]",
-                    Style::default().fg(Color::Green),
+                    format!("  ↩{replies}"),
+                    Style::default().fg(Color::Cyan),
                 ));
             }
             if is_outdated {
@@ -6059,6 +6164,79 @@ mod tests {
         assert_eq!(thread_index_label(&anchor), "conversation");
     }
 
+    fn thread_state(id: &str, anchor: Anchor, state: ThreadState) -> Thread {
+        let mut t = thread_with(id, anchor, 0);
+        t.state = state;
+        t
+    }
+
+    #[test]
+    fn resolved_threads_start_collapsed_manual_override_wins() {
+        let mut app = multi_file_app(&["a.rs"]);
+        app.review
+            .threads
+            .push(thread_state("open1", Anchor::Review, ThreadState::Open));
+        app.review
+            .threads
+            .push(thread_state("res1", Anchor::Review, ThreadState::Resolved));
+        app.relayout(); // re-derives the default folds
+        assert!(!app.collapsed.contains("open1"), "open starts expanded");
+        assert!(app.collapsed.contains("res1"), "resolved starts collapsed");
+        // A hand unfold of the resolved thread survives a re-derive.
+        app.toggle_collapse("res1".into());
+        assert!(!app.collapsed.contains("res1"));
+        app.relayout();
+        assert!(
+            !app.collapsed.contains("res1"),
+            "manual override is not clobbered by defaults"
+        );
+    }
+
+    #[test]
+    fn resolving_a_thread_folds_it() {
+        let mut app = multi_file_app(&["a.rs"]);
+        app.review.threads.push(thread_state(
+            "t",
+            Anchor::line("a.rs", Side::New, 2),
+            ThreadState::Open,
+        ));
+        app.relayout();
+        assert!(!app.collapsed.contains("t"));
+        app.resolve_thread(0);
+        assert!(
+            app.collapsed.contains("t") && app.review.threads[0].is_resolved(),
+            "resolve folds the thread"
+        );
+        app.resolve_thread(0);
+        assert!(!app.collapsed.contains("t"), "reopen expands it");
+    }
+
+    #[test]
+    fn conversation_h_l_fold_expand_and_focus() {
+        let mut app = multi_file_app(&["a.rs"]);
+        app.sidebar_override = Some(true);
+        app.body_width.set(120);
+        app.review
+            .threads
+            .push(thread_state("t", Anchor::Review, ThreadState::Open));
+        app.relayout();
+        app.view = View::Conversation;
+        app.focus = Focus::Body;
+        app.conv_cursor = 0;
+        assert!(!app.selected_collapsed());
+        // h collapses an open thread (focus stays in the body).
+        app.conversation_action(Action::NavOut);
+        assert!(app.selected_collapsed(), "h folds an open thread");
+        assert_eq!(app.focus, Focus::Body);
+        // h again (now collapsed) focuses the thread index.
+        app.conversation_action(Action::NavOut);
+        assert_eq!(app.focus, Focus::Sidebar, "h on a collapsed thread → index");
+        // l expands a collapsed thread.
+        app.focus = Focus::Body;
+        app.conversation_action(Action::NavIn);
+        assert!(!app.selected_collapsed(), "l expands a collapsed thread");
+    }
+
     #[test]
     fn the_sidebar_indexes_files_or_threads_by_view() {
         use ratatui::Terminal;
@@ -6129,10 +6307,12 @@ mod tests {
         assert_eq!(app.view, View::Conversation);
         assert_eq!(app.conv_cursor, 0);
 
-        // h from the Conversation body steps back out to the thread index.
+        // h folds the open thread (focus stays); h again steps out to the index.
         app.body_width.set(120);
         app.conversation_action(Action::NavOut);
-        assert_eq!(app.focus, Focus::Sidebar);
+        assert!(app.selected_collapsed(), "h folds the open thread first");
+        app.conversation_action(Action::NavOut);
+        assert_eq!(app.focus, Focus::Sidebar, "h on a collapsed thread → index");
     }
 
     #[test]
