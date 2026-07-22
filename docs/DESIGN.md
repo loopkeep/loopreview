@@ -126,6 +126,9 @@ Anchor =
 - **Outdated**: GitHub に揃えてバッジ表示(消さない・返信可能)。該当行の表示は ①保存済み文脈スニペット → ②`git show <commit>:<path>` による実履歴からの再構成、の2段構え。GitHub の original_commit_id + diff_hunk が同じ表示パスに写像される
 - 再配置は表示時に計算。行番号ドリフトには文脈スニペットの fuzzy マッチで追随
 - **ストア**: `~/.config/loopreview/` 配下、repo 単位キー。アンカーが commit を持つため worktree 間共有で曖昧にならない
+- **コメント入力はインライン統一**(`$EDITOR` に逃がさない): TUI 内の複数行テキストエリア(`tui-textarea` 等の実績 crate を検討)。想定は数行〜、快適に書ける品質を必須とする
+- **コメント本文は markdown をフルレンダリング**: 見出し・リスト・引用・コードブロック(シンタックスハイライト付き)・リンク等、ターミナルで表現可能な範囲の完全な描画。author 識別は人間 = `git config user.name` 既定(config 上書き可)、エージェント = 制御面呼び出し時の `--author`
+- **レビューのライフサイクル**: 完了(submit / close)したローカルレビューは**削除**(ゴミを溜めない)。削除時はユーザープロンプトで確認
 
 ## 6. マイルストーン
 
@@ -154,6 +157,16 @@ Anchor =
 - loopreview → loopkeep: loopkeep アダプタが `lk` CLI / loopkeepd ソケットを外部クライアントとして叩く(GitHub と同格の1ソース/シンク)
 - 配布同梱はパッケージングレベル(brew depends_on / Tauri sidecar / Releases 取得)。**lk バイナリへの静的埋め込みは不可**
 - **core crate の crates.io 公開は将来オプション**(管制室 GUI への埋め込み描画用)。API 安定後(M3 以降)に判断。公開はライセンス決定を強制する点に注意。それ以前の link 実験は cargo git 依存で可
+
+## 7.5 対応環境・依存境界・リリース(2026-07-22 確定)
+
+- **対応 OS**: macOS / Linux。Windows は非対象(crossterm により将来の可能性は残るが、テスト・CI をしない)
+- **VCS**: v1 は git のみ。jj 等はソース trait の裏に将来追加
+- **ランタイム依存境界**: 素の diff 表示(lr / lr diff / lr patch)は **git のみ**で動く。`gh` は PR 機能(`lr pr`)使用時のみ必須
+- **ライセンス: MIT**(公開タイミングとは独立に確定)
+- **バージョニング**: **v0.1.0 が初版** = ここまでに確定した全スコープ(M1 + M2a + M2b + M3)のフル実装。v0.0.x は出さない。以後はフィードバック対応で刻む
+- **リリース工程**: M1 完了 → ユーザー実機確認・フィードバック → フィードバック対応 + 残スコープ全実装 → 動作確認 → v0.1.0 タグ → Releases(前身の release.yml の型: タグ=バージョン一致検証、4ターゲット、checksums)。brew tap / cargo-binstall 対応は後続
+- M4(herdr ラッパー / loopkeep アダプタ)は本体リリースとは別成果物(それぞれの repo 側の作業)として扱う
 
 ## 8. 開発運用ルール
 
