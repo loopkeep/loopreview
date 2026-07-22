@@ -307,7 +307,7 @@ impl App {
         author: String,
         highlighter: Highlighter,
     ) -> App {
-        let comment_blocks = build_comment_blocks(&review);
+        let comment_blocks = build_comment_blocks(&review, &highlighter);
         let block_lens: Vec<usize> = comment_blocks.iter().map(Vec::len).collect();
         let layout = Layouts::build(&diff, &review, &block_lens);
         let num_width = digits(layout.max_lineno).max(3);
@@ -401,7 +401,7 @@ impl App {
     /// Recompute the layout and inline comment blocks from `diff` and the
     /// current review, replacing derived state. The caller restores the cursor.
     fn apply_layout(&mut self, diff: Diff) {
-        self.comment_blocks = build_comment_blocks(&self.review);
+        self.comment_blocks = build_comment_blocks(&self.review, &self.highlighter);
         let block_lens: Vec<usize> = self.comment_blocks.iter().map(Vec::len).collect();
         let layout = Layouts::build(&diff, &self.review, &block_lens);
         self.num_width = digits(layout.max_lineno).max(3);
@@ -1402,10 +1402,12 @@ fn status_color(status: loopreview_core::ChangeStatus) -> Color {
 
 /// The left gutter bar drawn beside an inline comment thread.
 const COMMENT_BAR: Color = Color::Rgb(90, 130, 200);
+/// Width the inline comment body wraps to (before the gutter bar).
+const INLINE_COMMENT_WRAP: usize = 76;
 
 /// Render each thread's inline block (index-aligned to `review.threads`): a
-/// header naming the author and state, then the root comment's body lines.
-fn build_comment_blocks(review: &Review) -> Vec<Vec<TextLine<'static>>> {
+/// header naming the author and state, then the root comment's body as markdown.
+fn build_comment_blocks(review: &Review, highlighter: &Highlighter) -> Vec<Vec<TextLine<'static>>> {
     let bar = Style::default().fg(COMMENT_BAR);
     review
         .threads
@@ -1441,11 +1443,12 @@ fn build_comment_blocks(review: &Review) -> Vec<Vec<TextLine<'static>>> {
             }
             lines.push(TextLine::from(header));
             if let Some(root) = thread.root() {
-                for body in root.body.lines() {
-                    lines.push(TextLine::from(vec![
-                        TextSpan::styled("  ▏ ", bar),
-                        TextSpan::styled(body.to_string(), Style::default().fg(Color::Gray)),
-                    ]));
+                for body in
+                    crate::markdown::render(&root.body, Some(INLINE_COMMENT_WRAP), highlighter)
+                {
+                    let mut spans = vec![TextSpan::styled("  ▏ ", bar)];
+                    spans.extend(body.spans);
+                    lines.push(TextLine::from(spans));
                 }
             }
             lines

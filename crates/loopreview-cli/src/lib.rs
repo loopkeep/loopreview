@@ -6,6 +6,7 @@
 
 mod cli;
 mod highlight;
+mod markdown;
 mod store;
 mod textarea;
 mod ui;

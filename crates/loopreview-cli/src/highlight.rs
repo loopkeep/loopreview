@@ -47,7 +47,24 @@ impl Highlighter {
             .and_then(|e| e.to_str())
             .and_then(|ext| self.syntaxes.find_syntax_by_extension(ext))
             .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
+        self.highlight_with(syntax, lines)
+    }
 
+    /// Highlight `lines` as source in `lang` (a markdown code-block info string,
+    /// e.g. `rust`), falling back to plain text when the language is unknown.
+    pub fn highlight_by_lang(&self, lang: &str, lines: &[&str]) -> Vec<Vec<Span>> {
+        let syntax = self
+            .syntaxes
+            .find_syntax_by_token(lang)
+            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
+        self.highlight_with(syntax, lines)
+    }
+
+    fn highlight_with(
+        &self,
+        syntax: &syntect::parsing::SyntaxReference,
+        lines: &[&str],
+    ) -> Vec<Vec<Span>> {
         let mut highlighter = HighlightLines::new(syntax, &self.theme);
         lines
             .iter()
