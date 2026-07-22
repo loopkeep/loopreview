@@ -4610,9 +4610,9 @@ impl App {
                     .selected_thread()
                     .is_some_and(|i| self.is_resolvable(i))
                 {
-                    "j/k thread · l open · h fold · r reply · x resolve · b index · tab diff · q quit"
+                    "j/k comment · l open · h fold · r reply · x resolve · e edit · d del · b index · tab diff · q quit"
                 } else {
-                    "j/k thread · l open · h fold · r reply · b index · tab diff · q quit"
+                    "j/k comment · l open · h fold · r reply · e edit · d del · b index · tab diff · q quit"
                 }
             } else if self.cursor_is_header() {
                 "h fold · l open · j/k move · b sidebar · ^p find · q quit"
