@@ -5081,7 +5081,7 @@ impl App {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" find file (type to filter, Enter to open, Esc to close) ")
-            .style(Style::default().bg(Color::Rgb(20, 22, 28)));
+            .style(Style::default().bg(FINDER_BG));
         let inner = block.inner(area);
         f.render_widget(block, area);
 
@@ -5111,7 +5111,7 @@ impl App {
             let base = if row == finder.selected {
                 Style::default().bg(SEL_BG)
             } else {
-                Style::default().bg(Color::Rgb(20, 22, 28))
+                Style::default().bg(FINDER_BG)
             };
             if let Some(entry) = entries.get(*file) {
                 // The finder shows full paths (they carry the fuzzy-match spans).
@@ -5793,7 +5793,7 @@ fn build_conversation(
                             for snippet in context {
                                 lines.push(TextLine::from(TextSpan::styled(
                                     format!("  │ {snippet}"),
-                                    Style::default().fg(Color::Rgb(90, 90, 100)),
+                                    Style::default().fg(SNIPPET_FG),
                                 )));
                             }
                         }
@@ -5981,9 +5981,9 @@ fn reconstruct_outdated(
         let number = from + offset + 1;
         let is_anchor = number as u32 == *start;
         let text_style = if is_anchor {
-            Style::default().fg(Color::White).bg(Color::Rgb(52, 46, 28))
+            Style::default().fg(Color::White).bg(EXCERPT_ANCHOR_BG)
         } else {
-            Style::default().fg(Color::Rgb(120, 120, 130))
+            Style::default().fg(EXCERPT_CONTEXT_FG)
         };
         out.push(TextLine::from(vec![
             TextSpan::styled(

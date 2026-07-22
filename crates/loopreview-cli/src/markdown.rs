@@ -10,6 +10,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span as TextSpan};
 use unicode_width::UnicodeWidthStr;
 
+use crate::palette;
+
 use crate::highlight::Highlighter;
 
 /// Render markdown `text` to styled lines. `wrap` is the wrap width, or `None`
@@ -74,9 +76,7 @@ impl Renderer<'_> {
             Event::Code(code) => {
                 self.spans.push(TextSpan::styled(
                     code.into_string(),
-                    self.style
-                        .fg(Color::Rgb(220, 180, 120))
-                        .bg(Color::Rgb(40, 40, 48)),
+                    self.style.fg(palette::CODE_FG).bg(palette::CODE_INLINE_BG),
                 ));
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -120,7 +120,7 @@ impl Renderer<'_> {
                 if let Some(url) = self.link.take() {
                     self.spans.push(TextSpan::styled(
                         format!(" ({url})"),
-                        self.style.fg(Color::Rgb(110, 140, 200)),
+                        self.style.fg(palette::LINK_FG),
                     ));
                 }
             }
@@ -188,7 +188,7 @@ impl Renderer<'_> {
         let Some((lang, text)) = self.code.take() else {
             return;
         };
-        let bg = Color::Rgb(30, 32, 40);
+        let bg = palette::CODE_BLOCK_BG;
         let raw: Vec<&str> = text.trim_end_matches('\n').lines().collect();
         for line in self.highlighter.highlight_by_lang(&lang, &raw) {
             let mut spans = vec![TextSpan::styled("  ", Style::default().bg(bg))];

@@ -1,10 +1,13 @@
 //! The review UI's colors, in one place.
 //!
-//! Every non-generic color the TUI uses is named here so the look is defined and
-//! tuned centrally, not scattered across the renderer. Truly generic ANSI colors
-//! (a plain `DarkGray` for dim text, `White` for body text) stay inline at the
-//! call site; a color earns a name here when it carries a specific role or is a
-//! custom RGB tuned for a dark terminal.
+//! Every fixed non-generic color the TUI uses is named here so the look is
+//! defined and tuned centrally, not scattered across the renderer. Two kinds of
+//! color stay inline at the call site: truly generic ANSI colors (a plain
+//! `DarkGray` for dim text, `White` for body text), and colors computed at
+//! runtime from data — the syntax-highlight theme (`syntect`) yields per-token
+//! RGB that is converted, not chosen. A color earns a name here when it is a
+//! fixed choice carrying a specific role, or a custom RGB tuned for a dark
+//! terminal.
 
 use ratatui::style::Color;
 
@@ -72,3 +75,19 @@ pub const EXCERPT_ANCHOR_BG: Color = Color::Rgb(46, 42, 30);
 /// note (never sent) stays subdued.
 pub const BADGE_DRAFT: Color = Color::Yellow;
 pub const BADGE_LOCAL: Color = Color::DarkGray;
+/// The muted line-number/context text in a placed thread's code excerpt.
+pub const EXCERPT_CONTEXT_FG: Color = Color::Rgb(120, 120, 130);
+/// The saved-snippet text shown for an outdated thread with no reconstruction.
+pub const SNIPPET_FG: Color = Color::Rgb(90, 90, 100);
+
+// -- finder and markdown ----------------------------------------------------
+
+/// Background of the fuzzy file-finder's rows.
+pub const FINDER_BG: Color = Color::Rgb(20, 22, 28);
+/// Inline `code`: a warm foreground on a faint fill.
+pub const CODE_FG: Color = Color::Rgb(220, 180, 120);
+pub const CODE_INLINE_BG: Color = Color::Rgb(40, 40, 48);
+/// A markdown link.
+pub const LINK_FG: Color = Color::Rgb(110, 140, 200);
+/// A fenced code block's background.
+pub const CODE_BLOCK_BG: Color = Color::Rgb(30, 32, 40);
