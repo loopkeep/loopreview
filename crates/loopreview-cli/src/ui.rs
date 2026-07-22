@@ -492,7 +492,9 @@ enum Region {
 }
 
 /// Map a screen cell `(x, y)` to a [`Region`], using the geometry captured at the
-/// last draw. Pure so it can be unit-tested across layout combinations.
+/// last draw. Pure so it can be unit-tested across layout combinations. The
+/// content and sidebar inner rects share a vertical extent (`body_top`,
+/// `body_height`); pane borders fall outside both, mapping to `Outside`.
 fn hit_region(x: u16, y: u16, hit: HitLayout) -> Region {
     if hit.tabs_row == Some(y) {
         return Region::Tabs;
@@ -504,36 +506,39 @@ fn hit_region(x: u16, y: u16, hit: HitLayout) -> Region {
         return Region::Outside;
     }
     let row = (y - hit.body_top) as usize;
-    if hit.sidebar_w > 0 {
-        if x < hit.sidebar_w {
-            return Region::Sidebar(row);
-        }
-        if x == hit.sidebar_w {
-            return Region::Outside; // the divider column
-        }
+    if hit.sidebar_w > 0 && x >= hit.sidebar_x0 && x < hit.sidebar_x0 + hit.sidebar_w {
+        return Region::Sidebar(row);
+    }
+    if x >= hit.content_x0 && x < hit.content_x0 + hit.content_w {
         return Region::Content {
-            col: x - (hit.sidebar_w + 1),
+            col: x - hit.content_x0,
             row,
         };
     }
-    Region::Content { col: x, row }
+    Region::Outside
 }
 
 /// Where things landed on screen at the last draw, for mouse hit-testing.
 #[derive(Clone, Copy, Default)]
 struct HitLayout {
-    /// First body row (below the header and tab bar).
+    /// First content/sidebar row (below the header, tab bar, and any top border).
     body_top: u16,
-    /// Body height in rows.
+    /// Content/sidebar inner height in rows.
     body_height: u16,
+    /// Leftmost column of the diff content (past any sidebar and borders).
+    content_x0: u16,
+    /// Diff content inner width in columns.
+    content_w: u16,
+    /// Leftmost column of the sidebar file list (past its left border).
+    sidebar_x0: u16,
+    /// Sidebar inner width in columns (0 = hidden).
+    sidebar_w: u16,
     /// The tab bar row, when the tabs are shown.
     tabs_row: Option<u16>,
     /// The Files tab occupies columns `[0, tab_files_end)`.
     tab_files_end: u16,
     /// The Conversation tab occupies `[tab_files_end + 1, tab_conv_end)`.
     tab_conv_end: u16,
-    /// Sidebar column count (0 = hidden); the diff starts past `sidebar_w`.
-    sidebar_w: u16,
     /// The footer row.
     footer_row: u16,
     /// The layout indicator occupies `[0, layout_end)` on the footer row.
@@ -2995,49 +3000,56 @@ impl App {
         } else {
             (chunks[0], chunks[1], chunks[2])
         };
-        self.body_height.set(body.height as usize);
-
         // Split off the file-explorer sidebar when shown and the terminal is
         // wide enough (it auto-hides on a narrow terminal — the finder still
-        // works there).
+        // works there). In the two-pane layout each pane is framed with a
+        // title, and the focused pane's frame accents so it is always obvious
+        // where input goes.
         let mut content = body;
+        let mut sidebar_x0 = 0u16;
         let mut sidebar_cols = 0u16;
         if let Some(sidebar_w) = self.sidebar_width(body.width as usize) {
+            let sidebar_focused = self.focus == Focus::Sidebar;
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Length(sidebar_w as u16),
-                    Constraint::Length(1),
+                    Constraint::Length(sidebar_w as u16 + 2), // +2 for the frame
+                    Constraint::Length(1),                    // a gap between panes
                     Constraint::Min(1),
                 ])
                 .split(body);
-            self.draw_sidebar(f, cols[0]);
-            // The divider doubles as a focus cue: accent when the sidebar holds
-            // focus, dim when the diff body does.
-            let (glyph, divider_fg) = if self.focus == Focus::Sidebar {
-                ("┃", FOCUS_ACCENT)
-            } else {
-                ("│", Color::DarkGray)
-            };
-            let divider: Vec<TextLine> = (0..cols[1].height)
-                .map(|_| TextLine::from(TextSpan::styled(glyph, Style::default().fg(divider_fg))))
-                .collect();
-            f.render_widget(Paragraph::new(divider), cols[1]);
-            content = cols[2];
-            sidebar_cols = sidebar_w as u16;
+            let sb_block = pane_block(
+                format!(" Files ({}) ", self.diff.files.len()),
+                sidebar_focused,
+            );
+            let sb_inner = sb_block.inner(cols[0]);
+            f.render_widget(sb_block, cols[0]);
+            self.draw_sidebar(f, sb_inner);
+
+            let body_block = pane_block(self.pane_title(), !sidebar_focused);
+            let body_inner = body_block.inner(cols[2]);
+            f.render_widget(body_block, cols[2]);
+            content = body_inner;
+            sidebar_x0 = sb_inner.x;
+            sidebar_cols = sb_inner.width;
         }
         self.body_width.set(content.width as usize);
+        self.body_height.set(content.height as usize);
 
-        // Record the geometry for mouse hit-testing.
+        // Record the geometry for mouse hit-testing (inner rects; frames map to
+        // Outside).
         let (files_label, conv_label) = self.tab_labels();
         let files_w = files_label.chars().count() as u16;
         self.hit.set(HitLayout {
-            body_top: body.y,
-            body_height: body.height,
+            body_top: content.y,
+            body_height: content.height,
+            content_x0: content.x,
+            content_w: content.width,
+            sidebar_x0,
+            sidebar_w: sidebar_cols,
             tabs_row: tabs.then(|| chunks[1].y),
             tab_files_end: files_w,
             tab_conv_end: files_w + 1 + conv_label.chars().count() as u16,
-            sidebar_w: sidebar_cols,
             footer_row: footer.y,
             layout_end: self.layout_label().chars().count() as u16,
         });
@@ -3412,6 +3424,14 @@ impl App {
         }
     }
 
+    /// The diff pane's frame title: the file the cursor is in, or a fallback.
+    fn pane_title(&self) -> String {
+        match self.diff.files.get(self.current_file()) {
+            Some(file) => format!(" {} ", file_name(file.display_path())),
+            None => " Diff ".to_string(),
+        }
+    }
+
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let bar = Style::default().bg(BAR_BG);
         let position = if self.view == View::Conversation {
@@ -3451,13 +3471,13 @@ impl App {
             // The hint switches with focus and with what the cursor rests on, so
             // the keys shown are always the ones that act right now.
             let help = if self.focus == Focus::Sidebar {
-                "l/enter open · o fold · h/esc back · ^p find · q quit"
+                "j/k move · l open · o fold · esc body · ^p find · q quit"
             } else if self.view == View::Conversation {
                 "j/k thread · o fold · r reply · x resolve · X close · b files · tab diff · q quit"
             } else if self.cursor_is_header() {
-                "l open · h fold · j/k move · b sidebar · ^p find · q quit"
+                "h fold · l open · j/k move · b sidebar · ^p find · q quit"
             } else {
-                "j/k move · l/h in·out · c comment · r reply · o fold · b sidebar · q quit"
+                "j/k move · h header · c comment · r reply · o fold · b sidebar · q quit"
             };
             spans.push(TextSpan::styled(help, bar.fg(Color::DarkGray)));
             if self.pr.is_some() {
@@ -3704,7 +3724,9 @@ impl App {
             .max()
             .unwrap_or(SIDEBAR_MIN);
         let desired = widest.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
-        (total >= desired + 1 + self.sidebar_min_content).then_some(desired)
+        // Framing overhead beside the diff: the sidebar's two borders, a 1-col
+        // gap, and the diff pane's two borders — five columns before content.
+        (total >= desired + 5 + self.sidebar_min_content).then_some(desired)
     }
 
     /// Whether the sidebar should be shown before the width check: a `b` override
@@ -3958,6 +3980,22 @@ fn note_line(msg: &str) -> TextLine<'static> {
 /// The last path component (the filename).
 fn file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// A titled pane frame whose border and title accent when the pane holds focus
+/// (a bright bold accent) and dim otherwise, so focus is obvious at a glance.
+fn pane_block(title: String, focused: bool) -> Block<'static> {
+    let style = if focused {
+        Style::default()
+            .fg(FOCUS_ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(style)
+        .title(TextLine::from(TextSpan::styled(title, style)))
 }
 
 /// One changed file, as shown in the sidebar and the file finder.
@@ -5420,7 +5458,7 @@ mod tests {
         // Body focused: the cursor bar is the bright cursor color.
         app.focus = Focus::Body;
         term.draw(|f| app.draw(f)).unwrap();
-        let x0 = app.hit.get().sidebar_w + 1;
+        let x0 = app.hit.get().content_x0;
         assert_eq!(
             body_cursor_bg(&term, x0),
             Some(CURSOR_BG),
@@ -5439,6 +5477,51 @@ mod tests {
     }
 
     #[test]
+    fn pane_frames_accent_the_focused_pane() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = multi_file_app(&["a.rs"]);
+        app.sidebar_override = Some(true);
+        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+
+        // Sidebar focused: its frame accents, the diff frame dims.
+        app.focus = Focus::Sidebar;
+        term.draw(|f| app.draw(f)).unwrap();
+        let hit = app.hit.get();
+        let border_row = hit.body_top - 1; // the top border sits above the content
+        let sidebar_border_x = hit.sidebar_x0 - 1;
+        let body_border_x = hit.content_x0 - 1;
+        {
+            let buf = term.backend().buffer();
+            assert_eq!(
+                buf[(sidebar_border_x, border_row)].fg,
+                FOCUS_ACCENT,
+                "the focused sidebar frame is accented"
+            );
+            assert_eq!(
+                buf[(body_border_x, border_row)].fg,
+                Color::DarkGray,
+                "the unfocused diff frame is dim"
+            );
+        }
+
+        // Body focused: the accent moves to the diff frame.
+        app.focus = Focus::Body;
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        assert_eq!(
+            buf[(body_border_x, border_row)].fg,
+            FOCUS_ACCENT,
+            "the focused diff frame is accented"
+        );
+        assert_eq!(
+            buf[(sidebar_border_x, border_row)].fg,
+            Color::DarkGray,
+            "the unfocused sidebar frame is dim"
+        );
+    }
+
+    #[test]
     fn footer_hint_follows_focus() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -5449,7 +5532,7 @@ mod tests {
         app.focus = Focus::Sidebar;
         term.draw(|f| app.draw(f)).unwrap();
         assert!(
-            footer_text(&term).contains("h/esc back"),
+            footer_text(&term).contains("esc body"),
             "the sidebar shows its own hint"
         );
 
@@ -5609,14 +5692,17 @@ mod tests {
 
     #[test]
     fn hit_region_maps_across_layouts() {
-        // No tabs, no sidebar: body at screen row 1.
+        // No tabs, no sidebar: content fills the body from column 0, row 1.
         let h = HitLayout {
             body_top: 1,
             body_height: 20,
+            content_x0: 0,
+            content_w: 100,
+            sidebar_x0: 0,
+            sidebar_w: 0,
             tabs_row: None,
             tab_files_end: 0,
             tab_conv_end: 0,
-            sidebar_w: 0,
             footer_row: 21,
             layout_end: 0,
         };
@@ -5634,16 +5720,21 @@ mod tests {
         assert_eq!(hit_region(5, 2, h), Region::Content { col: 5, row: 0 });
         assert_eq!(hit_region(5, 4, h), Region::Content { col: 5, row: 2 });
 
-        // Sidebar 22 wide: cols [0,22) sidebar, 22 divider, 23+ diff.
+        // Two framed panes: sidebar inner [1,23), the diff inner starts at 25.
+        // The frames and the gap between them (columns 0, 23, 24) map to Outside.
         let h = HitLayout {
             body_top: 1,
             tabs_row: None,
+            sidebar_x0: 1,
             sidebar_w: 22,
+            content_x0: 25,
             ..h
         };
         assert_eq!(hit_region(5, 1, h), Region::Sidebar(0));
-        assert_eq!(hit_region(22, 1, h), Region::Outside); // divider
-        assert_eq!(hit_region(25, 3, h), Region::Content { col: 2, row: 2 });
+        assert_eq!(hit_region(0, 1, h), Region::Outside); // sidebar left border
+        assert_eq!(hit_region(23, 1, h), Region::Outside); // sidebar right border
+        assert_eq!(hit_region(24, 1, h), Region::Outside); // gap / body border
+        assert_eq!(hit_region(27, 3, h), Region::Content { col: 2, row: 2 });
     }
 
     /// Empirical: render, read the buffer to find the screen row of a known
@@ -5788,10 +5879,13 @@ mod tests {
         HitLayout {
             body_top,
             body_height: 20,
+            content_x0: if sidebar_w > 0 { sidebar_w + 1 } else { 0 },
+            content_w: 100,
+            sidebar_x0: 0,
+            sidebar_w,
             tabs_row,
             tab_files_end: files_end,
             tab_conv_end: files_end + 1 + 20,
-            sidebar_w,
             footer_row: body_top + 20,
             layout_end: 0,
         }
@@ -5889,12 +5983,12 @@ mod tests {
         app.sidebar_cursor = 2;
         let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
+        let x = app.hit.get().sidebar_x0; // the marker column, inside the frame
         let buf = term.backend().buffer();
-        // The marker column (col 0) carries each row's state background.
         let mut sel_row = None;
         let mut current_row = None;
         for y in 0..24u16 {
-            match buf[(0, y)].bg {
+            match buf[(x, y)].bg {
                 SEL_BG => sel_row = Some(y),
                 SIDEBAR_CURRENT_BG => current_row = Some(y),
                 _ => {}

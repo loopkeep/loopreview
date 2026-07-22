@@ -122,6 +122,10 @@ files from a working-tree review.
 
 **Sidebar** (focused after `b`)
 
+The sidebar and the diff are framed side by side; the pane holding focus has an
+accent-colored frame, and the inactive pane's cursor dims — so it is always
+clear where your keys will land.
+
 | Key | Action |
 | --- | --- |
 | `j` / `k` | Select a file (the list scrolls to follow; wheel also scrolls it) |
