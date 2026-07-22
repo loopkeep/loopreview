@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// The diff layout to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -19,6 +19,30 @@ pub enum LayoutMode {
     Unified,
     /// Always side-by-side (old | new).
     Split,
+}
+
+/// Which side of the diff a line number is measured on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LineSide {
+    /// The original ("before") version.
+    Old,
+    /// The changed ("after") version.
+    New,
+}
+
+/// A review event a `wait` can subscribe to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WaitEvent {
+    /// A new comment thread was created.
+    Comment,
+    /// A reply was added to a thread.
+    Reply,
+    /// A thread was resolved or reopened.
+    Resolve,
+    /// A pull-request review was submitted.
+    Submit,
+    /// The diff was reloaded.
+    Reload,
 }
 
 /// Parsed command line for loopreview.
@@ -91,24 +115,210 @@ enum Command {
         #[arg(long)]
         detect: bool,
     },
-    /// Reserved: control-plane session commands (arrive in M3).
-    #[command(hide = true)]
-    Session {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-    /// Reserved: control-plane daemon (arrives in M3).
+    /// Inspect and steer a live review session (for agents and scripts).
+    Session(SessionArgs),
+    /// Reserved: a session daemon (a future alternative to per-session sockets).
     #[command(hide = true)]
     Daemon {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Reserved: agent skill docs (arrive in M3).
-    #[command(hide = true)]
-    Skill {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+    /// Print the bundled agent skill document (for `lr session`).
+    Skill(SkillArgs),
+}
+
+/// `lr session <verb>`: the control-plane client.
+#[derive(Args, Debug)]
+pub struct SessionArgs {
+    /// The session verb.
+    #[command(subcommand)]
+    pub verb: SessionVerb,
+}
+
+/// The `lr session` verbs.
+#[derive(Subcommand, Debug)]
+pub enum SessionVerb {
+    /// List the live review sessions.
+    List {
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
     },
+    /// Show a session's identity and diff source.
+    Get {
+        #[command(flatten)]
+        target: Target,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the reviewer's current focus (cursor and view).
+    Context {
+        #[command(flatten)]
+        target: Target,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the diff structure and the review's threads.
+    Review {
+        #[command(flatten)]
+        target: Target,
+        /// Include each hunk's lines (the raw diff text).
+        #[arg(long)]
+        patch: bool,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move the reviewer's cursor and view.
+    Navigate {
+        #[command(flatten)]
+        target: Target,
+        /// Jump to the line a thread is anchored to.
+        #[arg(long)]
+        thread: Option<String>,
+        /// Jump to a line in this file (with `--line`).
+        #[arg(long)]
+        file: Option<String>,
+        /// Which side `--line` is measured on.
+        #[arg(long, value_enum, default_value_t = LineSide::New)]
+        side: LineSide,
+        /// The 1-based line to move to.
+        #[arg(long)]
+        line: Option<u32>,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reload the session's diff source.
+    Reload {
+        #[command(flatten)]
+        target: Target,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read or leave review comments.
+    Comment {
+        /// The comment action.
+        #[command(subcommand)]
+        action: CommentAction,
+    },
+    /// Block until a review event occurs (or a timeout).
+    Wait {
+        #[command(flatten)]
+        target: Target,
+        /// The event kinds to wait for (repeatable); omit to wait for any.
+        #[arg(long = "for", value_enum, value_name = "EVENT")]
+        events: Vec<WaitEvent>,
+        /// Report only events after this sequence number.
+        #[arg(long)]
+        after: Option<u64>,
+        /// Give up after this many seconds.
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// The `lr session comment` actions.
+#[derive(Subcommand, Debug)]
+pub enum CommentAction {
+    /// Add a comment thread at a line.
+    Add {
+        #[command(flatten)]
+        target: Target,
+        /// The file to comment on.
+        #[arg(long)]
+        file: String,
+        /// Which side the line is measured on.
+        #[arg(long, value_enum, default_value_t = LineSide::New)]
+        side: LineSide,
+        /// The 1-based line number.
+        #[arg(long)]
+        line: u32,
+        /// The comment body (markdown).
+        #[arg(long)]
+        body: String,
+        /// The comment author (required; agent comments are attributed).
+        #[arg(long)]
+        author: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reply to a thread.
+    Reply {
+        #[command(flatten)]
+        target: Target,
+        /// The thread to reply to.
+        #[arg(long)]
+        thread: String,
+        /// The reply body (markdown).
+        #[arg(long)]
+        body: String,
+        /// The reply author.
+        #[arg(long)]
+        author: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resolve a thread (or reopen it with `--reopen`).
+    Resolve {
+        #[command(flatten)]
+        target: Target,
+        /// The thread to change.
+        #[arg(long)]
+        thread: String,
+        /// Reopen instead of resolving.
+        #[arg(long)]
+        reopen: bool,
+        /// The actor requesting the change.
+        #[arg(long)]
+        author: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the review's threads.
+    List {
+        #[command(flatten)]
+        target: Target,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// How to select the session a verb acts on.
+#[derive(Args, Debug, Clone)]
+pub struct Target {
+    /// The session id (needed only when several sessions share a repo).
+    pub session: Option<String>,
+    /// Select the session by repository (defaults to the current directory).
+    #[arg(long, value_name = "PATH")]
+    pub repo: Option<PathBuf>,
+}
+
+/// `lr skill <verb>`: the bundled agent skill document.
+#[derive(Args, Debug)]
+pub struct SkillArgs {
+    /// The skill verb (defaults to `path`).
+    #[command(subcommand)]
+    pub verb: Option<SkillVerb>,
+}
+
+/// The `lr skill` verbs.
+#[derive(Subcommand, Debug)]
+pub enum SkillVerb {
+    /// Write the skill document to disk and print its path.
+    Path,
+    /// Print the skill document to standard output.
+    Show,
 }
 
 /// What loopreview should do, resolved from the command line (before consulting
@@ -134,7 +344,42 @@ pub enum Action {
     NotYet(&'static str),
 }
 
+/// What the parsed command line dispatches to: the review UI, or a control-plane
+/// verb that runs headless (no terminal required).
+pub enum Dispatch {
+    /// Open the review UI.
+    Tui(Invocation),
+    /// Run a `lr session` verb against a live session.
+    Session(SessionArgs),
+    /// Run a `lr skill` verb.
+    Skill(SkillArgs),
+}
+
 impl Cli {
+    /// Split the parsed command line into a [`Dispatch`]. The control-plane verbs
+    /// (`session`, `skill`) run without a terminal; everything else opens the UI.
+    pub fn dispatch(self) -> Dispatch {
+        let Cli {
+            command,
+            no_watch,
+            exclude_untracked,
+            mode,
+        } = self;
+        match command {
+            Some(Command::Session(args)) => Dispatch::Session(args),
+            Some(Command::Skill(args)) => Dispatch::Skill(args),
+            command => Dispatch::Tui(
+                Cli {
+                    command,
+                    no_watch,
+                    exclude_untracked,
+                    mode,
+                }
+                .resolve(),
+            ),
+        }
+    }
+
     /// Resolve the parsed command line into an [`Invocation`].
     pub fn resolve(self) -> Invocation {
         let no_watch = self.no_watch;
@@ -166,15 +411,12 @@ impl Cli {
             Some(Command::Patch { file: None }) => Action::PatchStdin,
             Some(Command::Pr { query, detect }) => Action::Pr { query, detect },
             Some(Command::Show { .. }) => Action::NotYet("`lr show` (commit review) arrives in M2"),
-            Some(Command::Session { .. }) => {
-                Action::NotYet("`lr session` (control plane) arrives in M3")
-            }
-            Some(Command::Daemon { .. }) => {
-                Action::NotYet("`lr daemon` (control plane) arrives in M3")
-            }
-            Some(Command::Skill { .. }) => {
-                Action::NotYet("`lr skill` (agent skill docs) arrives in M3")
-            }
+            // `session` and `skill` are peeled off by `dispatch` before this.
+            Some(Command::Session(_)) => Action::NotYet("`lr session` is handled by dispatch"),
+            Some(Command::Skill(_)) => Action::NotYet("`lr skill` is handled by dispatch"),
+            Some(Command::Daemon { .. }) => Action::NotYet(
+                "`lr daemon` is reserved; this build hosts a socket per session (see `lr session`)",
+            ),
         }
     }
 }
@@ -281,10 +523,55 @@ mod tests {
     }
 
     #[test]
-    fn reserved_verbs_report_their_milestone() {
+    fn daemon_stays_reserved() {
         assert!(matches!(
-            action_of(&["lr", "session", "list"]),
+            action_of(&["lr", "daemon", "serve"]),
             Action::NotYet(_)
         ));
+    }
+
+    #[test]
+    fn session_and_skill_dispatch_off_the_ui() {
+        assert!(matches!(
+            Cli::parse_from(["lr", "session", "list"]).dispatch(),
+            Dispatch::Session(_)
+        ));
+        assert!(matches!(
+            Cli::parse_from(["lr", "skill", "path"]).dispatch(),
+            Dispatch::Skill(_)
+        ));
+        assert!(matches!(
+            Cli::parse_from(["lr", "diff"]).dispatch(),
+            Dispatch::Tui(_)
+        ));
+    }
+
+    #[test]
+    fn session_comment_add_parses_required_fields() {
+        let cli = Cli::parse_from([
+            "lr", "session", "comment", "add", "--file", "a.rs", "--line", "10", "--body", "hi",
+            "--author", "agent",
+        ]);
+        match cli.dispatch() {
+            Dispatch::Session(args) => match args.verb {
+                SessionVerb::Comment {
+                    action:
+                        CommentAction::Add {
+                            file,
+                            line,
+                            author,
+                            side,
+                            ..
+                        },
+                } => {
+                    assert_eq!(file, "a.rs");
+                    assert_eq!(line, 10);
+                    assert_eq!(author, "agent");
+                    assert_eq!(side, LineSide::New);
+                }
+                other => panic!("expected comment add, got {other:?}"),
+            },
+            _ => panic!("expected a session dispatch"),
+        }
     }
 }

@@ -6,9 +6,12 @@
 
 mod cli;
 mod config;
+mod control;
 mod highlight;
 mod markdown;
 mod prsync;
+mod session_cli;
+mod skill;
 mod store;
 mod textarea;
 mod ui;
@@ -25,7 +28,7 @@ use loopreview_core::{
     DiffError, DiffSource, FilePatchSource, RefSource, StdinPatchSource, WorktreeSource, git,
 };
 
-use cli::{Action, Cli, Invocation, LayoutMode};
+use cli::{Action, Cli, Dispatch, Invocation, LayoutMode};
 
 /// A diff source usable from the watch thread.
 type SharedSource = Arc<dyn DiffSource + Send + Sync>;
@@ -44,12 +47,18 @@ pub fn run() -> ExitCode {
 
 fn try_run() -> Result<()> {
     // clap handles `--help` / `--version` (printing and exiting) before this.
+    // The control-plane verbs run headless (an agent has no terminal); only the
+    // review UI needs a TTY, so split them off before the TTY guard.
     let Invocation {
         action,
         no_watch,
         exclude_untracked,
         mode,
-    } = Cli::parse().resolve();
+    } = match Cli::parse().dispatch() {
+        Dispatch::Session(args) => return session_cli::run(args),
+        Dispatch::Skill(args) => return skill::run(args),
+        Dispatch::Tui(invocation) => invocation,
+    };
 
     // A reserved verb is a usage error; report it regardless of the terminal.
     if let Action::NotYet(message) = &action {

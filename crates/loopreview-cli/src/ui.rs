@@ -28,11 +28,18 @@ use ratatui::text::{Line as TextLine, Span as TextSpan};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
+use loopreview_control::events::EventLog;
+use loopreview_control::protocol::{
+    self, ContextInfo, EventKind, NavigateResult, ReloadResult, Reply, Request, Response,
+    ReviewInfo, SessionInfo,
+};
+
 use loopreview_core::{
     Anchor, Comment, Diff, DiffSource, LineKind, Review, Segment, Side, Thread, ThreadState,
     word_diff,
 };
 
+use crate::control::{self, UiRequest};
 use crate::highlight::{Highlighter, Span as HlSpan};
 use crate::prsync::PrHandle;
 use crate::store::Store;
@@ -194,10 +201,26 @@ pub fn run(session: Session) -> Result<()> {
         store,
         author,
         Highlighter::new(),
-        repo_dir,
+        repo_dir.clone(),
     );
     app.mode = mode;
     app.split_min_width = split_min_width;
+
+    // Host the control plane so agents can read, steer, comment, and wait. A
+    // failure here degrades to a plain UI (no `lr session`), never a crash.
+    let control = control::start(
+        crate::config::sessions_dir().as_deref(),
+        repo_dir.as_deref(),
+        &app.label,
+    );
+    if let Some(control) = &control {
+        app.session_id = control.session_id.clone();
+        app.events = control.events.clone();
+    }
+
+    // The source is kept for on-demand reloads (a control-plane `reload`); the
+    // watcher, when active, gets its own clone.
+    app.source = Some(source.clone());
     if let Some(loader) = loader {
         app.start_loading(loader);
     }
@@ -208,13 +231,20 @@ pub fn run(session: Session) -> Result<()> {
     // Mouse capture and bracketed paste are best-effort: the UI is usable
     // without them, but they make navigation and pasting comments pleasant.
     let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
-    let result = app.event_loop(&mut terminal, updates);
+    let result = app.event_loop(
+        &mut terminal,
+        updates,
+        control.as_ref().map(|c| &c.requests),
+    );
     let _ = execute!(
         std::io::stdout(),
         DisableBracketedPaste,
         DisableMouseCapture
     );
     ratatui::restore();
+    if let Some(control) = &control {
+        control.deregister();
+    }
     result
 }
 
@@ -444,6 +474,12 @@ struct App {
     pr_key: Option<String>,
     /// The repo directory, for reconstructing outdated lines from history.
     repo_dir: Option<PathBuf>,
+    /// The diff source, for an on-demand reload from the control plane.
+    source: Option<Arc<dyn DiffSource + Send + Sync>>,
+    /// This session's control-plane id (empty when the control plane is off).
+    session_id: String,
+    /// The event log the control plane publishes to and `wait` blocks on.
+    events: Arc<EventLog>,
     /// Repaint tick, for the spinner animation.
     tick: usize,
     /// A transient status message (feedback or error).
@@ -523,6 +559,9 @@ impl App {
             pr: None,
             pr_key: None,
             repo_dir,
+            source: None,
+            session_id: String::new(),
+            events: Arc::new(EventLog::new()),
             tick: 0,
             status: None,
             reloaded_at: None,
@@ -617,13 +656,16 @@ impl App {
                 self.relayout();
             }
             Ok(JobOutcome::Resolved { index, resolved }) => {
+                let mut changed = None;
                 if let Some(thread) = self.review.threads.get_mut(index) {
                     thread.state = if resolved {
                         ThreadState::Resolved
                     } else {
                         ThreadState::Open
                     };
+                    changed = Some(thread.id.clone());
                 }
+                self.emit(EventKind::Resolve, changed);
                 self.status = Some(
                     if resolved {
                         "resolved on GitHub"
@@ -749,6 +791,7 @@ impl App {
         }
         // Published drafts are now remote; drop them from the store.
         let _ = self.save_pr_drafts();
+        self.emit(EventKind::Submit, None);
         self.status = Some("review submitted".to_string());
         self.relayout();
     }
@@ -785,17 +828,33 @@ impl App {
         }
     }
 
+    /// Drain and apply control-plane requests against the running review. Reads
+    /// and mutations both run here, on the UI thread, so an agent's comment or
+    /// navigation lands in the same `App` the human is looking at and shows on
+    /// the next repaint.
+    fn poll_control(&mut self, control: Option<&Receiver<UiRequest>>) {
+        let Some(rx) = control else {
+            return;
+        };
+        while let Ok(request) = rx.try_recv() {
+            let response = self.handle_control(request.request);
+            let _ = request.reply.send(response);
+        }
+    }
+
     // -- event loop -------------------------------------------------------
 
     fn event_loop(
         &mut self,
         terminal: &mut DefaultTerminal,
         updates: Option<Receiver<WatchMsg>>,
+        control: Option<&Receiver<UiRequest>>,
     ) -> Result<()> {
         while !self.quit {
             self.tick = self.tick.wrapping_add(1);
             self.poll_loading();
             self.poll_job();
+            self.poll_control(control);
 
             // Drain watch messages: apply the newest diff, or record an error.
             // Held back while composing so an incoming change can't reshuffle the
@@ -886,6 +945,7 @@ impl App {
             .min(self.clines.len().saturating_sub(1));
         self.scroll = self.scroll.min(self.rows_len().saturating_sub(1));
         self.follow_cursor();
+        self.emit(EventKind::Reload, None);
     }
 
     /// Rebuild after the review changed (diff unchanged), keeping the cursor.
@@ -1174,6 +1234,7 @@ impl App {
             );
             return;
         }
+        let id = self.review.threads[idx].id.clone();
         let thread = &mut self.review.threads[idx];
         thread.state = if thread.is_resolved() {
             ThreadState::Open
@@ -1181,6 +1242,7 @@ impl App {
             ThreadState::Resolved
         };
         let resolved = thread.is_resolved();
+        self.emit(EventKind::Resolve, Some(id));
         self.status = self.persist(if resolved { "resolved" } else { "reopened" });
         self.relayout();
     }
@@ -1346,28 +1408,15 @@ impl App {
             self.input = Some(compose);
             return;
         }
-        let comment = Comment {
-            id: generate_id(),
-            author: self.author.clone(),
-            body: compose.area.text().trim_end().to_string(),
-            created_at: now(),
-            remote_id: None,
-        };
+        let author = self.author.clone();
+        let body = compose.area.text();
         self.status = match compose.kind {
             ComposeKind::New(anchor) => {
-                self.review.threads.push(Thread {
-                    id: generate_id(),
-                    anchor,
-                    state: ThreadState::Open,
-                    comments: vec![comment],
-                });
+                self.add_thread(anchor, &author, &body);
                 self.persist("comment added")
             }
-            ComposeKind::Reply(thread_id) => match self.review.thread_mut(&thread_id) {
-                Some(thread) => {
-                    thread.comments.push(comment);
-                    self.persist("reply added")
-                }
+            ComposeKind::Reply(thread_id) => match self.add_reply(&thread_id, &author, &body) {
+                Some(_) => self.persist("reply added"),
                 None => Some("the thread is gone".to_string()),
             },
         };
@@ -1411,6 +1460,384 @@ impl App {
         store
             .save_pr_drafts(key, &drafts)
             .map_err(|e| format!("{e:#}"))
+    }
+
+    // -- comment mutation (shared by the human keys and the control plane) ---
+
+    /// Publish a review event to the control plane's event log.
+    fn emit(&self, kind: EventKind, thread: Option<String>) {
+        self.events.append(kind, thread);
+    }
+
+    /// Append a new thread with a single root comment, returning `(thread_id,
+    /// comment_id)`. Emits a [`EventKind::Comment`]; the caller persists and
+    /// relays out.
+    fn add_thread(&mut self, anchor: Anchor, author: &str, body: &str) -> (String, String) {
+        let comment_id = generate_id();
+        let thread_id = generate_id();
+        self.review.threads.push(Thread {
+            id: thread_id.clone(),
+            anchor,
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: comment_id.clone(),
+                author: author.to_string(),
+                body: body.trim_end().to_string(),
+                created_at: now(),
+                remote_id: None,
+            }],
+        });
+        self.emit(EventKind::Comment, Some(thread_id.clone()));
+        (thread_id, comment_id)
+    }
+
+    /// Append a reply to `thread_id`, returning the new comment id (or `None`
+    /// when the thread is gone). Emits a [`EventKind::Reply`].
+    fn add_reply(&mut self, thread_id: &str, author: &str, body: &str) -> Option<String> {
+        let comment_id = generate_id();
+        let thread = self.review.thread_mut(thread_id)?;
+        thread.comments.push(Comment {
+            id: comment_id.clone(),
+            author: author.to_string(),
+            body: body.trim_end().to_string(),
+            created_at: now(),
+            remote_id: None,
+        });
+        self.emit(EventKind::Reply, Some(thread_id.to_string()));
+        Some(comment_id)
+    }
+
+    // -- control plane (server side; runs on the UI thread) -----------------
+
+    /// Apply one control-plane request against the running review and produce a
+    /// response. `hello` and `wait` are handled by the socket thread and never
+    /// reach here.
+    fn handle_control(&mut self, request: Request) -> Response {
+        let reply = match request {
+            Request::Hello { .. } => return Response::Error("unexpected hello".to_string()),
+            Request::Wait(_) => {
+                return Response::Error("wait is served by the socket thread".to_string());
+            }
+            Request::Get => Reply::Session(self.session_info()),
+            Request::Context => Reply::Context(self.context_info()),
+            Request::Review { include_patch } => Reply::Review(self.review_info(include_patch)),
+            Request::CommentList => Reply::Threads {
+                threads: self.thread_infos(),
+            },
+            Request::Navigate(nav) => match self.control_navigate(nav) {
+                Ok(result) => Reply::Navigate(result),
+                Err(message) => return Response::Error(message),
+            },
+            Request::Reload => match self.control_reload() {
+                Ok(result) => Reply::Reload(result),
+                Err(message) => return Response::Error(message),
+            },
+            Request::CommentAdd(add) => match self.control_comment_add(add) {
+                Ok(result) => Reply::Comment(result),
+                Err(message) => return Response::Error(message),
+            },
+            Request::CommentReply(reply) => match self.control_comment_reply(reply) {
+                Ok(result) => Reply::Comment(result),
+                Err(message) => return Response::Error(message),
+            },
+            Request::CommentResolve(resolve) => match self.control_comment_resolve(resolve) {
+                Ok(result) => Reply::Resolve(result),
+                Err(message) => return Response::Error(message),
+            },
+        };
+        Response::Ok(reply)
+    }
+
+    /// This session's identity and source, for `lr session get`.
+    fn session_info(&self) -> SessionInfo {
+        SessionInfo {
+            id: self.session_id.clone(),
+            pid: std::process::id(),
+            repo: self
+                .repo_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            source: self.label.clone(),
+        }
+    }
+
+    /// The human reviewer's current focus, for `lr session context`.
+    fn context_info(&self) -> ContextInfo {
+        let view = match self.view {
+            View::Files => "files",
+            View::Conversation => "conversation",
+        }
+        .to_string();
+        let cursor = self.current_anchor();
+        let thread = match self.view {
+            View::Conversation => self
+                .review
+                .threads
+                .get(self.conv_cursor)
+                .map(|t| t.id.clone()),
+            View::Files => self
+                .thread_at_cursor()
+                .map(|idx| self.review.threads[idx].id.clone()),
+        };
+        ContextInfo {
+            view,
+            file: cursor.as_ref().map(|a| a.path.clone()),
+            side: cursor
+                .as_ref()
+                .map(|a| if a.new_side { Side::New } else { Side::Old }),
+            line: cursor.as_ref().map(|a| a.line),
+            thread,
+            event_seq: self.events.latest_seq(),
+        }
+    }
+
+    /// The diff structure and threads, for `lr session review`.
+    fn review_info(&self, include_patch: bool) -> ReviewInfo {
+        ReviewInfo {
+            source: self.label.clone(),
+            base: self.diff.provenance.base.clone(),
+            head: self.diff.provenance.head.clone(),
+            files: self
+                .diff
+                .files
+                .iter()
+                .map(|f| control::file_info(f, include_patch))
+                .collect(),
+            threads: self.thread_infos(),
+        }
+    }
+
+    /// The review's threads with their outdated flags, for `lr session review`
+    /// and `comment list`.
+    fn thread_infos(&self) -> Vec<protocol::ThreadInfo> {
+        self.review
+            .threads
+            .iter()
+            .map(|t| control::thread_info(t, control::anchor_outdated(&self.diff, &t.anchor)))
+            .collect()
+    }
+
+    /// Move the reviewer's cursor and view (a control-plane `navigate`).
+    fn control_navigate(&mut self, nav: protocol::Navigate) -> Result<NavigateResult, String> {
+        if let Some(thread_id) = nav.thread {
+            let idx = self
+                .review
+                .threads
+                .iter()
+                .position(|t| t.id == thread_id)
+                .ok_or_else(|| format!("no thread {thread_id}"))?;
+            let anchor = self.review.threads[idx].anchor.clone();
+            if let Anchor::Line {
+                file, side, end, ..
+            } = anchor
+            {
+                let target = CursorAnchor {
+                    path: file.clone(),
+                    new_side: side == Side::New,
+                    line: end,
+                };
+                if let Some(cursor) = self.find_anchor(&target) {
+                    self.view = View::Files;
+                    self.set_cursor(cursor);
+                    self.conv_cursor = idx;
+                    self.status = Some(format!("agent → {file}:{end}"));
+                    return Ok(NavigateResult {
+                        moved: true,
+                        file: Some(file),
+                        line: Some(end),
+                    });
+                }
+            }
+            // A file/review anchor, or an outdated line: select it in the
+            // Conversation view instead.
+            self.view = View::Conversation;
+            self.set_conv(idx);
+            self.status = Some("agent → conversation".to_string());
+            let file = self.review.threads[idx].anchor.file().map(str::to_string);
+            return Ok(NavigateResult {
+                moved: true,
+                file,
+                line: None,
+            });
+        }
+
+        match (nav.file, nav.line) {
+            (Some(file), Some(line)) => {
+                let side = nav.side.unwrap_or(Side::New);
+                let target = CursorAnchor {
+                    path: file.clone(),
+                    new_side: side == Side::New,
+                    line,
+                };
+                match self.find_anchor(&target) {
+                    Some(cursor) => {
+                        self.view = View::Files;
+                        self.set_cursor(cursor);
+                        self.status = Some(format!("agent → {file}:{line}"));
+                        Ok(NavigateResult {
+                            moved: true,
+                            file: Some(file),
+                            line: Some(line),
+                        })
+                    }
+                    None => Ok(NavigateResult {
+                        moved: false,
+                        file: Some(file),
+                        line: Some(line),
+                    }),
+                }
+            }
+            _ => Err("navigate needs --thread, or --file with --line".to_string()),
+        }
+    }
+
+    /// Reload the current source (a control-plane `reload`). A pull request
+    /// re-pulls in the background; a git/patch source reloads synchronously.
+    fn control_reload(&mut self) -> Result<ReloadResult, String> {
+        if self.pr.is_some() {
+            self.refresh();
+            self.status = Some("agent: reloading…".to_string());
+            return Ok(ReloadResult { started: true });
+        }
+        let Some(source) = self.source.clone() else {
+            return Err("this source cannot be reloaded".to_string());
+        };
+        match source.load() {
+            Ok(diff) => {
+                self.reload(diff);
+                self.status = Some("agent: reloaded".to_string());
+                Ok(ReloadResult { started: false })
+            }
+            Err(e) => Err(format!("reload failed: {e:#}")),
+        }
+    }
+
+    /// Add a comment thread at a line (a control-plane `comment add`).
+    fn control_comment_add(
+        &mut self,
+        add: protocol::CommentAdd,
+    ) -> Result<protocol::CommentResult, String> {
+        if self.store.is_none() && self.pr.is_none() {
+            return Err("comments need a git repository or a pull request".to_string());
+        }
+        // Locate the line so the anchor captures its commit and context.
+        let file_idx = self
+            .diff
+            .files
+            .iter()
+            .position(|f| f.display_path() == add.file)
+            .ok_or_else(|| format!("no file {} in the current review", add.file))?;
+        let found = self.diff.files[file_idx]
+            .hunks
+            .iter()
+            .enumerate()
+            .find_map(|(hi, h)| {
+                h.lines
+                    .iter()
+                    .position(|l| {
+                        let n = if add.side == Side::New {
+                            l.new_lineno
+                        } else {
+                            l.old_lineno
+                        };
+                        n == Some(add.line)
+                    })
+                    .map(|li| (hi, li))
+            });
+        let (hi, li) = found.ok_or_else(|| {
+            format!(
+                "line {} ({}) is not shown in the diff for {}",
+                add.line,
+                if add.side == Side::New { "new" } else { "old" },
+                add.file
+            )
+        })?;
+        let commit = if add.side == Side::New {
+            self.diff.provenance.head.clone()
+        } else {
+            self.diff.provenance.base.clone()
+        };
+        let context = context_snippet(&self.diff.files[file_idx].hunks[hi], li);
+        let anchor = Anchor::Line {
+            file: add.file.clone(),
+            side: add.side,
+            start: add.line,
+            end: add.line,
+            commit,
+            context,
+        };
+        let (thread, comment) = self.add_thread(anchor, &add.author, &add.body);
+        let draft = self.pr.is_some();
+        let done = self.persist("comment added").unwrap_or_default();
+        self.relayout();
+        self.status = Some(format!("agent: {done} ({}:{})", add.file, add.line));
+        Ok(protocol::CommentResult {
+            thread,
+            comment,
+            draft,
+        })
+    }
+
+    /// Reply to a thread (a control-plane `comment reply`).
+    fn control_comment_reply(
+        &mut self,
+        reply: protocol::CommentReply,
+    ) -> Result<protocol::CommentResult, String> {
+        if self.store.is_none() && self.pr.is_none() {
+            return Err("comments need a git repository or a pull request".to_string());
+        }
+        let comment = self
+            .add_reply(&reply.thread, &reply.author, &reply.body)
+            .ok_or_else(|| format!("no thread {}", reply.thread))?;
+        let draft = self.pr.is_some();
+        let done = self.persist("reply added").unwrap_or_default();
+        self.relayout();
+        self.status = Some(format!("agent: {done}"));
+        Ok(protocol::CommentResult {
+            thread: reply.thread,
+            comment,
+            draft,
+        })
+    }
+
+    /// Resolve or reopen a thread (a control-plane `comment resolve`). Refuses a
+    /// published pull-request thread: pushing that to GitHub is a human action.
+    fn control_comment_resolve(
+        &mut self,
+        resolve: protocol::CommentResolve,
+    ) -> Result<protocol::ResolveResult, String> {
+        let idx = self
+            .review
+            .threads
+            .iter()
+            .position(|t| t.id == resolve.thread)
+            .ok_or_else(|| format!("no thread {}", resolve.thread))?;
+        let published = self.review.threads[idx]
+            .root()
+            .is_some_and(|c| c.remote_id.is_some());
+        if published {
+            return Err(
+                "resolving a published pull-request thread is a human action (press x in the TUI)"
+                    .to_string(),
+            );
+        }
+        let thread = &mut self.review.threads[idx];
+        thread.state = if resolve.resolved {
+            ThreadState::Resolved
+        } else {
+            ThreadState::Open
+        };
+        let resolved = thread.is_resolved();
+        self.emit(EventKind::Resolve, Some(resolve.thread.clone()));
+        let done = self
+            .persist(if resolved { "resolved" } else { "reopened" })
+            .unwrap_or_default();
+        self.relayout();
+        self.status = Some(format!("agent: {done}"));
+        Ok(protocol::ResolveResult {
+            thread: resolve.thread,
+            resolved,
+        })
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) {

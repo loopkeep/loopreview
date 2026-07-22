@@ -36,6 +36,12 @@ impl Config {
     }
 }
 
+/// The directory holding one JSON record per live review session, under the
+/// config directory. Used by the control plane's registry.
+pub fn sessions_dir() -> Option<PathBuf> {
+    Some(config_dir()?.join("loopreview").join("sessions"))
+}
+
 /// The user's config directory: `$XDG_CONFIG_HOME` or `~/.config` on Unix,
 /// `%APPDATA%` on Windows. Shared by the config and the review store.
 pub fn config_dir() -> Option<PathBuf> {
