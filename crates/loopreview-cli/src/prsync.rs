@@ -49,6 +49,11 @@ pub struct PrHandle {
 }
 
 impl PrHandle {
+    /// The store key for this PR's drafts, `owner/repo#number`.
+    pub fn pr_key(&self) -> String {
+        format!("{}#{}", self.pr.slug(), self.pr.number)
+    }
+
     /// Re-pull the PR's threads from GitHub.
     pub fn pull(&self) -> Result<Vec<Thread>, String> {
         self.client.pull(&self.pr).map_err(|e| e.to_string())

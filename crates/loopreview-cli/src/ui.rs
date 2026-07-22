@@ -117,6 +117,8 @@ pub struct Loaded {
     pub review: Review,
     /// The PR handle, when this load is a pull request (enables sync/submit).
     pub pr: Option<PrHandle>,
+    /// The store key for this PR's drafts (`owner/repo#number`), if a PR.
+    pub pr_key: Option<String>,
 }
 
 /// A background load job: reports progress via the callback, then yields the
@@ -424,6 +426,8 @@ struct App {
     job: Option<Job>,
     /// The pull-request handle, when reviewing a PR (enables sync/submit).
     pr: Option<Arc<PrHandle>>,
+    /// The store key for the current PR's drafts (`owner/repo#number`).
+    pr_key: Option<String>,
     /// Repaint tick, for the spinner animation.
     tick: usize,
     /// A transient status message (feedback or error).
@@ -491,6 +495,7 @@ impl App {
             load_error: None,
             job: None,
             pr: None,
+            pr_key: None,
             tick: 0,
             status: None,
             reloaded_at: None,
@@ -523,6 +528,7 @@ impl App {
         self.label = loaded.label;
         self.review = loaded.review;
         self.pr = loaded.pr.map(Arc::new);
+        self.pr_key = loaded.pr_key;
         self.apply_layout(loaded.diff);
         self.cursor = 0;
         self.scroll = 0;
@@ -714,6 +720,8 @@ impl App {
                 comment.remote_id = Some(stamp.remote_id);
             }
         }
+        // Published drafts are now remote; drop them from the store.
+        let _ = self.save_pr_drafts();
         self.status = Some("review submitted".to_string());
         self.relayout();
     }
@@ -1168,13 +1176,26 @@ impl App {
         }
     }
 
-    /// Close the review: delete the store and clear all threads.
+    /// Close the review. For a pull request this discards the local drafts
+    /// (published comments stay); otherwise it deletes the local review store.
     fn close_review(&mut self) {
-        self.status = match self.store.as_ref().map(Store::delete) {
-            Some(Ok(())) | None => Some("review closed".to_string()),
-            Some(Err(e)) => Some(format!("could not remove the store: {e:#}")),
-        };
-        self.review.threads.clear();
+        if self.pr.is_some() {
+            // Drop fully-local draft threads and draft replies; keep published.
+            self.review
+                .threads
+                .retain(|t| t.root().is_some_and(|c| c.remote_id.is_some()));
+            for thread in &mut self.review.threads {
+                thread.comments.retain(|c| c.remote_id.is_some());
+            }
+            let _ = self.save_pr_drafts();
+            self.status = Some("drafts discarded".to_string());
+        } else {
+            self.status = match self.store.as_ref().map(Store::delete) {
+                Some(Ok(())) | None => Some("review closed".to_string()),
+                Some(Err(e)) => Some(format!("could not remove the store: {e:#}")),
+            };
+            self.review.threads.clear();
+        }
         self.conv_cursor = 0;
         self.conv_scroll = 0;
         self.view = View::Files;
@@ -1296,15 +1317,41 @@ impl App {
 
     /// Save the review, returning a status message describing the outcome.
     fn persist(&self, done: &str) -> Option<String> {
+        // In a pull request, only the drafts are stored (published comments are
+        // re-pulled); they are sent on submit.
+        if self.pr.is_some() {
+            return match self.save_pr_drafts() {
+                Ok(()) => Some(format!("{done} — draft saved, Ctrl-S to submit")),
+                Err(e) => Some(format!("{done}, but save failed: {e}")),
+            };
+        }
         match &self.store {
             Some(store) => match store.save(&self.review) {
                 Ok(()) => Some(done.to_string()),
                 Err(e) => Some(format!("{done}, but save failed: {e:#}")),
             },
-            // A pull-request draft is not stored; it is sent on submit.
-            None if self.pr.is_some() => Some(format!("{done} — draft, Ctrl-S to submit")),
             None => Some(format!("{done} (not saved)")),
         }
+    }
+
+    /// Persist the current PR's draft-only threads (those with an unpublished
+    /// comment). This is a no-op outside a pull request.
+    fn save_pr_drafts(&self) -> Result<(), String> {
+        let (Some(store), Some(key)) = (&self.store, &self.pr_key) else {
+            return Ok(());
+        };
+        let drafts = Review {
+            threads: self
+                .review
+                .threads
+                .iter()
+                .filter(|t| t.comments.iter().any(|c| c.remote_id.is_none()))
+                .cloned()
+                .collect(),
+        };
+        store
+            .save_pr_drafts(key, &drafts)
+            .map_err(|e| format!("{e:#}"))
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
@@ -1750,12 +1797,16 @@ impl App {
             .border_style(Style::default().fg(Color::Yellow));
         let inner = block.inner(area);
         f.render_widget(block, area);
-        let count = self.review.threads.len();
+        let prompt = if self.pr.is_some() {
+            "Discard your local drafts for this pull request?".to_string()
+        } else {
+            format!(
+                "Delete all {} thread(s) and close this review?",
+                self.review.threads.len()
+            )
+        };
         let lines = vec![
-            TextLine::from(TextSpan::styled(
-                format!("Delete all {count} thread(s) and close this review?"),
-                Style::default().fg(Color::White),
-            )),
+            TextLine::from(TextSpan::styled(prompt, Style::default().fg(Color::White))),
             TextLine::from(""),
             TextLine::from(TextSpan::styled(
                 "y / Enter confirm · any other key cancel",

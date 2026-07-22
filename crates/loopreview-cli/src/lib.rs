@@ -122,13 +122,30 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
     let dir = repo_root()?;
     let pr_query = prsync::query(query, detect).map_err(|m| anyhow!(m))?;
     let author = git::config(&dir, "user.name").unwrap_or_else(|| "you".to_string());
+
+    // The PR's drafts persist in this repo's store; the loader re-attaches them
+    // after the pull (the same merge the refresh action uses).
+    let common = git::common_dir(&dir);
+    let store = common.as_deref().and_then(store::Store::for_repo);
+    let draft_common = common;
     let loader: ui::Loader = Box::new(move |progress| {
         let (handle, label, diff, threads) = prsync::fetch(dir, pr_query, progress)?;
+        let pr_key = handle.pr_key();
+        let review = match draft_common.as_deref().and_then(store::Store::for_repo) {
+            Some(store) => {
+                let drafts = store.load_pr_drafts(&pr_key).unwrap_or_default();
+                loopreview_core::Review {
+                    threads: prsync::merge_drafts(&drafts, threads),
+                }
+            }
+            None => loopreview_core::Review { threads },
+        };
         Ok(ui::Loaded {
             label,
             diff,
-            review: loopreview_core::Review { threads },
+            review,
             pr: Some(handle),
+            pr_key: Some(pr_key),
         })
     });
 
@@ -140,7 +157,7 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
         watch_root: None,
         mode: layout_mode(mode),
         review: loopreview_core::Review::default(),
-        store: None,
+        store,
         author,
         split_min_width: config::Config::load().split_min_width,
         loader: Some(loader),
