@@ -10,6 +10,14 @@
 //!
 //! Structural keys (quit, view switch, and the modal keys such as Ctrl-S / Esc in
 //! the composer) are handled directly by the UI, not through this map.
+//!
+//! Convention (enforced by `no_two_actions_share_a_default_key`): every action's
+//! default key is unique. Unmodified letters are contextual actions; `Ctrl`
+//! combos are structural/global (paging, finder, refresh, submit); an uppercase
+//! (Shift) letter is the heavier sibling of its lowercase action (`V` select vs
+//! `v` layout, `X` close vs `x` resolve, `G`/`g`). When adding an [`Action`],
+//! pick a key not already in `DEFAULTS`/`FIXED` and list it in the README
+//! `[keys]` table — the test fails on a collision.
 
 use std::collections::HashMap;
 
@@ -291,5 +299,40 @@ mod tests {
         let errors = Keymap::from_overrides(&bad).unwrap_err();
         assert!(errors.iter().any(|e| e.contains("comment")));
         assert!(errors.iter().any(|e| e.contains("nonexistent")));
+    }
+
+    #[test]
+    fn no_two_actions_share_a_default_key() {
+        // The permanent rule, machine-checked: every remappable action's default
+        // key is unique, so the built-in keymap can never silently shadow one
+        // action with another. Adding an `Action` means choosing a free key (and
+        // listing it in the README `[keys]` table).
+        let mut seen: HashMap<(KeyCode, KeyModifiers), &str> = HashMap::new();
+        for (_, name, key) in DEFAULTS {
+            let binding = parse_key(key).expect("every default key parses");
+            if let Some(prev) = seen.insert(binding, name) {
+                panic!("default key `{key}` is bound to both `{prev}` and `{name}`");
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_alternates_never_shadow_a_different_action() {
+        // A fixed alternate may intentionally duplicate a default (`enter` and
+        // `l` both mean NavIn), but must never bind a key that a default already
+        // gives to a *different* action.
+        let defaults: HashMap<(KeyCode, KeyModifiers), Action> = DEFAULTS
+            .iter()
+            .map(|(action, _, key)| (parse_key(key).unwrap(), *action))
+            .collect();
+        for (key, action) in FIXED {
+            let binding = parse_key(key).unwrap();
+            if let Some(default_action) = defaults.get(&binding) {
+                assert_eq!(
+                    default_action, action,
+                    "fixed key `{key}` collides with a default bound elsewhere"
+                );
+            }
+        }
     }
 }

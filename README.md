@@ -256,7 +256,8 @@ an invalid binding is reported at startup with the offending line. Action names:
 `cursor_down`, `cursor_up`, `half_page_down`, `half_page_up`, `top`, `bottom`,
 `next_file`, `prev_file`, `next_hunk`, `prev_hunk`, `nav_in`, `nav_out`,
 `scroll_left`, `scroll_right`, `layout_toggle`, `comment`, `reply`, `resolve`,
-`fold`, `select`, `close_review`, `sidebar`, `file_finder`, `refresh`, `submit`.
+`fold`, `select`, `close_review`, `delete`, `edit`, `toggle_kind`, `sidebar`,
+`file_finder`, `refresh`, `submit`.
 
 ```toml
 split_min_width = 160
