@@ -1458,6 +1458,7 @@ impl App {
             Action::ScrollRight => self.hscroll_by(HSCROLL_STEP),
             Action::Select => self.start_selection(),
             Action::Delete => self.request_delete(),
+            Action::ToggleKind => self.toggle_selected_kind(),
             _ => {}
         }
     }
@@ -1468,6 +1469,59 @@ impl App {
             Some(idx) => self.confirming_delete = Some(idx),
             None => self.status = Some("no draft thread here to remove".to_string()),
         }
+    }
+
+    /// The thread the selection points at (Conversation or Files), whatever its
+    /// kind — for the local⇄draft toggle.
+    fn selected_thread_any(&self) -> Option<usize> {
+        if self.view == View::Conversation {
+            self.selected_thread()
+        } else {
+            self.thread_at_cursor()
+        }
+    }
+
+    /// Toggle the selected thread's root between a local note and a draft (a
+    /// human action, e.g. adopting an agent's note to send it). Only on a pull
+    /// request, and only for an unpublished comment.
+    fn toggle_selected_kind(&mut self) {
+        if self.pr.is_none() {
+            self.status = Some("local/draft applies only to a pull request".to_string());
+            return;
+        }
+        let Some(idx) = self.selected_thread_any() else {
+            self.status = Some("no comment selected".to_string());
+            return;
+        };
+        let now_draft = {
+            let Some(root) = self.review.threads[idx].comments.first_mut() else {
+                return;
+            };
+            if root.is_published() {
+                self.status = Some("a published comment can't change kind".to_string());
+                return;
+            }
+            root.kind = if root.kind == CommentKind::Local {
+                CommentKind::Draft
+            } else {
+                CommentKind::Local
+            };
+            root.kind == CommentKind::Draft
+        };
+        let _ = self.persist(if now_draft {
+            "queued as draft"
+        } else {
+            "kept local"
+        });
+        self.relayout();
+        self.status = Some(
+            if now_draft {
+                "→ draft (will submit on Ctrl-S)"
+            } else {
+                "→ local (kept off GitHub)"
+            }
+            .to_string(),
+        );
     }
 
     /// The thread the selection points at (Conversation: the selected thread;
@@ -2216,6 +2270,7 @@ impl App {
             }
             Action::CloseReview if self.has_review() => self.confirming_close = true,
             Action::Delete => self.request_delete(),
+            Action::ToggleKind => self.toggle_selected_kind(),
             Action::Fold => self.toggle_collapse_conv(),
             // l: a collapsed thread expands; an open one scrolls to its top.
             Action::NavIn => {
@@ -6159,6 +6214,40 @@ mod tests {
         assert!(
             pr.review.threads[1].root().unwrap().is_draft(),
             "--draft queues the comment"
+        );
+    }
+
+    #[test]
+    fn t_toggles_a_thread_between_local_and_draft_on_a_pr() {
+        let mut app = pr_app();
+        // An agent left a local note; the human adopts it as a draft with `t`.
+        add(&mut app, 2, false);
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        assert!(app.review.threads[0].root().unwrap().is_local());
+        app.on_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(
+            app.review.threads[0].root().unwrap().is_draft(),
+            "t promotes a local note to a draft"
+        );
+        app.on_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(
+            app.review.threads[0].root().unwrap().is_local(),
+            "t again demotes it back to local"
+        );
+
+        // In a local review the toggle is a no-op with an explanatory status.
+        let mut local = sample_app();
+        add(&mut local, 2, false);
+        local.view = View::Conversation;
+        local.on_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(local.review.threads[0].root().unwrap().is_local());
+        assert!(
+            local
+                .status
+                .as_deref()
+                .unwrap_or("")
+                .contains("pull request")
         );
     }
 
