@@ -82,7 +82,10 @@ pub fn run(check_only: bool) -> Result<()> {
     }
 
     let asset = asset_name(&latest, target);
-    let work = TempDir::new()?;
+    // Stage under the install directory: same filesystem as the target (so the
+    // final rename never crosses a device) and a directory the user owns.
+    let install_dir = install_dir()?;
+    let work = TempDir::new_in(&install_dir)?;
     eprintln!("downloading v{latest} for {target}…");
     backend.download(&release, &asset, work.path())?;
 
@@ -104,7 +107,6 @@ pub fn run(check_only: bool) -> Result<()> {
     extract_binaries(&archive_path, work.path())
         .with_context(|| format!("extracting {}", archive_path.display()))?;
 
-    let install_dir = install_dir()?;
     install_all(work.path(), &install_dir)?;
 
     println!("updated v{current} → v{latest}");
@@ -682,16 +684,34 @@ fn write_error(dir: &Path, target: &Path, source: io::Error) -> anyhow::Error {
 struct TempDir(PathBuf);
 
 impl TempDir {
-    /// Create a uniquely named temp directory under the system temp dir.
-    fn new() -> Result<TempDir> {
+    /// Create a uniquely named private working directory under `base`.
+    ///
+    /// Staging lives under the install directory rather than the system temp dir:
+    /// it shares the target's filesystem (so the final `rename` never crosses a
+    /// device) and sits in a directory the user already owns, avoiding the symlink
+    /// races a world-writable `/tmp` invites. It is restricted to the owner (0700)
+    /// on Unix and removed on drop.
+    fn new_in(base: &Path) -> Result<TempDir> {
         let nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir =
-            std::env::temp_dir().join(format!("loopreview-update-{}-{nanos}", std::process::id()));
+        let dir = base.join(format!(".loopreview-update-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("restricting {}", dir.display()))?;
+        }
         Ok(TempDir(dir))
+    }
+
+    /// Create a uniquely named temp directory under the system temp dir (tests
+    /// only; the update itself stages under the install directory).
+    #[cfg(test)]
+    fn new() -> Result<TempDir> {
+        TempDir::new_in(&std::env::temp_dir())
     }
 
     /// The directory's path.
@@ -920,6 +940,21 @@ mod tests {
             fs::metadata(&target).unwrap().permissions().mode() & 0o111,
             0
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_is_created_under_the_base_dir_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = TempDir::new().unwrap();
+        let work = TempDir::new_in(base.path()).unwrap();
+        assert!(
+            work.path().starts_with(base.path()),
+            "staging lives under the install directory"
+        );
+        let mode = fs::metadata(work.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "staging is restricted to its owner");
     }
 
     #[cfg(not(windows))]
