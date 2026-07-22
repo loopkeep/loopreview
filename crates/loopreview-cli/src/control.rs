@@ -265,6 +265,7 @@ pub fn thread_info(thread: &Thread, outdated: bool) -> ThreadInfo {
         anchor: anchor_info(&thread.anchor),
         state: state.to_string(),
         outdated,
+        draft: thread.root().is_some_and(|c| c.is_draft()),
         comments: thread
             .comments
             .iter()
@@ -517,6 +518,7 @@ mod tests {
         assert_eq!(info.anchor.side, Some(Side::New));
         assert_eq!(info.anchor.end, Some(2));
         assert!(info.comments[0].draft);
+        assert!(info.draft, "a draft root marks the thread as a draft");
     }
 
     #[test]

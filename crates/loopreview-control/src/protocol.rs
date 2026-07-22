@@ -278,6 +278,9 @@ pub struct ThreadInfo {
     pub state: String,
     /// True when the anchor line is not present in the current diff.
     pub outdated: bool,
+    /// True when the thread's root comment is an unpublished draft (a quick way
+    /// to tell an agent's own drafts from pulled/published threads).
+    pub draft: bool,
     /// The comments, oldest first.
     pub comments: Vec<CommentInfo>,
 }
@@ -493,6 +496,7 @@ mod tests {
             anchor: anchor.clone(),
             state: "open".into(),
             outdated: false,
+            draft: true,
             comments: vec![CommentInfo {
                 id: "c1".into(),
                 author: "agent".into(),
