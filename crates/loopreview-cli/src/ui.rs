@@ -4145,7 +4145,7 @@ impl App {
             spans.push(TextSpan::styled(help, bar.fg(Color::DarkGray)));
             if self.pr.is_some() {
                 spans.push(TextSpan::styled(
-                    "  · ^r refresh · ^s submit",
+                    "  · t kind · ^r refresh · ^s submit",
                     bar.fg(Color::Rgb(120, 160, 220)),
                 ));
             }
@@ -4527,13 +4527,19 @@ impl App {
                     ),
                     TextSpan::styled(format!("{glyph} "), base.fg(glyph_fg)),
                 ];
-                // Right-fixed cluster: the author, then the reply count.
+                // Right-fixed cluster: a compact kind badge (the narrow index
+                // abbreviates the wide views' `[local]`/`[draft]`), the author,
+                // then the reply count.
                 let replies = thread.comments.len().saturating_sub(1);
                 let author = thread.root().map(|c| c.author.as_str()).unwrap_or("");
-                let mut right = vec![TextSpan::styled(
+                let mut right = Vec::new();
+                if let Some((badge, fg)) = thread.root().and_then(kind_index_badge) {
+                    right.push(TextSpan::styled(format!(" {badge}"), base.fg(fg)));
+                }
+                right.push(TextSpan::styled(
                     format!(" {author}"),
                     base.fg(Color::DarkGray),
-                )];
+                ));
                 if replies > 0 {
                     right.push(TextSpan::styled(
                         format!(" ↩{replies}"),
@@ -5049,6 +5055,12 @@ fn build_comment_blocks(
                         .add_modifier(Modifier::BOLD),
                 ),
             ];
+            if let Some((badge, fg)) = thread.root().and_then(kind_badge) {
+                header.push(TextSpan::styled(
+                    format!("  {badge}"),
+                    Style::default().fg(fg),
+                ));
+            }
             if thread.is_resolved() {
                 header.push(TextSpan::styled(
                     "  [resolved]",
@@ -5125,6 +5137,12 @@ fn build_conversation(
                         .add_modifier(Modifier::BOLD),
                 ),
             ];
+            if let Some((badge, fg)) = thread.root().and_then(kind_badge) {
+                header.push(TextSpan::styled(
+                    format!("  {badge}"),
+                    Style::default().fg(fg),
+                ));
+            }
             if replies > 0 {
                 header.push(TextSpan::styled(
                     format!("  ↩{replies}"),
@@ -5171,7 +5189,7 @@ fn build_conversation(
             }
 
             if let Some(root) = thread.root() {
-                lines.push(comment_meta_line(&root.author, root.created_at, now, false));
+                lines.push(comment_meta_line(root, now, false));
                 lines.extend(crate::markdown::render(
                     &root.body,
                     Some(width),
@@ -5179,12 +5197,7 @@ fn build_conversation(
                 ));
             }
             for reply in thread.replies() {
-                lines.push(comment_meta_line(
-                    &reply.author,
-                    reply.created_at,
-                    now,
-                    true,
-                ));
+                lines.push(comment_meta_line(reply, now, true));
                 for line in
                     crate::markdown::render(&reply.body, Some(width.saturating_sub(2)), highlighter)
                 {
@@ -5199,21 +5212,29 @@ fn build_conversation(
 }
 
 /// The author/timestamp line for a comment; replies are marked and indented.
-fn comment_meta_line(author: &str, created_at: u64, now: u64, reply: bool) -> TextLine<'static> {
+/// A `[local]`/`[draft]` badge follows when the comment is unpublished.
+fn comment_meta_line(comment: &Comment, now: u64, reply: bool) -> TextLine<'static> {
     let prefix = if reply { "  ↳ " } else { "" };
-    TextLine::from(vec![
+    let mut spans = vec![
         TextSpan::styled(prefix, Style::default().fg(Color::DarkGray)),
         TextSpan::styled(
-            author.to_string(),
+            comment.author.clone(),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
         TextSpan::styled(
-            format!("  · {}", relative_time(created_at, now)),
+            format!("  · {}", relative_time(comment.created_at, now)),
             Style::default().fg(Color::DarkGray),
         ),
-    ])
+    ];
+    if let Some((badge, fg)) = kind_badge(comment) {
+        spans.push(TextSpan::styled(
+            format!("  {badge}"),
+            Style::default().fg(fg),
+        ));
+    }
+    TextLine::from(spans)
 }
 
 /// A code excerpt for a placed line-anchored thread: the anchored range plus a
@@ -5415,6 +5436,30 @@ fn thread_index_label(anchor: &Anchor) -> String {
         }
         Anchor::File { file } => file.clone(),
         Anchor::Review => "conversation".to_string(),
+    }
+}
+
+/// The disposition badge for a comment: `[local]` (subdued — never sent) or
+/// `[draft]` (attention — queued to submit). A published comment has none.
+fn kind_badge(comment: &Comment) -> Option<(&'static str, Color)> {
+    if comment.is_published() {
+        None
+    } else if comment.is_local() {
+        Some(("[local]", Color::DarkGray))
+    } else {
+        Some(("[draft]", Color::Yellow))
+    }
+}
+
+/// The compact index form of [`kind_badge`]: `[l]`/`[d]` for the narrow
+/// sidebar, with the same colors. A published comment has none.
+fn kind_index_badge(comment: &Comment) -> Option<(&'static str, Color)> {
+    if comment.is_published() {
+        None
+    } else if comment.is_local() {
+        Some(("[l]", Color::DarkGray))
+    } else {
+        Some(("[d]", Color::Yellow))
     }
 }
 
@@ -6308,6 +6353,38 @@ mod tests {
         );
         let (_, _, _, foreign) = solo.draft_summary();
         assert!(!foreign, "only the human's own drafts — no warning");
+    }
+
+    #[test]
+    fn kind_badges_reflect_disposition() {
+        let mk = |kind, remote: Option<&str>| Comment {
+            id: "c".into(),
+            author: "a".into(),
+            body: "b".into(),
+            created_at: 0,
+            remote_id: remote.map(str::to_string),
+            kind,
+        };
+        // Published (it has a remote id) shows no badge, whatever the kind.
+        assert_eq!(kind_badge(&mk(CommentKind::Draft, Some("R1"))), None);
+        assert_eq!(kind_index_badge(&mk(CommentKind::Draft, Some("R1"))), None);
+        // Local is the subdued default; draft draws attention.
+        assert_eq!(
+            kind_badge(&mk(CommentKind::Local, None)).unwrap().0,
+            "[local]"
+        );
+        assert_eq!(
+            kind_badge(&mk(CommentKind::Draft, None)).unwrap().0,
+            "[draft]"
+        );
+        assert_eq!(
+            kind_index_badge(&mk(CommentKind::Local, None)).unwrap().0,
+            "[l]"
+        );
+        assert_eq!(
+            kind_index_badge(&mk(CommentKind::Draft, None)).unwrap().0,
+            "[d]"
+        );
     }
 
     #[test]
