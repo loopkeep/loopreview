@@ -2,19 +2,24 @@
 
 loopreview (`lr`) is a review-first diff viewer for the terminal. It opens a
 diff in an interactive TUI so you can read changes hunk by hunk, with syntax
-highlighting and file/hunk navigation. With no arguments it shows the working
-tree; give a target such as `main...` or `HEAD~3` to compare git refs; or pipe a
-patch straight in.
+highlighting, intra-line emphasis of exactly what changed, and unified or
+side-by-side layout (chosen automatically by width). With no arguments it shows
+the working tree; `lr diff <target>` compares git refs; `lr patch` reviews a
+saved or piped patch.
 
 ```sh
 lr                 # review the working tree (staged + unstaged vs HEAD)
-lr main...         # review this branch's changes off main
-lr diff HEAD~3     # review the last three commits
-git diff | lr      # review a patch from stdin
+lr diff main...    # review this branch's changes off main
+lr diff --staged   # review only the staged changes
+lr patch fix.diff  # review a saved patch (or: git diff | lr patch)
+git diff | lr      # review a patch piped in
 ```
 
-Navigate with `j`/`k` to scroll, `n`/`p` to jump between files, `[`/`]` between
-hunks, `g`/`G` for top/bottom, and `q` to quit.
+Navigate with `j`/`k` (line cursor), `n`/`p` between files, `[`/`]` between
+hunks, `Ctrl-D`/`Ctrl-U` to page, `g`/`G` for the ends, `v` to toggle
+unified/side-by-side, and `q` to quit. The mouse wheel scrolls and a click moves
+the cursor. Working-tree and ref views refresh automatically as files change
+(pass `--no-watch` to disable).
 
 ## Development
 
