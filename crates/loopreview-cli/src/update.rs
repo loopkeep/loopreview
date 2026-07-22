@@ -531,7 +531,15 @@ fn install_dir() -> Result<PathBuf> {
 /// Install each freshly extracted binary in `staging` over its counterpart in
 /// `install_dir`. A binary missing from either side is warned about and skipped
 /// (the other is still updated); at least one always exists — we are running it.
+///
+/// Each target is backed up before it is replaced, so a failure partway through
+/// (the second binary fails after the first was swapped) rolls the already-
+/// replaced binaries back to their previous version rather than leaving a mix of
+/// old and new. The rollback is best-effort and its outcome is named in the
+/// error.
 fn install_all(staging: &Path, install_dir: &Path) -> Result<()> {
+    // The binaries present on both sides — the ones actually replaced.
+    let mut pairs = Vec::new();
     for name in BIN_NAMES {
         let new = staging.join(name);
         let target = install_dir.join(name);
@@ -547,9 +555,62 @@ fn install_all(staging: &Path, install_dir: &Path) -> Result<()> {
             );
             continue;
         }
-        install_one(&new, &target)?;
+        pairs.push((name, new, target));
+    }
+
+    // Replace each in turn, keeping a backup of every one already swapped so a
+    // later failure can undo them.
+    let mut done: Vec<(PathBuf, PathBuf)> = Vec::new(); // (backup, target)
+    for (name, new, target) in &pairs {
+        let backup = backup_path(target);
+        let backed_up = fs::copy(target, &backup).is_ok();
+        match install_one(new, target) {
+            Ok(()) if backed_up => done.push((backup, target.clone())),
+            Ok(()) => {
+                let _ = fs::remove_file(&backup);
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&backup);
+                let restored = rollback(&done);
+                return Err(e.context(format!(
+                    "installing {name} failed; rolled back {restored} of {} already-replaced \
+                     binar{}",
+                    done.len(),
+                    if done.len() == 1 { "y" } else { "ies" }
+                )));
+            }
+        }
+    }
+    // Success: the backups are no longer needed.
+    for (backup, _) in &done {
+        let _ = fs::remove_file(backup);
     }
     Ok(())
+}
+
+/// The backup path for a target binary, a hidden sibling in the same directory.
+fn backup_path(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("loopreview");
+    target.with_file_name(format!(".{name}.bak.{}", std::process::id()))
+}
+
+/// Restore each already-replaced binary from its backup, returning how many were
+/// put back. Best-effort: a rename is atomic on Unix (and keeps the running
+/// process's inode); on Windows an overwriting copy is the fallback.
+fn rollback(done: &[(PathBuf, PathBuf)]) -> usize {
+    let mut restored = 0;
+    for (backup, target) in done {
+        if fs::rename(backup, target).is_ok() {
+            restored += 1;
+        } else if fs::copy(backup, target).is_ok() {
+            let _ = fs::remove_file(backup);
+            restored += 1;
+        }
+    }
+    restored
 }
 
 /// Replace `target` with `new` via a temp file plus `rename` (a fresh inode, so
@@ -859,6 +920,44 @@ mod tests {
             fs::metadata(&target).unwrap().permissions().mode() & 0o111,
             0
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn install_all_rolls_back_when_a_later_binary_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let install = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        // Both binaries are installed at an old version.
+        for name in BIN_NAMES {
+            let target = install.path().join(name);
+            fs::write(&target, b"old binary").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // The first staged binary is a valid replacement; the second is a
+        // directory, so install_one fails on it after the first was swapped.
+        fs::write(staging.path().join(BIN_NAMES[0]), b"new binary").unwrap();
+        fs::create_dir(staging.path().join(BIN_NAMES[1])).unwrap();
+
+        let err = install_all(staging.path(), install.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("rolled back"),
+            "the error names the rollback: {err:#}"
+        );
+        // The first binary is back to its old version — no old/new mix remains.
+        assert_eq!(
+            fs::read(install.path().join(BIN_NAMES[0])).unwrap(),
+            b"old binary",
+            "the already-replaced binary was restored"
+        );
+        // No backup files are left behind.
+        let leftovers: Vec<_> = fs::read_dir(install.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak."))
+            .collect();
+        assert!(leftovers.is_empty(), "backups are cleaned up");
     }
 
     #[cfg(not(windows))]
