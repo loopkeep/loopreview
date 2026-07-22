@@ -46,41 +46,10 @@ use loopreview_core::{
 use crate::control::{self, UiRequest};
 use crate::highlight::{Highlighter, LineHighlighter, Span as HlSpan};
 use crate::keys::Action;
+use crate::palette::*;
 use crate::prsync::PrHandle;
 use crate::store::Store;
 use crate::textarea::TextArea;
-
-/// Subtle row tints for changed lines, and the stronger tint for the exact
-/// words that changed within them (readable on a dark terminal).
-const ADD_BG: Color = Color::Rgb(18, 44, 26);
-const DEL_BG: Color = Color::Rgb(52, 24, 27);
-const ADD_EMPH_BG: Color = Color::Rgb(30, 84, 44);
-const DEL_EMPH_BG: Color = Color::Rgb(96, 40, 46);
-/// Background of the line the cursor is on (when it has no diff tint).
-const CURSOR_BG: Color = Color::Rgb(38, 43, 56);
-/// The line cursor when the body is the inactive pane (sidebar focused): a
-/// faint fill so it reads as "not the active target".
-const CURSOR_DIM_BG: Color = Color::Rgb(30, 33, 42);
-/// Faint full-width band behind every file header (even without the cursor), so
-/// headers read as list dividers and inter-file blank lines can be dropped.
-const HEADER_BG: Color = Color::Rgb(28, 31, 40);
-/// Background of the file header the cursor rests on — brighter than a content
-/// line's cursor, since headers are the diff's few anchors and must stand out.
-const HEADER_CURSOR_BG: Color = Color::Rgb(54, 64, 92);
-/// The header cursor when the body is the inactive pane (sidebar focused).
-const HEADER_CURSOR_DIM_BG: Color = Color::Rgb(40, 45, 62);
-/// Background marking the sidebar file currently shown in the body (a subtle
-/// blue tint under a cyan bar), distinct from the stronger selection color.
-const SIDEBAR_CURRENT_BG: Color = Color::Rgb(33, 43, 62);
-/// The sidebar's resting selection when the sidebar is not the focused pane —
-/// a faint fill, dimmer than the focused selection and the current-file tint.
-const SIDEBAR_SEL_DIM_BG: Color = Color::Rgb(31, 35, 47);
-/// Accent used on the focused pane's divider (dim when it is not focused).
-const FOCUS_ACCENT: Color = Color::Cyan;
-/// Background of a side-by-side cell with no line (the other side changed).
-const ABSENT_BG: Color = Color::Rgb(22, 24, 30);
-/// The bar background used for the header and footer.
-const BAR_BG: Color = Color::Rgb(30, 33, 40);
 
 /// Rows of context kept above/below the cursor when scrolling.
 const SCROLLOFF: usize = 3;
@@ -92,11 +61,6 @@ const HSCROLL_MARGIN: usize = 8;
 /// Sidebar width bounds (the minimum diff width kept beside it is configurable).
 const SIDEBAR_MIN: usize = 22;
 const SIDEBAR_MAX: usize = 44;
-/// Background of a selected sidebar / finder row — a clear blue, distinct at a
-/// glance from the current-file and cursor tints.
-const SEL_BG: Color = Color::Rgb(48, 66, 106);
-/// Background of lines in a range selection (for a multi-line comment).
-const SELECTION_BG: Color = Color::Rgb(38, 48, 74);
 /// A cursor stop's `flat` value meaning "the file header" (not a content line).
 /// Headers are cursor stops so `j`/`k` walks them and folded files stay
 /// navigable; content lines use their real flat index.
@@ -4377,7 +4341,7 @@ impl App {
     }
 
     fn draw_conversation(&self, f: &mut Frame, area: Rect) {
-        let select_bg = Color::Rgb(40, 46, 60);
+        let select_bg = CONV_SELECT_BG;
         let width = area.width as usize;
         let mut lines: Vec<TextLine> = Vec::new();
         for (pos, &ti) in self.conv_order.iter().enumerate() {
@@ -4508,7 +4472,7 @@ impl App {
         if !self.review.is_empty() {
             spans.push(TextSpan::styled(
                 format!("  💬 {} open", self.review.open_count()),
-                bar.fg(Color::Rgb(120, 160, 220)),
+                bar.fg(PR_ACCENT),
             ));
         }
         spans.push(self.watch_indicator(bar));
@@ -4592,7 +4556,7 @@ impl App {
         if self.hscroll > 0 && self.view == View::Files {
             spans.push(TextSpan::styled(
                 format!("→{} ", self.hscroll),
-                bar.fg(Color::Rgb(120, 160, 220)),
+                bar.fg(PR_ACCENT),
             ));
         }
         if let Some(status) = &self.status {
@@ -4621,7 +4585,7 @@ impl App {
             if self.pr.is_some() {
                 spans.push(TextSpan::styled(
                     "  · t kind · ^r refresh · ^s submit",
-                    bar.fg(Color::Rgb(120, 160, 220)),
+                    bar.fg(PR_ACCENT),
                 ));
             }
         }
@@ -5496,14 +5460,10 @@ fn status_color(status: loopreview_core::ChangeStatus) -> Color {
     }
 }
 
-/// The left gutter bar drawn beside an inline comment thread.
-const COMMENT_BAR: Color = Color::Rgb(90, 130, 200);
 /// Width the inline comment body wraps to (before the gutter bar).
 const INLINE_COMMENT_WRAP: usize = 76;
 /// Max lines in a placed thread's code excerpt (clipped tail-first beyond it).
 const EXCERPT_MAX: usize = 8;
-/// Subtle background on the anchored line(s) within a thread's code excerpt.
-const EXCERPT_ANCHOR_BG: Color = Color::Rgb(46, 42, 30);
 
 /// Render each thread's inline block (index-aligned to `review.threads`): a
 /// header naming the author and state, then the root comment's body as markdown.
@@ -5963,9 +5923,9 @@ fn kind_badge(comment: &Comment) -> Option<(&'static str, Color)> {
     if comment.is_published() {
         None
     } else if comment.is_local() {
-        Some(("[local]", Color::DarkGray))
+        Some(("[local]", BADGE_LOCAL))
     } else {
-        Some(("[draft]", Color::Yellow))
+        Some(("[draft]", BADGE_DRAFT))
     }
 }
 
@@ -5975,9 +5935,9 @@ fn kind_index_badge(comment: &Comment) -> Option<(&'static str, Color)> {
     if comment.is_published() {
         None
     } else if comment.is_local() {
-        Some(("[l]", Color::DarkGray))
+        Some(("[l]", BADGE_LOCAL))
     } else {
-        Some(("[d]", Color::Yellow))
+        Some(("[d]", BADGE_DRAFT))
     }
 }
 
