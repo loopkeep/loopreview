@@ -485,7 +485,10 @@ const REVIEW_THREADS_QUERY: &str = r#"query($owner:String!,$repo:String!,$number
           path
           line
           originalLine
+          startLine
+          originalStartLine
           diffSide
+          startDiffSide
           subjectType
           comments(first:100){
             nodes{

@@ -170,11 +170,9 @@ review threads without touching your working tree. Your comments and replies are
 kept as **drafts** — they persist across sessions — until you submit. `Ctrl-S`
 opens the submit modal to choose the review event and an optional summary;
 `Ctrl-R` re-pulls from GitHub while keeping your drafts. Resolving a published
-thread syncs to GitHub. (The pull-request features use the `gh` CLI, which must
-be installed and authenticated.)
-
-> A GitHub multi-line comment is currently anchored to its last line (its range
-> is not yet folded into the diff); full range support is planned.
+thread syncs to GitHub. Multi-line comments round-trip as ranges (GitHub's
+`start_line` / `startLine`). (The pull-request features use the `gh` CLI, which
+must be installed and authenticated.)
 
 ## Agent integration
 

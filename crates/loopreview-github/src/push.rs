@@ -59,10 +59,17 @@ pub(crate) fn api_side(side: Side) -> &'static str {
 pub struct ReviewCommentInput {
     /// The file the comment is on.
     pub path: String,
-    /// The line number on `side` the comment anchors to.
+    /// The last line on `side` the comment anchors to (GitHub's `line`).
     pub line: u64,
     /// `RIGHT` (new side) or `LEFT` (old side).
     pub side: String,
+    /// The first line of a multi-line comment (GitHub's `start_line`); `None`
+    /// for a single-line comment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u64>,
+    /// The side of `start_line` (GitHub's `start_side`); `None` for single-line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_side: Option<String>,
     /// The comment body.
     pub body: String,
 }
@@ -97,10 +104,10 @@ pub(crate) struct ReplyPayload<'a> {
 ///
 /// A thread contributes exactly one comment when it is a brand-new inline draft:
 /// anchored to a line, with a root comment that has not been published yet
-/// (`remote_id` is `None`). Multi-line anchors post on their last line (the
-/// commented line, as GitHub does); range creation is otherwise deferred.
-/// File- and review-anchored drafts are not inline comments and are skipped
-/// here.
+/// (`remote_id` is `None`). A multi-line anchor (`start != end`) carries GitHub's
+/// `start_line` / `start_side` alongside the last-line `line` / `side`; a
+/// single-line anchor omits them. File- and review-anchored drafts are not inline
+/// comments and are skipped here.
 pub(crate) fn plan_inline_comments(threads: &[Thread]) -> Vec<PlannedComment> {
     let mut planned = Vec::new();
     for thread in threads {
@@ -111,10 +118,19 @@ pub(crate) fn plan_inline_comments(threads: &[Thread]) -> Vec<PlannedComment> {
             continue;
         }
         let Anchor::Line {
-            file, side, end, ..
+            file,
+            side,
+            start,
+            end,
+            ..
         } = &thread.anchor
         else {
             continue;
+        };
+        let (start_line, start_side) = if start != end {
+            (Some(*start as u64), Some(api_side(*side).to_string()))
+        } else {
+            (None, None)
         };
         planned.push(PlannedComment {
             thread_id: thread.id.clone(),
@@ -122,6 +138,8 @@ pub(crate) fn plan_inline_comments(threads: &[Thread]) -> Vec<PlannedComment> {
                 path: file.clone(),
                 line: *end as u64,
                 side: api_side(*side).to_string(),
+                start_line,
+                start_side,
                 body: root.body.clone(),
             },
         });
@@ -296,11 +314,14 @@ mod tests {
         assert_eq!(planned[0].input.side, "RIGHT");
         assert_eq!(planned[0].input.line, 10);
         assert_eq!(planned[0].input.body, "fix this");
+        // A single-line comment omits the multi-line range fields.
+        assert_eq!(planned[0].input.start_line, None);
+        assert_eq!(planned[0].input.start_side, None);
         assert_eq!(planned[1].input.side, "LEFT");
     }
 
     #[test]
-    fn multi_line_anchor_posts_on_last_line() {
+    fn multi_line_anchor_carries_start_line_and_side() {
         let thread = Thread {
             id: "t".to_string(),
             anchor: Anchor::Line {
@@ -316,6 +337,13 @@ mod tests {
         };
         let planned = plan_inline_comments(&[thread]);
         assert_eq!(planned[0].input.line, 14);
+        assert_eq!(planned[0].input.side, "RIGHT");
+        assert_eq!(planned[0].input.start_line, Some(10));
+        assert_eq!(planned[0].input.start_side, Some("RIGHT".to_string()));
+        // The range fields serialize under GitHub's names.
+        let json = serde_json::to_string(&planned[0].input).unwrap();
+        assert!(json.contains("\"start_line\":10"));
+        assert!(json.contains("\"start_side\":\"RIGHT\""));
     }
 
     #[test]
@@ -349,6 +377,8 @@ mod tests {
                     path: "src/a.rs".to_string(),
                     line: 10,
                     side: "RIGHT".to_string(),
+                    start_line: None,
+                    start_side: None,
                     body: "one".to_string(),
                 },
             },
@@ -358,6 +388,8 @@ mod tests {
                     path: "src/a.rs".to_string(),
                     line: 5,
                     side: "LEFT".to_string(),
+                    start_line: None,
+                    start_side: None,
                     body: "two".to_string(),
                 },
             },

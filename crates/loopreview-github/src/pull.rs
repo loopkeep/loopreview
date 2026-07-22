@@ -75,9 +75,18 @@ pub struct ReviewThread {
     /// The line at the original commit (used when `line` is null).
     #[serde(rename = "originalLine", default)]
     pub original_line: Option<u32>,
+    /// The first line of a multi-line thread (null for a single-line thread).
+    #[serde(rename = "startLine", default)]
+    pub start_line: Option<u32>,
+    /// The first line at the original commit (used when `startLine` is null).
+    #[serde(rename = "originalStartLine", default)]
+    pub original_start_line: Option<u32>,
     /// `LEFT` or `RIGHT` — which side of the diff the thread sits on.
     #[serde(rename = "diffSide", default)]
     pub diff_side: Option<String>,
+    /// The side of the thread's start line (falls back for the anchor side).
+    #[serde(rename = "startDiffSide", default)]
+    pub start_diff_side: Option<String>,
     /// `LINE` or `FILE`.
     #[serde(rename = "subjectType", default)]
     pub subject_type: Option<String>,
@@ -245,12 +254,25 @@ fn thread_anchor(thread: &ReviewThread) -> Anchor {
     }
 
     let line = thread.line.or(thread.original_line).filter(|&l| l > 0);
-    let Some(line) = line else {
+    let Some(end) = line else {
         // Outdated with no resolvable line: keep it visible on the file.
         return Anchor::File { file: path };
     };
 
-    let side = match thread.diff_side.as_deref() {
+    // A multi-line thread reports its first line; single-line threads report the
+    // same as the last line. Clamp the start below the end defensively.
+    let start = thread
+        .start_line
+        .or(thread.original_start_line)
+        .filter(|&l| l > 0)
+        .unwrap_or(end)
+        .min(end);
+
+    let side = match thread
+        .diff_side
+        .as_deref()
+        .or(thread.start_diff_side.as_deref())
+    {
         Some("LEFT") => Side::Old,
         _ => Side::New,
     };
@@ -267,8 +289,8 @@ fn thread_anchor(thread: &ReviewThread) -> Anchor {
     Anchor::Line {
         file: path,
         side,
-        start: line,
-        end: line,
+        start,
+        end,
         commit,
         context,
     }
@@ -492,6 +514,43 @@ mod tests {
                 assert_eq!(context[0], "@@ -40,3 +40,4 @@");
             }
             other => panic!("expected line anchor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_line_thread_restores_its_range() {
+        let json = r#"{
+          "data": { "repository": { "pullRequest": { "reviewThreads": { "nodes": [
+            {
+              "id": "PRRT_range",
+              "isResolved": false,
+              "path": "src/lib.rs",
+              "line": 48,
+              "originalLine": 46,
+              "startLine": 44,
+              "originalStartLine": 42,
+              "diffSide": "RIGHT",
+              "startDiffSide": "RIGHT",
+              "subjectType": "LINE",
+              "comments": { "nodes": [
+                { "databaseId": 3001, "body": "range note",
+                  "createdAt": "2026-07-21T15:24:08Z",
+                  "diffHunk": "@@ -44,5 +44,5 @@",
+                  "originalCommit": { "oid": "aaa" },
+                  "author": { "login": "octocat" } }
+              ]}
+            }
+          ]}}}}
+        }"#;
+        let threads = parse_review_threads(json).unwrap();
+        match &map_review_thread(&threads[0]).anchor {
+            Anchor::Line {
+                side, start, end, ..
+            } => {
+                assert_eq!(*side, Side::New);
+                assert_eq!((*start, *end), (44, 48), "the multi-line range is restored");
+            }
+            other => panic!("expected a line anchor, got {other:?}"),
         }
     }
 
