@@ -613,6 +613,9 @@ struct App {
     comment_blocks: Vec<Vec<TextLine<'static>>>,
     /// Rendered Conversation block per thread (root, replies), same order.
     conv_blocks: Vec<Vec<TextLine<'static>>>,
+    /// Whether each thread is outdated (line-anchored but no longer in the diff),
+    /// index-aligned to `review.threads`. Drives the thread index's status icon.
+    thread_outdated: Vec<bool>,
     /// Thread ids whose inline/Conversation body is collapsed to its header.
     collapsed: HashSet<String>,
     /// File display paths that are collapsed to their header (contents hidden;
@@ -742,6 +745,7 @@ impl App {
             submit: None,
             comment_blocks,
             conv_blocks,
+            thread_outdated: outdated,
             collapsed: HashSet::new(),
             collapsed_files: HashSet::new(),
             auto_collapse_files: 50,
@@ -1124,13 +1128,13 @@ impl App {
             build_comment_blocks(&self.review, &self.highlighter, &self.collapsed);
         let block_lens: Vec<usize> = self.comment_blocks.iter().map(Vec::len).collect();
         let layout = Layouts::build(&diff, &self.review, &block_lens, &self.collapsed_files);
-        let outdated = outdated_flags(&self.review, &layout.placed);
+        self.thread_outdated = outdated_flags(&self.review, &layout.placed);
         let conv_width = self.body_width.get().clamp(40, 120);
         self.conv_blocks = build_conversation(
             &self.review,
             conv_width,
             &self.highlighter,
-            &outdated,
+            &self.thread_outdated,
             &self.collapsed,
             self.repo_dir.as_deref(),
         );
@@ -1236,6 +1240,19 @@ impl App {
         !self.review.threads.is_empty()
     }
 
+    /// Switch the top-level view, re-syncing the sidebar so its index scroll
+    /// tracks the new view's selection (the current file, or the selected
+    /// thread).
+    fn set_view(&mut self, view: View) {
+        self.view = view;
+        let sel = if view == View::Conversation {
+            self.conv_cursor
+        } else {
+            self.current_file()
+        };
+        self.reveal_in_sidebar(sel);
+    }
+
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         // While loading, a background job runs, or a load error shows, only quit
         // is accepted (the job keeps running until it reports back).
@@ -1291,10 +1308,11 @@ impl App {
                 return;
             }
             (KeyCode::Tab, _) if self.has_review() => {
-                self.view = match self.view {
+                let next = match self.view {
                     View::Files => View::Conversation,
                     View::Conversation => View::Files,
                 };
+                self.set_view(next);
                 return;
             }
             _ => {}
@@ -1807,11 +1825,16 @@ impl App {
         }
     }
 
-    /// Move focus into the sidebar, synced to the current file.
+    /// Move focus into the sidebar, synced to the right pane's selection: the
+    /// current file (Files view) or the selected thread (Conversation view).
     fn focus_sidebar(&mut self) {
         self.focus = Focus::Sidebar;
-        self.sidebar_cursor = self.current_file();
-        self.follow_sidebar();
+        if self.view == View::Conversation {
+            self.reveal_in_sidebar(self.conv_cursor);
+        } else {
+            self.sidebar_cursor = self.current_file();
+            self.follow_sidebar();
+        }
     }
 
     /// Keep the sidebar selection visible.
@@ -1840,8 +1863,13 @@ impl App {
         self.sidebar_scroll = (self.sidebar_scroll as isize + delta).clamp(0, max) as usize;
     }
 
-    /// Route a key while the sidebar has focus.
+    /// Route a key while the sidebar has focus. In the Conversation view the
+    /// sidebar drives the thread index instead of the file index.
     fn sidebar_action(&mut self, action: Action) {
+        if self.view == View::Conversation {
+            self.thread_index_action(action);
+            return;
+        }
         let files = self.diff.files.len();
         match action {
             Action::MoveDown => {
@@ -1890,6 +1918,36 @@ impl App {
             self.focus = Focus::Sidebar;
             self.follow_sidebar();
         }
+    }
+
+    /// Route a key while the thread index (Conversation sidebar) has focus. The
+    /// grammar mirrors the file index: j/k select, l/Enter jump into the thread,
+    /// o folds it.
+    fn thread_index_action(&mut self, action: Action) {
+        let n = self.review.threads.len();
+        if n == 0 {
+            return;
+        }
+        match action {
+            Action::MoveDown => self.set_conv((self.conv_cursor + 1).min(n - 1)),
+            Action::MoveUp => self.set_conv(self.conv_cursor.saturating_sub(1)),
+            Action::Top => self.set_conv(0),
+            Action::Bottom => self.set_conv(n - 1),
+            Action::NavIn => self.jump_to_thread(self.conv_cursor),
+            Action::Fold => self.toggle_collapse_conv(),
+            _ => {}
+        }
+    }
+
+    /// Jump the Conversation view to `thread` and move focus to the body pane so
+    /// the reviewer can read and reply (the sidebar analogue of `jump_to_file`).
+    fn jump_to_thread(&mut self, thread: usize) {
+        if thread >= self.review.threads.len() {
+            return;
+        }
+        self.view = View::Conversation;
+        self.set_conv(thread);
+        self.focus = Focus::Body;
     }
 
     /// Toggle a file's collapse from the sidebar (does not move the body cursor).
@@ -2009,6 +2067,10 @@ impl App {
             Action::Resolve if self.has_review() => self.resolve_thread(self.conv_cursor),
             Action::CloseReview if self.has_review() => self.confirming_close = true,
             Action::Fold => self.toggle_collapse_conv(),
+            // `h` steps out to the thread index (same cascade grammar as Files).
+            Action::NavOut if self.sidebar_width(self.body_width.get()).is_some() => {
+                self.focus_sidebar()
+            }
             _ => {}
         }
     }
@@ -2054,6 +2116,8 @@ impl App {
         }
         self.conv_cursor = index.min(self.review.threads.len() - 1);
         self.follow_conv();
+        // Keep the thread index (sidebar) tracking the selection too.
+        self.reveal_in_sidebar(self.conv_cursor);
     }
 
     /// The first line index of each Conversation thread block (blocks are
@@ -2690,12 +2754,19 @@ impl App {
             Region::Tabs if self.has_review() => {
                 let hit = self.hit.get();
                 if column < hit.tab_files_end {
-                    self.view = View::Files;
+                    self.set_view(View::Files);
                 } else if column > hit.tab_files_end && column < hit.tab_conv_end {
-                    self.view = View::Conversation;
+                    self.set_view(View::Conversation);
                 }
             }
-            Region::Sidebar(row) => self.sidebar_activate(self.sidebar_scroll + row),
+            Region::Sidebar(row) => {
+                let idx = self.sidebar_scroll + row;
+                if self.view == View::Conversation {
+                    self.jump_to_thread(idx);
+                } else {
+                    self.sidebar_activate(idx);
+                }
+            }
             Region::Content { col, row } => {
                 if let Some(cursor) = self.cline_at_body(col, row) {
                     if self.clines[cursor].1 == HEADER {
@@ -3018,10 +3089,14 @@ impl App {
                     Constraint::Min(1),
                 ])
                 .split(body);
-            let sb_block = pane_block(
-                format!(" Files ({}) ", self.diff.files.len()),
-                sidebar_focused,
-            );
+            // The sidebar indexes whatever the right pane shows: files in the
+            // Files view, threads in the Conversation view.
+            let sb_title = if self.view == View::Conversation {
+                format!(" Threads ({}) ", self.review.threads.len())
+            } else {
+                format!(" Files ({}) ", self.diff.files.len())
+            };
+            let sb_block = pane_block(sb_title, sidebar_focused);
             let sb_inner = sb_block.inner(cols[0]);
             f.render_widget(sb_block, cols[0]);
             self.draw_sidebar(f, sb_inner);
@@ -3424,8 +3499,16 @@ impl App {
         }
     }
 
-    /// The diff pane's frame title: the file the cursor is in, or a fallback.
+    /// The right pane's frame title. The Files view names the file the cursor is
+    /// in; the Conversation view names the review context (a PR or a local
+    /// review), never a filename — the threads there span files.
     fn pane_title(&self) -> String {
+        if self.view == View::Conversation {
+            return match &self.pr {
+                Some(pr) => format!(" PR #{} — {} ", pr.number(), pr.title()),
+                None => format!(" Review — {} ", self.label),
+            };
+        }
         match self.diff.files.get(self.current_file()) {
             Some(file) => format!(" {} ", file_name(file.display_path())),
             None => " Diff ".to_string(),
@@ -3767,8 +3850,13 @@ impl App {
         )
     }
 
-    /// Draw the file-explorer sidebar.
+    /// Draw the sidebar: a file index in the Files view, a thread index in the
+    /// Conversation view (the left pane always indexes the right one).
     fn draw_sidebar(&self, f: &mut Frame, area: Rect) {
+        if self.view == View::Conversation {
+            self.draw_thread_index(f, area);
+            return;
+        }
         let entries = self.file_entries();
         let width = area.width as usize;
         let height = area.height as usize;
@@ -3809,6 +3897,70 @@ impl App {
                 )];
                 spans.extend(self.file_row_spans(e, width.saturating_sub(1), base, &[]));
                 TextLine::from(spans)
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), area);
+    }
+
+    /// Draw the thread index (the Conversation view's sidebar): one row per
+    /// thread — status glyph, anchor label, and a right-fixed author + reply
+    /// count — mirroring the file index's format and selection tiers.
+    fn draw_thread_index(&self, f: &mut Frame, area: Rect) {
+        let width = area.width as usize;
+        let height = area.height as usize;
+        let sidebar_focused = self.focus == Focus::Sidebar;
+        let n = self.review.threads.len();
+        let start = self.sidebar_scroll.min(n);
+        let end = (start + height).min(n);
+        let lines: Vec<TextLine> = (start..end)
+            .map(|i| {
+                let thread = &self.review.threads[i];
+                let outdated = self.thread_outdated.get(i).copied().unwrap_or(false);
+                let (glyph, glyph_fg) = thread_status(thread, outdated);
+                // The selected thread is what the right pane shows: a strong fill
+                // while the sidebar has focus, a subtle one when the body does.
+                let is_sel = i == self.conv_cursor;
+                let (base, marker, marker_fg) = if sidebar_focused && is_sel {
+                    (
+                        Style::default().bg(SEL_BG).add_modifier(Modifier::BOLD),
+                        "▎",
+                        Color::White,
+                    )
+                } else if is_sel {
+                    (Style::default().bg(SIDEBAR_CURRENT_BG), "▎", Color::Cyan)
+                } else {
+                    (Style::default(), " ", Color::Reset)
+                };
+                let left = vec![
+                    TextSpan::styled(
+                        marker.to_string(),
+                        base.fg(marker_fg).add_modifier(Modifier::BOLD),
+                    ),
+                    TextSpan::styled(format!("{glyph} "), base.fg(glyph_fg)),
+                ];
+                // Right-fixed cluster: the author, then the reply count.
+                let replies = thread.comments.len().saturating_sub(1);
+                let author = thread.root().map(|c| c.author.as_str()).unwrap_or("");
+                let mut right = vec![TextSpan::styled(
+                    format!(" {author}"),
+                    base.fg(Color::DarkGray),
+                )];
+                if replies > 0 {
+                    right.push(TextSpan::styled(
+                        format!(" ↩{replies}"),
+                        base.fg(Color::Cyan),
+                    ));
+                }
+                let label = thread_index_label(&thread.anchor);
+                let row = right_aligned_row(
+                    left,
+                    &label,
+                    |shown| vec![TextSpan::styled(shown.to_string(), base.fg(Color::Gray))],
+                    right,
+                    width,
+                    base,
+                );
+                TextLine::from(row)
             })
             .collect();
         f.render_widget(Paragraph::new(lines), area);
@@ -4528,6 +4680,35 @@ fn anchor_label(anchor: &Anchor) -> String {
         }
         Anchor::File { file } => file.clone(),
         Anchor::Review => "changeset".to_string(),
+    }
+}
+
+/// A compact anchor label for the thread index: `file:line` / `file` /
+/// `conversation` (no side suffix — the index is narrow).
+fn thread_index_label(anchor: &Anchor) -> String {
+    match anchor {
+        Anchor::Line {
+            file, start, end, ..
+        } => {
+            if start == end {
+                format!("{file}:{start}")
+            } else {
+                format!("{file}:{start}-{end}")
+            }
+        }
+        Anchor::File { file } => file.clone(),
+        Anchor::Review => "conversation".to_string(),
+    }
+}
+
+/// The status glyph and color for a thread in the index.
+fn thread_status(thread: &Thread, outdated: bool) -> (&'static str, Color) {
+    if thread.is_resolved() {
+        ("✓", Color::Green)
+    } else if outdated {
+        ("⚠", Color::Yellow)
+    } else {
+        ("○", Color::Cyan)
     }
 }
 
@@ -5518,6 +5699,145 @@ mod tests {
         let buf = term.backend().buffer();
         let (w, h) = (buf.area().width, buf.area().height);
         (0..w).map(|x| buf[(x, h - 1)].symbol()).collect()
+    }
+
+    fn screen_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        let (w, h) = (buf.area().width, buf.area().height);
+        let mut s = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                s.push_str(buf[(x, y)].symbol());
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    /// A thread anchored to `file`:`line` with `replies` replies under `author`.
+    fn thread_on(file: &str, line: u32, author: &str, replies: usize) -> Thread {
+        let mut comments = vec![Comment {
+            id: format!("{file}-{line}-root"),
+            author: author.into(),
+            body: "root".into(),
+            created_at: 0,
+            remote_id: None,
+        }];
+        for r in 0..replies {
+            comments.push(Comment {
+                id: format!("{file}-{line}-r{r}"),
+                author: "reviewer".into(),
+                body: "reply".into(),
+                created_at: (r + 1) as u64,
+                remote_id: None,
+            });
+        }
+        Thread {
+            id: format!("t-{file}-{line}"),
+            anchor: Anchor::line(file, Side::New, line),
+            state: ThreadState::Open,
+            comments,
+        }
+    }
+
+    fn app_with_threads() -> App {
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        app.sidebar_override = Some(true);
+        app.review.threads.push(thread_on("a.rs", 1, "alice", 2));
+        app.review.threads.push(thread_on("b.rs", 2, "bob", 0));
+        app.relayout();
+        app
+    }
+
+    #[test]
+    fn the_sidebar_indexes_files_or_threads_by_view() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = app_with_threads();
+        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+
+        // Files view: a file index and a Files frame title.
+        app.set_view(View::Files);
+        term.draw(|f| app.draw(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(
+            screen.contains("Files (2)"),
+            "sidebar titled Files: {screen:?}"
+        );
+        assert!(screen.contains("a.rs"), "the file index is shown");
+
+        // Conversation view: a thread index, a Threads frame title, and a
+        // review-context right-pane title (not a filename).
+        app.set_view(View::Conversation);
+        term.draw(|f| app.draw(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(
+            screen.contains("Threads (2)"),
+            "sidebar titled Threads: {screen:?}"
+        );
+        assert!(
+            screen.contains("Review —"),
+            "review-context pane title: {screen:?}"
+        );
+        assert!(screen.contains('○'), "an open-thread status glyph is shown");
+    }
+
+    #[test]
+    fn conversation_pane_title_is_the_review_context() {
+        let mut app = multi_file_app(&["a.rs"]);
+        app.label = "working tree".into();
+        app.view = View::Conversation;
+        assert!(
+            app.pane_title().contains("Review"),
+            "local review title: {:?}",
+            app.pane_title()
+        );
+        app.view = View::Files;
+        assert!(
+            app.pane_title().contains("a.rs"),
+            "files view names the file: {:?}",
+            app.pane_title()
+        );
+    }
+
+    #[test]
+    fn thread_index_selects_and_jumps() {
+        let mut app = app_with_threads();
+        app.view = View::Conversation;
+        app.focus = Focus::Sidebar;
+        app.conv_cursor = 0;
+
+        // j / k move the thread selection.
+        app.sidebar_action(Action::MoveDown);
+        assert_eq!(app.conv_cursor, 1, "j selects the next thread");
+        app.sidebar_action(Action::MoveUp);
+        assert_eq!(app.conv_cursor, 0);
+
+        // l jumps into the thread: focus to the body, still the Conversation view.
+        app.sidebar_action(Action::NavIn);
+        assert_eq!(app.focus, Focus::Body);
+        assert_eq!(app.view, View::Conversation);
+        assert_eq!(app.conv_cursor, 0);
+
+        // h from the Conversation body steps back out to the thread index.
+        app.body_width.set(120);
+        app.conversation_action(Action::NavOut);
+        assert_eq!(app.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn a_sidebar_click_in_conversation_jumps_to_the_thread() {
+        let mut app = app_with_threads();
+        app.view = View::Conversation;
+        app.body_width.set(120);
+        app.hit.set(hit(1, 22, None, 0));
+        // Sidebar body row 1 (screen row 2) is the second thread.
+        app.mouse_down(3, 2);
+        assert_eq!(
+            app.conv_cursor, 1,
+            "a thread-index click selects that thread"
+        );
+        assert_eq!(app.focus, Focus::Body);
     }
 
     #[test]

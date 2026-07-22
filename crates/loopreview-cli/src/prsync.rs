@@ -54,6 +54,16 @@ impl PrHandle {
         format!("{}#{}", self.pr.slug(), self.pr.number)
     }
 
+    /// The pull request number (for UI labels; never the private slug).
+    pub fn number(&self) -> u64 {
+        self.pr.number
+    }
+
+    /// The pull request title.
+    pub fn title(&self) -> &str {
+        &self.pr.title
+    }
+
     /// Re-pull the PR's threads from GitHub.
     pub fn pull(&self) -> Result<Vec<Thread>, String> {
         self.client.pull(&self.pr).map_err(|e| e.to_string())
