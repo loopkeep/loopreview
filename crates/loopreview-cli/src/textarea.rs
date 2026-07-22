@@ -30,6 +30,14 @@ impl Default for TextArea {
 }
 
 impl TextArea {
+    /// A buffer pre-seeded with `text`, caret at the end — for editing the body
+    /// of an existing comment.
+    pub fn from_text(text: &str) -> TextArea {
+        let mut area = TextArea::default();
+        area.paste(text);
+        area
+    }
+
     /// The full text, lines joined with `\n`.
     pub fn text(&self) -> String {
         self.lines.join("\n")

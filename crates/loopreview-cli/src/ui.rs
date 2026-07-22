@@ -447,6 +447,8 @@ enum ComposeKind {
     New(Anchor),
     /// A reply to an existing thread (by id).
     Reply(String),
+    /// Editing an existing comment's body (thread id, comment id).
+    Edit { thread: String, comment: String },
 }
 
 /// The review events offered in the submit modal.
@@ -1502,6 +1504,7 @@ impl App {
             Action::ScrollRight => self.hscroll_by(HSCROLL_STEP),
             Action::Select => self.start_selection(),
             Action::Delete => self.request_delete(),
+            Action::Edit => self.start_edit(),
             Action::ToggleKind => self.toggle_selected_kind(),
             _ => {}
         }
@@ -1583,6 +1586,40 @@ impl App {
             .then_some(idx)
     }
 
+    /// Open the composer to edit the selected thread's root comment, pre-filled
+    /// with its body. Only your own unpublished comment (a draft or a local
+    /// note): a published GitHub comment cannot be edited from here, and
+    /// rewriting another author's note would misattribute it. Editing a reply
+    /// needs comment-level navigation and is not in this version.
+    fn start_edit(&mut self) {
+        let Some(idx) = self.selected_thread_any() else {
+            self.status = Some("no comment selected".to_string());
+            return;
+        };
+        let thread = &self.review.threads[idx];
+        let Some(root) = thread.root() else {
+            return;
+        };
+        if root.is_published() {
+            self.status = Some("a published comment can't be edited here".to_string());
+            return;
+        }
+        if root.author != self.author {
+            self.status = Some("only your own comments can be edited".to_string());
+            return;
+        }
+        let compose = Compose {
+            area: TextArea::from_text(&root.body),
+            kind: ComposeKind::Edit {
+                thread: thread.id.clone(),
+                comment: root.id.clone(),
+            },
+            target: "edit comment".to_string(),
+            confirming_discard: false,
+        };
+        self.input = Some(compose);
+    }
+
     /// Route a key while the comment composer is open.
     fn on_key_compose(&mut self, code: KeyCode, mods: KeyModifiers) {
         let ctrl = mods.contains(KeyModifiers::CONTROL);
@@ -1637,6 +1674,7 @@ impl App {
         let kind = match &compose.kind {
             ComposeKind::New(_) => self.human_new_kind(),
             ComposeKind::Reply(id) => self.reply_kind(id),
+            ComposeKind::Edit { .. } => return "save edit",
         };
         if kind == CommentKind::Draft {
             "save draft"
@@ -2343,6 +2381,7 @@ impl App {
             }
             Action::CloseReview if self.has_review() => self.confirming_close = true,
             Action::Delete => self.request_delete(),
+            Action::Edit => self.start_edit(),
             Action::ToggleKind => self.toggle_selected_kind(),
             Action::Fold => self.toggle_collapse_conv(),
             // l: a collapsed thread expands; an open one scrolls to its top.
@@ -2561,8 +2600,33 @@ impl App {
                     None => Some("the thread is gone".to_string()),
                 }
             }
+            ComposeKind::Edit { thread, comment } => {
+                if self.edit_comment(&thread, &comment, &body) {
+                    self.persist("comment edited")
+                } else {
+                    Some("the comment can no longer be edited".to_string())
+                }
+            }
         };
         self.relayout();
+    }
+
+    /// Replace the body of an existing comment, re-checking it is still the
+    /// author's own unpublished comment (state may have changed while the
+    /// composer was open). Returns false when it is gone or no longer editable.
+    fn edit_comment(&mut self, thread_id: &str, comment_id: &str, body: &str) -> bool {
+        let author = self.author.clone();
+        let Some(thread) = self.review.threads.iter_mut().find(|t| t.id == thread_id) else {
+            return false;
+        };
+        let Some(comment) = thread.comments.iter_mut().find(|c| c.id == comment_id) else {
+            return false;
+        };
+        if comment.is_published() || comment.author != author {
+            return false;
+        }
+        comment.body = body.to_string();
+        true
     }
 
     /// Save the review, returning a status message describing the outcome.
@@ -4017,9 +4081,13 @@ impl App {
     fn draw_compose(&self, f: &mut Frame, compose: &Compose) {
         let area = centered_rect(80, 50, f.area());
         f.render_widget(Clear, area);
+        let title = match &compose.kind {
+            ComposeKind::Edit { .. } => " Edit comment ".to_string(),
+            _ => format!(" Comment on {} ", compose.target),
+        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Comment on {} ", compose.target))
+            .title(title)
             .border_style(Style::default().fg(Color::Cyan));
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -6461,6 +6529,74 @@ mod tests {
         );
         reply.open_reply(0);
         assert_eq!(reply.compose_save_label(), "save note");
+    }
+
+    #[test]
+    fn e_edits_your_own_unpublished_comment() {
+        let mut app = sample_app(); // author "tester"
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "original",
+            CommentKind::Local,
+        );
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        // `e` opens the composer pre-filled with the existing body.
+        app.on_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(app.input.is_some(), "the editor opened");
+        assert_eq!(app.input.as_ref().unwrap().area.text(), "original");
+        // Append and save with Enter — the body is replaced in place.
+        app.on_key(KeyCode::Char('!'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.input.is_none(), "Enter saves the edit");
+        assert_eq!(app.review.threads[0].root().unwrap().body, "original!");
+        // The comment count did not change — an edit, not a new comment.
+        assert_eq!(app.review.threads[0].comments.len(), 1);
+    }
+
+    #[test]
+    fn e_refuses_published_and_others_comments() {
+        // Another author's note is not editable — that would misattribute it.
+        let mut app = sample_app(); // author "tester"
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "agent",
+            "theirs",
+            CommentKind::Local,
+        );
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        app.on_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(app.input.is_none(), "cannot edit another author's comment");
+        assert!(app.status.as_deref().unwrap_or("").contains("your own"));
+
+        // A published comment (it has a remote id) is not editable, even yours.
+        let mut published = sample_app();
+        published.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "posted",
+            CommentKind::Draft,
+        );
+        published.review.threads[0].comments[0].remote_id = Some("R1".into());
+        published.relayout();
+        published.view = View::Conversation;
+        published.conv_cursor = 0;
+        published.on_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(
+            published.input.is_none(),
+            "a published comment can't be edited"
+        );
+        assert!(
+            published
+                .status
+                .as_deref()
+                .unwrap_or("")
+                .contains("published")
+        );
     }
 
     #[test]

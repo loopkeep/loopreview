@@ -116,6 +116,7 @@ files from a working-tree review.
 | `V` | Start / cancel a line-range selection (`j` / `k` to extend, then `c`) |
 | `r` | Reply to the thread on the cursor line |
 | `x` | Resolve / reopen that thread |
+| `e` | Edit your own unpublished comment (the thread's root; opens the composer pre-filled) |
 | `d` | Withdraw the unpublished thread at the cursor (a draft or a local note; never a published comment) |
 | `t` | Toggle that thread between a draft and a local note (pull requests) |
 | `o` | Fold: expand the current file if collapsed, else fold the thread at the cursor, else collapse the current file |
@@ -148,6 +149,7 @@ move; `Enter` opens the file; `Esc` closes.
 | `Ctrl-D` / `Ctrl-U` (or `PageDown` / `PageUp`) | Scroll |
 | `r` | Reply to the selected thread |
 | `x` | Resolve / reopen |
+| `e` | Edit your own unpublished comment (the selected thread's root) |
 | `d` | Withdraw the selected thread if unpublished (a draft or local note) |
 | `t` | Toggle the selected thread between a draft and a local note (pull requests) |
 | `o` | Collapse / expand |
