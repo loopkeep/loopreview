@@ -27,6 +27,9 @@ features use the `gh` CLI.
   terminal width, and toggled at any time.
 - **Built for reading** — syntect syntax highlighting, word-level intra-line
   emphasis, a line cursor for precise navigation, and full mouse support.
+- **Built for big diffs** — fold files to their header, a file-explorer sidebar,
+  and a fuzzy file finder (`Ctrl-P`); a large diff opens collapsed so it loads
+  fast, and collapsed files are never highlighted.
 - **Live by default** — a `notify`-based watcher refreshes the diff the moment
   files change on disk (event-driven, not polling); disable with `--no-watch`.
 - **Local review** — leave markdown comments and threads on any line, reply,
@@ -89,6 +92,8 @@ files from a working-tree review.
 | --- | --- |
 | `q` / `Esc` / `Ctrl-C` | Quit |
 | `Tab` | Switch between the Files and Conversation views (once the review has threads) |
+| `b` | Toggle the file-explorer sidebar |
+| `Ctrl-P` | Open the fuzzy file finder |
 | `Ctrl-R` | Refresh from GitHub (pull requests) |
 | `Ctrl-S` | Open the submit modal (pull requests) |
 
@@ -106,8 +111,20 @@ files from a working-tree review.
 | `c` | Comment on the cursor line |
 | `r` | Reply to the thread on the cursor line |
 | `x` | Resolve / reopen that thread |
-| `o` | Collapse / expand that thread |
+| `o` | Fold: expand the current file if collapsed, else fold the thread at the cursor, else collapse the current file |
 | Wheel / click | Scroll / move the cursor |
+
+**Sidebar** (focused after `b`)
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Select a file |
+| `Enter` (or `l` / `→`) | Open the file (expanding it if collapsed) |
+| `o` | Fold / unfold the selected file |
+| `Esc` (or `h` / `←`) | Return focus to the diff |
+
+**File finder** (`Ctrl-P`): type to fuzzy-filter; `↑` / `↓` (or `Ctrl-P` / `Ctrl-N`)
+move; `Enter` opens the file; `Esc` closes.
 
 **Conversation view**
 
@@ -188,6 +205,8 @@ Settings live in `<config-dir>/loopreview/config.json` (all keys optional):
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `split_min_width` | integer | `160` | Body width, in columns, at which `auto` layout switches to side-by-side |
+| `auto_collapse_files` | integer | `50` | A diff with more changed files than this opens with every file collapsed |
+| `auto_collapse_lines` | integer | `20000` | A diff with more changed lines than this opens with every file collapsed |
 
 Data is stored under the same directory: local reviews in `reviews/`, live
 control-plane sessions in `sessions/`. `<config-dir>` is `$XDG_CONFIG_HOME` (or

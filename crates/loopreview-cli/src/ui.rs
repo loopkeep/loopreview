@@ -22,6 +22,8 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use notify::{RecursiveMode, Watcher};
+use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span as TextSpan};
@@ -60,6 +62,13 @@ const BAR_BG: Color = Color::Rgb(30, 33, 40);
 
 /// Rows of context kept above/below the cursor when scrolling.
 const SCROLLOFF: usize = 3;
+/// Sidebar width bounds, and the minimum diff width kept beside it (below which
+/// the sidebar auto-hides).
+const SIDEBAR_MIN: usize = 22;
+const SIDEBAR_MAX: usize = 44;
+const SIDEBAR_MIN_CONTENT: usize = 44;
+/// Background of a selected sidebar / finder row.
+const SEL_BG: Color = Color::Rgb(45, 50, 66);
 /// How often the event loop wakes to repaint when idle.
 const POLL_MS: u64 = 200;
 /// Quiet period after a filesystem event before a watched source is reloaded,
@@ -78,6 +87,25 @@ pub enum Mode {
     Auto,
     Unified,
     SideBySide,
+}
+
+/// Which pane holds the keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    /// The diff (or Conversation) body.
+    Body,
+    /// The file-explorer sidebar.
+    Sidebar,
+}
+
+/// The fuzzy file-finder overlay (Ctrl-P).
+struct Finder {
+    /// The current search text.
+    query: String,
+    /// Ranked matches: `(file index, matched char positions)`, best first.
+    matches: Vec<(usize, Vec<u32>)>,
+    /// Index into `matches` of the highlighted row.
+    selected: usize,
 }
 
 /// Which top-level view is showing (tabs appear once a review has threads).
@@ -486,6 +514,16 @@ struct App {
     auto_collapse_lines: usize,
     /// The current top-level view.
     view: View,
+    /// Whether the file-explorer sidebar is shown (subject to width).
+    sidebar: bool,
+    /// Which pane has the keyboard focus.
+    focus: Focus,
+    /// Selected file index in the sidebar.
+    sidebar_cursor: usize,
+    /// Scroll offset (in rows) of the sidebar.
+    sidebar_scroll: usize,
+    /// The fuzzy file-finder overlay, when open.
+    finder: Option<Finder>,
     /// Selected thread index in the Conversation view.
     conv_cursor: usize,
     /// Scroll offset (in lines) of the Conversation view.
@@ -584,6 +622,11 @@ impl App {
             auto_collapse_files: 50,
             auto_collapse_lines: 20_000,
             view: View::Files,
+            sidebar: false,
+            focus: Focus::Body,
+            sidebar_cursor: 0,
+            sidebar_scroll: 0,
+            finder: None,
             conv_cursor: 0,
             conv_scroll: 0,
             split_min_width: 160,
@@ -1057,13 +1100,22 @@ impl App {
             }
             return;
         }
-        // Modals take keys next: the composer, then the submit modal.
+        // Modals take keys next: the composer, the submit modal, the finder.
         if self.input.is_some() {
             self.on_key_compose(code, mods);
             return;
         }
         if self.submit.is_some() {
             self.on_key_submit(code, mods);
+            return;
+        }
+        if self.finder.is_some() {
+            self.on_key_finder(code, mods);
+            return;
+        }
+        // Ctrl-P opens the fuzzy file finder from anywhere.
+        if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('p') {
+            self.open_finder();
             return;
         }
         // PR sync shortcuts, available in either view.
@@ -1105,10 +1157,18 @@ impl App {
                 };
                 return;
             }
+            // `b` toggles the file-explorer sidebar.
+            (KeyCode::Char('b'), false) => {
+                self.toggle_sidebar();
+                return;
+            }
             _ => {}
         }
 
-        if self.view == View::Conversation {
+        // The sidebar takes keys while focused; otherwise the active view does.
+        if self.focus == Focus::Sidebar && self.sidebar {
+            self.on_key_sidebar(code, mods);
+        } else if self.view == View::Conversation {
             self.on_key_conversation(code, mods);
         } else {
             self.on_key_files(code, mods);
@@ -1367,6 +1427,191 @@ impl App {
                 ));
             }
             self.relayout();
+        }
+    }
+
+    // -- file explorer (sidebar + finder) -----------------------------------
+
+    /// The changed files, in diff order, for the sidebar and the finder.
+    fn file_entries(&self) -> Vec<FileEntry> {
+        self.diff
+            .files
+            .iter()
+            .enumerate()
+            .map(|(index, f)| {
+                let (added, removed) = f.line_stats();
+                let path = f.display_path().to_string();
+                FileEntry {
+                    index,
+                    comments: self.file_comment_count(&path),
+                    collapsed: self.collapsed_files.contains(&path),
+                    path,
+                    added,
+                    removed,
+                }
+            })
+            .collect()
+    }
+
+    /// Jump the diff view to `file`: expand it if collapsed, move the cursor to
+    /// its first line, and return focus to the body.
+    fn jump_to_file(&mut self, file: usize) {
+        if let Some(path) = self
+            .diff
+            .files
+            .get(file)
+            .map(|f| f.display_path().to_string())
+            && self.collapsed_files.remove(&path)
+        {
+            let diff = std::mem::take(&mut self.diff);
+            self.apply_layout(diff);
+        }
+        self.view = View::Files;
+        self.focus = Focus::Body;
+        self.sidebar_cursor = file;
+        if let Some(cursor) = self.file_first.get(file).copied().flatten() {
+            self.cursor = cursor.min(self.clines.len().saturating_sub(1));
+            self.follow_cursor();
+        }
+    }
+
+    /// Toggle the sidebar. Showing it moves focus there, synced to the current
+    /// file; hiding it returns focus to the body.
+    fn toggle_sidebar(&mut self) {
+        self.sidebar = !self.sidebar;
+        if self.sidebar {
+            self.focus = Focus::Sidebar;
+            self.sidebar_cursor = self.current_file();
+            self.follow_sidebar();
+        } else {
+            self.focus = Focus::Body;
+        }
+    }
+
+    /// Keep the sidebar selection visible.
+    fn follow_sidebar(&mut self) {
+        let files = self.diff.files.len();
+        self.sidebar_cursor = self.sidebar_cursor.min(files.saturating_sub(1));
+        let height = self.body_height.get().max(1);
+        if self.sidebar_cursor < self.sidebar_scroll {
+            self.sidebar_scroll = self.sidebar_cursor;
+        } else if self.sidebar_cursor >= self.sidebar_scroll + height {
+            self.sidebar_scroll = self.sidebar_cursor + 1 - height;
+        }
+    }
+
+    /// Route a key while the sidebar has focus.
+    fn on_key_sidebar(&mut self, code: KeyCode, _mods: KeyModifiers) {
+        let files = self.diff.files.len();
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.sidebar_cursor + 1 < files {
+                    self.sidebar_cursor += 1;
+                    self.follow_sidebar();
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.sidebar_cursor = self.sidebar_cursor.saturating_sub(1);
+                self.follow_sidebar();
+            }
+            KeyCode::Char('g') | KeyCode::Home => {
+                self.sidebar_cursor = 0;
+                self.follow_sidebar();
+            }
+            KeyCode::Char('G') | KeyCode::End => {
+                self.sidebar_cursor = files.saturating_sub(1);
+                self.follow_sidebar();
+            }
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                self.jump_to_file(self.sidebar_cursor)
+            }
+            KeyCode::Char('o') => self.toggle_fold_at(self.sidebar_cursor),
+            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Body,
+            _ => {}
+        }
+    }
+
+    /// Toggle a file's collapse from the sidebar (does not move the body cursor).
+    fn toggle_fold_at(&mut self, file: usize) {
+        let Some(path) = self
+            .diff
+            .files
+            .get(file)
+            .map(|f| f.display_path().to_string())
+        else {
+            return;
+        };
+        if !self.collapsed_files.remove(&path) {
+            self.collapsed_files.insert(path);
+        }
+        let diff = std::mem::take(&mut self.diff);
+        self.apply_layout(diff);
+        self.cursor = self.cursor.min(self.clines.len().saturating_sub(1));
+    }
+
+    /// Open the fuzzy file finder (Ctrl-P).
+    fn open_finder(&mut self) {
+        if self.diff.files.is_empty() {
+            return;
+        }
+        let entries = self.file_entries();
+        let matches = fuzzy_files(&entries, "");
+        self.finder = Some(Finder {
+            query: String::new(),
+            matches,
+            selected: 0,
+        });
+    }
+
+    /// Route a key while the finder overlay is open.
+    fn on_key_finder(&mut self, code: KeyCode, mods: KeyModifiers) {
+        let ctrl = mods.contains(KeyModifiers::CONTROL);
+        match code {
+            KeyCode::Esc => self.finder = None,
+            KeyCode::Enter => {
+                let target = self
+                    .finder
+                    .as_ref()
+                    .and_then(|f| f.matches.get(f.selected).map(|&(i, _)| i));
+                self.finder = None;
+                if let Some(file) = target {
+                    self.jump_to_file(file);
+                }
+            }
+            KeyCode::Down => self.move_finder(1),
+            KeyCode::Up => self.move_finder(-1),
+            KeyCode::Char('n') if ctrl => self.move_finder(1),
+            KeyCode::Char('p') if ctrl => self.move_finder(-1),
+            KeyCode::Backspace => {
+                if let Some(f) = self.finder.as_mut() {
+                    f.query.pop();
+                }
+                self.refilter_finder();
+            }
+            KeyCode::Char(c) if !ctrl => {
+                if let Some(f) = self.finder.as_mut() {
+                    f.query.push(c);
+                }
+                self.refilter_finder();
+            }
+            _ => {}
+        }
+    }
+
+    /// Move the finder selection, clamped.
+    fn move_finder(&mut self, delta: isize) {
+        if let Some(f) = self.finder.as_mut() {
+            let last = f.matches.len().saturating_sub(1) as isize;
+            f.selected = (f.selected as isize + delta).clamp(0, last) as usize;
+        }
+    }
+
+    /// Recompute the finder's matches after the query changed.
+    fn refilter_finder(&mut self) {
+        let entries = self.file_entries();
+        if let Some(f) = self.finder.as_mut() {
+            f.matches = fuzzy_files(&entries, &f.query);
+            f.selected = f.selected.min(f.matches.len().saturating_sub(1));
         }
     }
 
@@ -2254,20 +2499,43 @@ impl App {
             (chunks[0], chunks[1], chunks[2])
         };
         self.body_height.set(body.height as usize);
-        self.body_width.set(body.width as usize);
+
+        // Split off the file-explorer sidebar when shown and the terminal is
+        // wide enough (it auto-hides on a narrow terminal — the finder still
+        // works there).
+        let mut content = body;
+        if let Some(sidebar_w) = self.sidebar_width(body.width as usize) {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(sidebar_w as u16),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                ])
+                .split(body);
+            self.draw_sidebar(f, cols[0]);
+            let divider: Vec<TextLine> = (0..cols[1].height)
+                .map(|_| {
+                    TextLine::from(TextSpan::styled("│", Style::default().fg(Color::DarkGray)))
+                })
+                .collect();
+            f.render_widget(Paragraph::new(divider), cols[1]);
+            content = cols[2];
+        }
+        self.body_width.set(content.width as usize);
 
         self.draw_header(f, header);
         if tabs {
             self.draw_tabs(f, chunks[1]);
         }
         if self.view == View::Conversation {
-            self.draw_conversation(f, body);
+            self.draw_conversation(f, content);
         } else if self.clines.is_empty() && self.diff.files.is_empty() {
-            self.draw_empty(f, body);
+            self.draw_empty(f, content);
         } else if self.sbs() {
-            self.draw_body_sbs(f, body);
+            self.draw_body_sbs(f, content);
         } else {
-            self.draw_body_unified(f, body);
+            self.draw_body_unified(f, content);
         }
         self.draw_footer(f, footer);
 
@@ -2276,6 +2544,9 @@ impl App {
         }
         if let Some(modal) = &self.submit {
             self.draw_submit(f, modal);
+        }
+        if let Some(finder) = &self.finder {
+            self.draw_finder(f, finder);
         }
         if self.confirming_close {
             self.draw_close_confirm(f);
@@ -2626,10 +2897,12 @@ impl App {
         if let Some(status) = &self.status {
             spans.push(TextSpan::styled(status.clone(), bar.fg(Color::Yellow)));
         } else {
-            let help = if self.view == View::Conversation {
-                "j/k thread · o fold · r reply · x resolve · X close · tab files · q quit"
+            let help = if self.focus == Focus::Sidebar {
+                "j/k file · enter open · o fold · esc body · ^p find · q quit"
+            } else if self.view == View::Conversation {
+                "j/k thread · o fold · r reply · x resolve · X close · b files · tab diff · q quit"
             } else {
-                "j/k move · n/p file · c comment · r reply · x resolve · o fold · q quit"
+                "j/k move · n/p file · c comment · r reply · x resolve · o fold · b sidebar · ^p find · q quit"
             };
             spans.push(TextSpan::styled(help, bar.fg(Color::DarkGray)));
             if self.pr.is_some() {
@@ -2816,6 +3089,155 @@ impl App {
             .count()
     }
 
+    /// The sidebar width for a body `total` columns wide, or `None` when the
+    /// sidebar is hidden or the terminal is too narrow to keep a usable diff.
+    fn sidebar_width(&self, total: usize) -> Option<usize> {
+        if !self.sidebar {
+            return None;
+        }
+        let widest = self
+            .file_entries()
+            .iter()
+            .map(|e| {
+                e.path.chars().count()
+                    + 2
+                    + format!(" +{} -{}", e.added, e.removed).chars().count()
+                    + if e.comments > 0 { 4 } else { 0 }
+            })
+            .max()
+            .unwrap_or(SIDEBAR_MIN);
+        let desired = widest.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+        (total >= desired + 1 + SIDEBAR_MIN_CONTENT).then_some(desired)
+    }
+
+    /// One file row for the sidebar or finder: a fold chevron, the tail-truncated
+    /// path (with fuzzy-match highlighting when `matched` is given), the line
+    /// stats, and a comment badge — padded to `width` so a selection fills it.
+    fn file_row_spans(
+        &self,
+        entry: &FileEntry,
+        width: usize,
+        base: Style,
+        matched: &[u32],
+    ) -> Vec<TextSpan<'static>> {
+        let chevron = if entry.collapsed { "▸ " } else { "  " };
+        let stats_w = format!(" +{} -{}", entry.added, entry.removed)
+            .chars()
+            .count();
+        let badge = if entry.comments > 0 {
+            format!(" ●{}", entry.comments)
+        } else {
+            String::new()
+        };
+        let path_budget = width.saturating_sub(2 + stats_w + badge.chars().count());
+        let shown = truncate_path_head(&entry.path, path_budget.max(1));
+        let mut spans = vec![TextSpan::styled(chevron, base.fg(Color::Cyan))];
+        spans.extend(path_highlight_spans(
+            &shown,
+            &entry.path,
+            matched,
+            base.fg(Color::Gray),
+        ));
+        spans.push(TextSpan::styled(
+            format!(" +{}", entry.added),
+            base.fg(Color::Green),
+        ));
+        spans.push(TextSpan::styled(
+            format!(" -{}", entry.removed),
+            base.fg(Color::Red),
+        ));
+        if !badge.is_empty() {
+            spans.push(TextSpan::styled(badge, base.fg(Color::Magenta)));
+        }
+        fit(spans, width, base)
+    }
+
+    /// Draw the file-explorer sidebar.
+    fn draw_sidebar(&self, f: &mut Frame, area: Rect) {
+        let entries = self.file_entries();
+        let width = area.width as usize;
+        let height = area.height as usize;
+        // The selection is the sidebar cursor when focused, else the current file.
+        let selected = if self.focus == Focus::Sidebar {
+            self.sidebar_cursor
+        } else {
+            self.current_file()
+        };
+        let start = self.sidebar_scroll.min(entries.len());
+        let end = (start + height).min(entries.len());
+        let lines: Vec<TextLine> = entries[start..end]
+            .iter()
+            .map(|e| {
+                let base = if e.index == selected {
+                    let bg = if self.focus == Focus::Sidebar {
+                        SEL_BG
+                    } else {
+                        CURSOR_BG
+                    };
+                    Style::default().bg(bg)
+                } else {
+                    Style::default()
+                };
+                TextLine::from(self.file_row_spans(e, width, base, &[]))
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), area);
+    }
+
+    /// Draw the fuzzy file-finder overlay.
+    fn draw_finder(&self, f: &mut Frame, finder: &Finder) {
+        let area = centered_rect(70, 70, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" find file (type to filter, Enter to open, Esc to close) ")
+            .style(Style::default().bg(Color::Rgb(20, 22, 28)));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let mut lines = vec![
+            TextLine::from(vec![
+                TextSpan::styled("> ", Style::default().fg(Color::Cyan)),
+                TextSpan::styled(finder.query.clone(), Style::default().fg(Color::White)),
+                TextSpan::styled("▏", Style::default().fg(Color::Gray)),
+            ]),
+            TextLine::from(""),
+        ];
+        let entries = self.file_entries();
+        let width = inner.width as usize;
+        let list_height = (inner.height as usize).saturating_sub(2);
+        let start = if finder.selected >= list_height {
+            finder.selected + 1 - list_height
+        } else {
+            0
+        };
+        for (row, (file, indices)) in finder
+            .matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(list_height)
+        {
+            let base = if row == finder.selected {
+                Style::default().bg(SEL_BG)
+            } else {
+                Style::default().bg(Color::Rgb(20, 22, 28))
+            };
+            if let Some(entry) = entries.get(*file) {
+                lines.push(TextLine::from(
+                    self.file_row_spans(entry, width, base, indices),
+                ));
+            }
+        }
+        if finder.matches.is_empty() {
+            lines.push(TextLine::from(TextSpan::styled(
+                "  no matching files",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn hunk_header_line(&self, fi: usize, hi: usize) -> TextLine<'static> {
         let hunk = &self.diff.files[fi].hunks[hi];
         let mut spans = vec![TextSpan::styled(
@@ -2902,6 +3324,87 @@ fn note_line(msg: &str) -> TextLine<'static> {
 /// The last path component (the filename).
 fn file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// One changed file, as shown in the sidebar and the file finder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileEntry {
+    /// Index into the diff's files.
+    index: usize,
+    /// The file's display path.
+    path: String,
+    /// Added lines.
+    added: u32,
+    /// Removed lines.
+    removed: u32,
+    /// Number of comment threads on the file.
+    comments: usize,
+    /// Whether the file is currently collapsed.
+    collapsed: bool,
+}
+
+/// Rank `entries` against a fuzzy `query`, best match first. An empty query
+/// keeps the diff's order (every file). Returns each match's index into
+/// `entries` together with the matched character positions in its path (for
+/// highlighting).
+fn fuzzy_files(entries: &[FileEntry], query: &str) -> Vec<(usize, Vec<u32>)> {
+    if query.is_empty() {
+        return (0..entries.len()).map(|i| (i, Vec::new())).collect();
+    }
+    let mut matcher = Matcher::new(NucleoConfig::DEFAULT.match_paths());
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut buf = Vec::new();
+    let mut scored: Vec<(usize, u32, Vec<u32>)> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let haystack = Utf32Str::new(&entry.path, &mut buf);
+        let mut indices = Vec::new();
+        if let Some(score) = pattern.indices(haystack, &mut matcher, &mut indices) {
+            indices.sort_unstable();
+            indices.dedup();
+            scored.push((i, score, indices));
+        }
+    }
+    // Higher score first; break ties toward the shorter path (a closer match).
+    scored.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| entries[a.0].path.len().cmp(&entries[b.0].path.len()))
+    });
+    scored.into_iter().map(|(i, _, idx)| (i, idx)).collect()
+}
+
+/// Render `shown` (a possibly head-truncated `path`) with the fuzzy-matched
+/// characters emphasized. Highlighting is applied only when `shown` is the full
+/// path (indices map directly); a truncated path renders without per-char
+/// emphasis.
+fn path_highlight_spans(
+    shown: &str,
+    full: &str,
+    matched: &[u32],
+    base: Style,
+) -> Vec<TextSpan<'static>> {
+    if matched.is_empty() || shown != full {
+        return vec![TextSpan::styled(shown.to_string(), base)];
+    }
+    let set: HashSet<u32> = matched.iter().copied().collect();
+    let hl = base.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut run_hl = false;
+    for (i, ch) in shown.chars().enumerate() {
+        let is_hl = set.contains(&(i as u32));
+        if !run.is_empty() && is_hl != run_hl {
+            spans.push(TextSpan::styled(
+                std::mem::take(&mut run),
+                if run_hl { hl } else { base },
+            ));
+        }
+        run_hl = is_hl;
+        run.push(ch);
+    }
+    if !run.is_empty() {
+        spans.push(TextSpan::styled(run, if run_hl { hl } else { base }));
+    }
+    spans
 }
 
 /// Truncate `path` to `max` columns by dropping its head (with a leading `…`),
@@ -3979,6 +4482,124 @@ mod tests {
             layout.placed[0],
             "a present line stays placed even when its file is collapsed"
         );
+    }
+
+    // -- file explorer (sidebar + finder) -----------------------------------
+
+    fn multi_file_app(paths: &[&str]) -> App {
+        let files = paths.iter().map(|p| one_file(p)).collect();
+        let diff = Diff {
+            files,
+            provenance: Provenance::default(),
+        };
+        let mut app = App::new(
+            "t".into(),
+            diff,
+            Review::default(),
+            None,
+            "me".into(),
+            Highlighter::new(),
+            None,
+        );
+        app.mode = Mode::Unified;
+        app
+    }
+
+    fn entry(index: usize, path: &str) -> FileEntry {
+        FileEntry {
+            index,
+            path: path.into(),
+            added: 1,
+            removed: 0,
+            comments: 0,
+            collapsed: false,
+        }
+    }
+
+    #[test]
+    fn fuzzy_files_ranks_filters_and_reports_indices() {
+        let entries = vec![
+            entry(0, "src/main.rs"),
+            entry(1, "src/ui/mod.rs"),
+            entry(2, "README.md"),
+        ];
+        // Empty query keeps every file in order.
+        let all = fuzzy_files(&entries, "");
+        assert_eq!(all.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [0, 1, 2]);
+        // "main" matches only main.rs, with match positions for highlighting.
+        let m = fuzzy_files(&entries, "main");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].0, 0);
+        assert!(!m[0].1.is_empty());
+        // Smart case: "readme" finds README.md.
+        assert_eq!(fuzzy_files(&entries, "readme")[0].0, 2);
+        // No match.
+        assert!(fuzzy_files(&entries, "zzzzz").is_empty());
+    }
+
+    #[test]
+    fn finder_filters_and_jumps() {
+        let mut app = multi_file_app(&["src/a.rs", "src/b.rs"]);
+        app.open_finder();
+        assert!(app.finder.is_some());
+        app.on_key_finder(KeyCode::Char('b'), KeyModifiers::NONE);
+        {
+            let f = app.finder.as_ref().unwrap();
+            assert_eq!(f.matches.len(), 1);
+            assert_eq!(f.matches[0].0, 1);
+        }
+        // Enter opens the file and closes the finder.
+        app.on_key_finder(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.finder.is_none());
+        assert_eq!(app.current_file(), 1);
+    }
+
+    #[test]
+    fn jump_to_file_expands_a_collapsed_file() {
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        app.collapsed_files.insert("b.rs".to_string());
+        app.relayout();
+        app.jump_to_file(1);
+        assert!(!app.collapsed_files.contains("b.rs"), "jumping expands it");
+        assert_eq!(app.current_file(), 1);
+        assert_eq!(app.focus, Focus::Body);
+    }
+
+    #[test]
+    fn sidebar_toggle_selects_and_jumps() {
+        let mut app = multi_file_app(&["a.rs", "b.rs", "c.rs"]);
+        app.toggle_sidebar();
+        assert!(app.sidebar);
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.on_key_sidebar(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.on_key_sidebar(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.sidebar_cursor, 2);
+        app.on_key_sidebar(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.current_file(), 2);
+        assert_eq!(app.focus, Focus::Body);
+    }
+
+    #[test]
+    fn drawing_the_sidebar_and_finder_does_not_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = multi_file_app(&[
+            "src/aaaa.rs",
+            "verylong/path/to/some/deeply/nested/module/file.rs",
+        ]);
+        app.sidebar = true;
+        app.focus = Focus::Sidebar;
+        let mut wide = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        wide.draw(|f| app.draw(f)).unwrap();
+        // With the finder open and a query (exercises match highlighting).
+        app.open_finder();
+        app.on_key_finder(KeyCode::Char('a'), KeyModifiers::NONE);
+        wide.draw(|f| app.draw(f)).unwrap();
+        // A narrow terminal auto-hides the sidebar but must still draw.
+        let mut narrow = Terminal::new(TestBackend::new(50, 20)).unwrap();
+        narrow.draw(|f| app.draw(f)).unwrap();
+        assert!(app.sidebar_width(50).is_none(), "sidebar hides when narrow");
+        assert!(app.sidebar_width(120).is_some(), "sidebar shows when wide");
     }
 
     // -- robustness (resize, hostile input, truncation) ---------------------
