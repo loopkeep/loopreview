@@ -89,10 +89,16 @@ impl DiffSource for WorktreeSource {
     }
 
     fn describe(&self) -> String {
-        if self.staged {
-            "staged changes".to_string()
+        let base = if self.staged {
+            "staged changes"
         } else {
-            "working tree".to_string()
+            "working tree"
+        };
+        // With no commits yet, everything reads as added — say so in the header.
+        if git::head_sha(&self.dir).is_none() {
+            format!("{base} · no commits yet — all files new")
+        } else {
+            base.to_string()
         }
     }
 }

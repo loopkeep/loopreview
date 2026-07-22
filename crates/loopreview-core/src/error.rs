@@ -34,6 +34,13 @@ pub enum DiffError {
         path: String,
     },
 
+    /// A `git diff <target>` names a revision git cannot resolve.
+    #[error("could not resolve `{target}` — no such branch, tag, or commit")]
+    UnknownRevision {
+        /// The unresolvable revision expression.
+        target: String,
+    },
+
     /// A patch could not be parsed into the diff model.
     #[error("could not parse patch: {0}")]
     Parse(String),

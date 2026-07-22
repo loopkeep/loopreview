@@ -64,14 +64,48 @@ pub fn repo_root(dir: &Path) -> Result<PathBuf, DiffError> {
 /// The unified diff against `HEAD`. When `staged`, only the index is compared
 /// (`--cached`); otherwise the full working tree. `pathspec`, when non-empty,
 /// restricts the diff to matching paths.
+///
+/// With no commits yet (an unborn `HEAD`), `git diff HEAD` fails with exit 128;
+/// the comparison base is the empty tree instead, so staged files show as added.
+/// (Untracked files are handled separately by the caller.)
 pub fn diff_worktree(dir: &Path, staged: bool, pathspec: &[String]) -> Result<String, DiffError> {
+    let base = match head_sha(dir) {
+        Some(_) => "HEAD".to_string(),
+        None => empty_tree(dir).ok_or_else(|| DiffError::Command {
+            program: "git".to_string(),
+            code: -1,
+            stderr: "no commits yet, and the empty tree could not be resolved".to_string(),
+        })?,
+    };
     let mut cmd = diff_command(dir);
     if staged {
         cmd.arg("--cached");
     }
-    cmd.arg("HEAD");
+    cmd.arg(base);
     append_pathspec(&mut cmd, pathspec);
     run(cmd)
+}
+
+/// The SHA of this repository's empty tree object. Derived rather than
+/// hard-coded because a SHA-256 repository's empty tree is not the familiar
+/// SHA-1 `4b825dc…`. Empty stdin is the empty tree's content.
+pub fn empty_tree(dir: &Path) -> Option<String> {
+    use std::process::Stdio;
+    let mut child = Command::new("git")
+        .current_dir(dir)
+        .args(["hash-object", "-t", "tree", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    drop(child.stdin.take()); // EOF on empty stdin
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!sha.is_empty()).then_some(sha)
 }
 
 /// The unified diff for an arbitrary `git diff` target, e.g. `main`,
@@ -80,7 +114,17 @@ pub fn diff_target(dir: &Path, target: &str, pathspec: &[String]) -> Result<Stri
     let mut cmd = diff_command(dir);
     cmd.arg(target);
     append_pathspec(&mut cmd, pathspec);
-    run(cmd)
+    match run(cmd) {
+        // Git's raw "fatal: ambiguous argument …" is opaque; name the target.
+        Err(DiffError::Command {
+            code: 128, stderr, ..
+        }) if stderr.contains("unknown revision") || stderr.contains("ambiguous argument") => {
+            Err(DiffError::UnknownRevision {
+                target: target.to_string(),
+            })
+        }
+        other => other,
+    }
 }
 
 /// The commit SHA at `HEAD`, or `None` when it cannot be resolved (e.g. a

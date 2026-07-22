@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use loopreview_core::{ChangeStatus, DiffSource, LineKind, RefSource, WorktreeSource};
+use loopreview_core::{ChangeStatus, DiffError, DiffSource, LineKind, RefSource, WorktreeSource};
 
 /// Run `git` in `dir` with `args`, panicking on failure.
 fn git(dir: &Path, args: &[&str]) {
@@ -51,6 +51,92 @@ fn init_repo(name: &str) -> PathBuf {
     git(&dir, &["add", "file.txt"]);
     git(&dir, &["commit", "--quiet", "-m", "initial"]);
     dir
+}
+
+/// Like [`init_repo`] but with no commit — an unborn `HEAD`.
+fn init_no_commit(name: &str) -> PathBuf {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "loopreview-{name}-nocommit-{}-{unique}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp repo dir");
+    git(&dir, &["init", "--quiet"]);
+    git(&dir, &["config", "user.email", "test@example.com"]);
+    git(&dir, &["config", "user.name", "Test"]);
+    git(&dir, &["config", "core.autocrlf", "false"]);
+    dir
+}
+
+#[test]
+fn worktree_source_on_an_unborn_repo_shows_all_files_added() {
+    let repo = init_no_commit("worktree");
+    std::fs::write(repo.join("a.txt"), "alpha\nbeta\n").expect("write a");
+    std::fs::write(repo.join("b.txt"), "gamma\n").expect("write b");
+
+    let source = WorktreeSource::new(&repo);
+    let diff = source
+        .load()
+        .expect("worktree diff loads with an unborn HEAD");
+    let mut names: Vec<&str> = diff
+        .files
+        .iter()
+        .filter_map(|f| f.new_path.as_deref())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["a.txt", "b.txt"], "every file shows as added");
+    assert!(diff.files.iter().all(|f| f.status == ChangeStatus::Added));
+    assert_eq!(diff.provenance.base, None, "there is no base commit");
+    assert!(
+        source.describe().contains("no commits yet"),
+        "the header notes the unborn state: {}",
+        source.describe()
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn staged_source_on_an_unborn_repo_shows_staged_files_added() {
+    let repo = init_no_commit("staged");
+    std::fs::write(repo.join("s.txt"), "x\ny\n").expect("write s");
+    git(&repo, &["add", "s.txt"]);
+
+    let diff = WorktreeSource::new(&repo)
+        .staged(true)
+        .load()
+        .expect("staged diff loads with an unborn HEAD");
+    let file = diff
+        .files
+        .iter()
+        .find(|f| f.new_path.as_deref() == Some("s.txt"))
+        .expect("the staged file is present");
+    assert_eq!(file.status, ChangeStatus::Added);
+    assert_eq!(file.old_path, None);
+    assert_eq!(file.line_stats(), (2, 0));
+    assert_eq!(diff.provenance.base, None);
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn ref_source_reports_an_unknown_revision() {
+    let repo = init_repo("unknown-rev");
+    let err = RefSource::new(&repo, "no-such-ref-xyz")
+        .load()
+        .expect_err("an unresolvable target fails");
+    assert!(
+        matches!(err, DiffError::UnknownRevision { .. }),
+        "a friendly error, not a raw git 128: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("no-such-ref-xyz"),
+        "the message names the target: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
 }
 
 #[test]
