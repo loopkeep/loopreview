@@ -20,10 +20,14 @@ path = "src/bin/lr.rs"
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
-# `use-dev-tty` routes key input through /dev/tty so `git diff | lr` still reads
-# keystrokes when stdin is the piped patch rather than the keyboard.
-crossterm = { version = "0.29.0", features = ["use-dev-tty", "libc"] }
+crossterm = "0.29.0"
 loopreview-core = { path = "../loopreview-core" }
 ratatui = "0.30.2"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
+
+# On Unix, route key input through /dev/tty so `git diff | lr` still reads
+# keystrokes when stdin is the piped patch. These features are Unix-only; on
+# Windows crossterm reads the console directly, so the base dependency is used.
+[target.'cfg(unix)'.dependencies]
+crossterm = { version = "0.29.0", features = ["use-dev-tty", "libc"] }
