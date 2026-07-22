@@ -101,11 +101,21 @@ fn try_run() -> Result<()> {
         .as_deref()
         .and_then(git::common_dir)
         .and_then(|common| store::Store::for_repo(&common));
-    let review = store
-        .as_ref()
-        .map(store::Store::load)
-        .transpose()?
-        .unwrap_or_default();
+    // A corrupt or unreadable store must not stop plain diff viewing: recover by
+    // moving the bad file aside and starting fresh, then warn in the status line.
+    let (review, notice) = match store.as_ref() {
+        Some(store) => {
+            let (review, backup) = store.load_or_recover();
+            let notice = backup.map(|path| {
+                format!(
+                    "review store was unreadable — backed it up to {} and started fresh",
+                    path.display()
+                )
+            });
+            (review, notice)
+        }
+        None => (loopreview_core::Review::default(), None),
+    };
     let author = repo_dir
         .as_deref()
         .and_then(|dir| git::config(dir, "user.name"))
@@ -123,6 +133,7 @@ fn try_run() -> Result<()> {
         split_min_width: config::Config::load().split_min_width,
         repo_dir,
         loader: None,
+        notice,
     })
 }
 
@@ -173,6 +184,7 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
         split_min_width: config::Config::load().split_min_width,
         repo_dir: session_dir,
         loader: Some(loader),
+        notice: None,
     })
 }
 

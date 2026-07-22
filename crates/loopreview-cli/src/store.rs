@@ -2,12 +2,12 @@
 //! directory. The store is keyed by the repository's shared git directory, so a
 //! repo's worktrees share one review (the anchors' commit SHAs disambiguate).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-
-use std::collections::HashMap;
 
 use loopreview_core::Review;
 
@@ -83,23 +83,73 @@ impl Store {
     }
 
     /// Write the document atomically (temp file + rename) so a crash never
-    /// truncates the store.
+    /// truncates the store. The temp name is unique per process and call so two
+    /// writers never clobber each other's temp file.
     fn write_doc(&self, doc: &StoreDoc) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(doc)?;
-        let tmp = self.path.with_extension("json.tmp");
+        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        let tmp = self.path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::write(&tmp, json).with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("replacing {}", self.path.display()))?;
         Ok(())
     }
 
+    /// Read the document, apply `update`, and write it back — all while holding an
+    /// advisory lock on a sibling `.lock` file, and re-reading inside the lock, so
+    /// two TUIs sharing a repo's store (worktrees share one review) cannot lose
+    /// each other's changes to a last-writer-wins overwrite. The lock is
+    /// best-effort: if it cannot be taken (an exotic filesystem), the re-read plus
+    /// per-id merge still avoids dropping another writer's threads.
+    fn locked_update(&self, update: impl FnOnce(&mut StoreDoc)) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(self.path.with_extension("lock"))
+            .ok();
+        let mut lock = lock_file.map(fd_lock::RwLock::new);
+        // Held for the whole read-modify-write below (drops before `lock`).
+        let _guard = lock.as_mut().and_then(|l| l.write().ok());
+
+        let mut doc = self.read_doc()?;
+        update(&mut doc);
+        self.write_doc(&doc)
+    }
+
     /// Load the working-tree review, empty when the file does not exist.
     pub fn load(&self) -> Result<Review> {
         Ok(self.read_doc()?.review)
+    }
+
+    /// Load the working-tree review, recovering from a corrupt or unreadable
+    /// store rather than failing: the bad file is moved aside to `.bak` (never
+    /// deleted) and an empty review is returned, with the backup path so the
+    /// caller can warn. A review-store fault must not stop plain diff viewing.
+    pub fn load_or_recover(&self) -> (Review, Option<PathBuf>) {
+        match self.load() {
+            Ok(review) => (review, None),
+            Err(_) => {
+                let backup = self.path.with_extension("json.bak");
+                match std::fs::rename(&self.path, &backup) {
+                    Ok(()) => (Review::default(), Some(backup)),
+                    Err(_) => (Review::default(), None),
+                }
+            }
+        }
     }
 
     /// Delete the store file, if it exists (closing the review).
@@ -111,11 +161,11 @@ impl Store {
         }
     }
 
-    /// Save the working-tree review, preserving any stored PR drafts.
+    /// Save the working-tree review, preserving any stored PR drafts and merging
+    /// (by thread and comment id) with whatever another window may have written
+    /// since this one loaded, so no comment is silently overwritten.
     pub fn save(&self, review: &Review) -> Result<()> {
-        let mut doc = self.read_doc()?;
-        doc.review = review.clone();
-        self.write_doc(&doc)
+        self.locked_update(|doc| merge_review(&mut doc.review, review))
     }
 
     /// Load the stored draft review for a pull request (keyed `owner/repo#N`).
@@ -129,14 +179,40 @@ impl Store {
     }
 
     /// Save (or clear) the draft review for a pull request, preserving the rest.
+    /// An empty draft set clears the entry (all submitted or discarded); a
+    /// non-empty one is merged by id with any concurrently-written drafts.
     pub fn save_pr_drafts(&self, key: &str, drafts: &Review) -> Result<()> {
-        let mut doc = self.read_doc()?;
-        if drafts.is_empty() {
-            doc.pr_drafts.remove(key);
-        } else {
-            doc.pr_drafts.insert(key.to_string(), drafts.clone());
+        self.locked_update(|doc| {
+            if drafts.is_empty() {
+                doc.pr_drafts.remove(key);
+            } else {
+                merge_review(doc.pr_drafts.entry(key.to_string()).or_default(), drafts);
+            }
+        })
+    }
+}
+
+/// Merge `mine` into `into` by id: an incoming thread replaces the same-id thread
+/// (merging their comments by id, keeping both sides' comments and taking the
+/// incoming resolved state) or is appended when new. Threads present only in
+/// `into` — another window's additions — are kept. Threads are never deleted
+/// here; a review is only fully removed by deleting its store file.
+fn merge_review(into: &mut Review, mine: &Review) {
+    for thread in &mine.threads {
+        match into.threads.iter_mut().find(|t| t.id == thread.id) {
+            Some(existing) => {
+                for comment in &thread.comments {
+                    match existing.comments.iter_mut().find(|c| c.id == comment.id) {
+                        Some(current) => *current = comment.clone(),
+                        None => existing.comments.push(comment.clone()),
+                    }
+                }
+                existing.comments.sort_by_key(|c| c.created_at);
+                existing.state = thread.state;
+                existing.anchor = thread.anchor.clone();
+            }
+            None => into.threads.push(thread.clone()),
         }
-        self.write_doc(&doc)
     }
 }
 
@@ -245,6 +321,87 @@ mod tests {
         store.save_pr_drafts("o/r#7", &Review::default()).unwrap();
         assert!(store.load_pr_drafts("o/r#7").unwrap().is_empty());
         assert_eq!(store.load().unwrap(), worktree);
+
+        let _ = std::fs::remove_dir_all(store.path.parent().unwrap());
+    }
+
+    fn thread_of(id: &str, comments: &[(&str, &str)]) -> Thread {
+        Thread {
+            id: id.to_string(),
+            anchor: Anchor::line("a.rs", Side::New, 1),
+            state: ThreadState::Open,
+            comments: comments
+                .iter()
+                .map(|(cid, body)| Comment {
+                    id: cid.to_string(),
+                    author: "me".to_string(),
+                    body: body.to_string(),
+                    created_at: 0,
+                    remote_id: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn concurrent_saves_merge_by_thread_and_comment_id() {
+        let store = temp_store();
+        // Two windows loaded the same empty store; each adds a different thread.
+        store
+            .save(&Review {
+                threads: vec![thread_of("t1", &[("c1", "from A")])],
+            })
+            .unwrap();
+        store
+            .save(&Review {
+                threads: vec![thread_of("t2", &[("c2", "from B")])],
+            })
+            .unwrap();
+        // The second save must not drop the first window's thread.
+        let mut ids: Vec<String> = store
+            .load()
+            .unwrap()
+            .threads
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["t1".to_string(), "t2".to_string()]);
+
+        // Two windows reply to the same thread with different comment ids; both
+        // replies survive.
+        store
+            .save(&Review {
+                threads: vec![thread_of("t1", &[("c1", "root"), ("ca", "A reply")])],
+            })
+            .unwrap();
+        store
+            .save(&Review {
+                threads: vec![thread_of("t1", &[("c1", "root"), ("cb", "B reply")])],
+            })
+            .unwrap();
+        let loaded = store.load().unwrap();
+        let t1 = loaded.threads.iter().find(|t| t.id == "t1").unwrap();
+        let mut cids: Vec<&str> = t1.comments.iter().map(|c| c.id.as_str()).collect();
+        cids.sort_unstable();
+        assert_eq!(cids, vec!["c1", "ca", "cb"]);
+
+        let _ = std::fs::remove_dir_all(store.path.parent().unwrap());
+    }
+
+    #[test]
+    fn load_or_recover_backs_up_a_corrupt_store() {
+        let store = temp_store();
+        std::fs::create_dir_all(store.path.parent().unwrap()).unwrap();
+        std::fs::write(&store.path, b"{ not valid json").unwrap();
+
+        let (review, backup) = store.load_or_recover();
+        assert!(review.is_empty());
+        let backup = backup.expect("a backup path is returned");
+        assert!(backup.exists(), "the corrupt file is preserved");
+        assert!(!store.path.exists(), "the corrupt file is moved aside");
+        // A subsequent load starts clean.
+        assert!(store.load().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(store.path.parent().unwrap());
     }

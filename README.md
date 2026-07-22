@@ -152,6 +152,9 @@ opens the submit modal to choose the review event and an optional summary;
 thread syncs to GitHub. (The pull-request features use the `gh` CLI, which must
 be installed and authenticated.)
 
+> A GitHub multi-line comment is currently anchored to its last line (its range
+> is not yet folded into the diff); full range support is planned.
+
 ## Agent integration
 
 Reviewing agent work usually means an agent is on the other side of the loop. A

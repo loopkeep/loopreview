@@ -115,6 +115,8 @@ pub struct Session {
     /// A background loader (used by `lr pr`): when present, the UI opens on a
     /// spinner and this runs off-thread to produce the diff and threads.
     pub loader: Option<Loader>,
+    /// An initial status line to show (e.g. a store-recovery warning).
+    pub notice: Option<String>,
 }
 
 /// The result of a background load: the diff and threads to show.
@@ -192,6 +194,7 @@ pub fn run(session: Session) -> Result<()> {
         split_min_width,
         repo_dir,
         loader,
+        notice,
     } = session;
 
     let mut app = App::new(
@@ -205,6 +208,7 @@ pub fn run(session: Session) -> Result<()> {
     );
     app.mode = mode;
     app.split_min_width = split_min_width;
+    app.status = notice;
 
     // Host the control plane so agents can read, steer, comment, and wait. A
     // failure here degrades to a plain UI (no `lr session`), never a crash.
@@ -888,6 +892,7 @@ impl App {
                     }
                     Event::Mouse(mouse) => self.on_mouse(mouse),
                     Event::Paste(text) => self.on_paste(&text),
+                    Event::Resize(cols, _) => self.on_resize(cols),
                     _ => {}
                 }
             }
@@ -1840,6 +1845,24 @@ impl App {
         })
     }
 
+    /// Re-clamp the cursor and scroll after a terminal resize. A resize can flip
+    /// `auto` layout to side-by-side (which has fewer rows than unified), so a
+    /// scroll or cursor that was valid a moment ago may now point past the end;
+    /// left unclamped, the side-by-side renderer would try to allocate a row for
+    /// every position from a stale scroll to the end and panic.
+    fn on_resize(&mut self, cols: u16) {
+        self.body_width.set(cols as usize);
+        if !self.clines.is_empty() {
+            self.cursor = self.cursor.min(self.clines.len() - 1);
+        }
+        self.scroll = self.scroll.min(self.rows_len().saturating_sub(1));
+        if !self.review.threads.is_empty() {
+            self.conv_cursor = self.conv_cursor.min(self.review.threads.len() - 1);
+        }
+        self.conv_scroll = self.conv_scroll.min(self.conv_max_scroll());
+        self.follow_cursor();
+    }
+
     fn on_mouse(&mut self, mouse: MouseEvent) {
         if self.input.is_some()
             || self.submit.is_some()
@@ -2504,7 +2527,9 @@ impl App {
     }
 
     fn draw_body_unified(&self, f: &mut Frame, area: Rect) {
-        let start = self.scroll;
+        // Clamp the scroll: a layout change (e.g. a resize that flips to
+        // side-by-side, which has fewer rows) can leave it past the last row.
+        let start = self.scroll.min(self.urows.len());
         let end = (start + area.height as usize).min(self.urows.len());
         let current = self.current_file();
         let cursor_row = self.line_urow.get(self.cursor).copied();
@@ -2528,9 +2553,13 @@ impl App {
         let (cursor_file, cursor_flat) = self.clines.get(self.cursor).copied().unwrap_or((0, 0));
         let current = self.current_file();
 
-        let start = self.scroll;
+        // Clamp the scroll before computing the capacity: `end - start` would
+        // underflow (a huge allocation, a "capacity overflow" panic) if the
+        // scroll were past the last row — which happens when a resize flips the
+        // layout from unified (more rows) to side-by-side (fewer rows).
+        let start = self.scroll.min(self.srows.len());
         let end = (start + area.height as usize).min(self.srows.len());
-        let mut lines = Vec::with_capacity(end - start);
+        let mut lines = Vec::with_capacity(end.saturating_sub(start));
         for i in start..end {
             let line = match &self.srows[i] {
                 SRow::Spacer => TextLine::from(""),
@@ -2606,6 +2635,14 @@ impl App {
             (Some(old), Some(new)) if old != new => format!("{old} → {new}"),
             _ => file.display_path().to_string(),
         };
+        // When the row is too narrow, drop the head of the path (not the tail),
+        // so the filename is always visible (DESIGN §4). The marker is 2 columns.
+        let suffix = format!("  [{}]  +{added} -{removed}", file.status.label());
+        let budget = self
+            .body_width
+            .get()
+            .saturating_sub(2 + suffix.chars().count());
+        let path = truncate_path_head(&path, budget.max(1));
         let marker = if is_current { "▸ " } else { "  " };
         let path_style = if is_current {
             Style::default()
@@ -2711,6 +2748,21 @@ fn note_line(msg: &str) -> TextLine<'static> {
 
 /// Truncate/pad styled `spans` to exactly `width` display columns (approximated
 /// by character count), filling any remainder with `fill`.
+/// Truncate `path` to `max` columns by dropping its head (with a leading `…`),
+/// so the filename at the tail is always kept. Widths are counted in `char`s, to
+/// match [`fit`] and the rest of the renderer.
+fn truncate_path_head(path: &str, max: usize) -> String {
+    let count = path.chars().count();
+    if count <= max {
+        return path.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let tail: String = path.chars().skip(count - (max - 1)).collect();
+    format!("…{tail}")
+}
+
 fn fit(spans: Vec<TextSpan<'static>>, width: usize, fill: Style) -> Vec<TextSpan<'static>> {
     let mut out = Vec::new();
     let mut used = 0usize;
@@ -3201,9 +3253,10 @@ impl Layouts {
                 for (hi, hunk) in file.hunks.iter().enumerate() {
                     urows.push(URow::HunkHeader(fi, hi));
                     hunk_first.push(clines.len());
+                    // Saturating: a hostile patch could carry counts near u32::MAX.
                     max_lineno = max_lineno
-                        .max(hunk.old_start + hunk.old_lines)
-                        .max(hunk.new_start + hunk.new_lines);
+                        .max(hunk.old_start.saturating_add(hunk.old_lines))
+                        .max(hunk.new_start.saturating_add(hunk.new_lines));
                     for li in 0..hunk.lines.len() {
                         let cursor = clines.len();
                         if file_first[fi].is_none() {
@@ -3563,5 +3616,77 @@ mod tests {
             Response::Ok(Reply::Threads { threads }) => assert_eq!(threads.len(), 1),
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    // -- robustness (resize, hostile input, truncation) ---------------------
+
+    #[test]
+    fn truncate_path_head_keeps_the_filename() {
+        // Fits: unchanged.
+        assert_eq!(truncate_path_head("src/lib.rs", 20), "src/lib.rs");
+        // Too long: the head is dropped and the filename survives.
+        let out = truncate_path_head("very/deep/nested/path/to/file.rs", 12);
+        assert!(out.starts_with('…'));
+        assert!(out.ends_with("file.rs"), "kept the filename: {out}");
+        assert_eq!(out.chars().count(), 12);
+        // Degenerate widths.
+        assert_eq!(truncate_path_head("abcdef", 1), "…");
+    }
+
+    #[test]
+    fn on_resize_clamps_a_scroll_past_the_end() {
+        let mut app = sample_app();
+        app.mode = Mode::SideBySide;
+        app.scroll = 10_000;
+        app.cursor = 10_000;
+        app.on_resize(200);
+        assert!(app.scroll <= app.rows_len());
+        assert!(app.cursor < app.clines.len().max(1));
+    }
+
+    #[test]
+    fn drawing_side_by_side_with_a_stale_scroll_does_not_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let app = {
+            let mut app = sample_app();
+            app.mode = Mode::SideBySide;
+            // A scroll left over from a taller unified layout, past every sbs row.
+            app.scroll = 10_000;
+            app
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        // Without the clamp + saturating capacity this panics ("capacity overflow").
+        terminal.draw(|f| app.draw(f)).unwrap();
+    }
+
+    #[test]
+    fn layout_line_numbers_saturate_on_a_hostile_hunk() {
+        let file = FileDiff {
+            old_path: Some("a".into()),
+            new_path: Some("a".into()),
+            status: ChangeStatus::Modified,
+            binary: false,
+            hunks: vec![Hunk {
+                old_start: u32::MAX,
+                old_lines: u32::MAX,
+                new_start: u32::MAX,
+                new_lines: u32::MAX,
+                section: None,
+                lines: vec![Line {
+                    kind: LineKind::Context,
+                    content: "x".into(),
+                    old_lineno: Some(1),
+                    new_lineno: Some(1),
+                }],
+            }],
+        };
+        let diff = Diff {
+            files: vec![file],
+            provenance: Provenance::default(),
+        };
+        // Must not overflow-panic; the ceiling saturates.
+        let layout = Layouts::build(&diff, &Review::default(), &[]);
+        assert_eq!(layout.max_lineno, u32::MAX);
     }
 }

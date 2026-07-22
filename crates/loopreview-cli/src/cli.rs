@@ -101,7 +101,7 @@ enum Command {
         /// Patch file to read; reads standard input when omitted.
         file: Option<PathBuf>,
     },
-    /// Reserved: commit review (arrives in M2).
+    /// Reserved: commit review (planned, not yet available).
     #[command(hide = true)]
     Show {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -410,7 +410,9 @@ impl Cli {
             Some(Command::Patch { file: Some(path) }) => Action::PatchFile(path),
             Some(Command::Patch { file: None }) => Action::PatchStdin,
             Some(Command::Pr { query, detect }) => Action::Pr { query, detect },
-            Some(Command::Show { .. }) => Action::NotYet("`lr show` (commit review) arrives in M2"),
+            Some(Command::Show { .. }) => {
+                Action::NotYet("`lr show` (commit review) is planned but not yet available")
+            }
             // `session` and `skill` are peeled off by `dispatch` before this.
             Some(Command::Session(_)) => Action::NotYet("`lr session` is handled by dispatch"),
             Some(Command::Skill(_)) => Action::NotYet("`lr skill` is handled by dispatch"),
