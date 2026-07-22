@@ -456,6 +456,12 @@ struct SubmitModal {
     new_count: usize,
     /// Draft replies that will be posted.
     reply_count: usize,
+    /// Draft authors and their counts, most first — a check before sending under
+    /// the human's GitHub identity.
+    authors: Vec<(String, usize)>,
+    /// True when a draft is authored by someone other than the submitting human
+    /// (e.g. an agent) — flagged so it is not sent unnoticed.
+    foreign: bool,
 }
 
 /// An in-progress comment being composed.
@@ -941,24 +947,43 @@ impl App {
 
     /// Count the local drafts that a submit would post: new inline threads and
     /// replies (comments without a remote id).
-    fn draft_counts(&self) -> (usize, usize) {
+    /// What a submit would send: the new-inline and reply counts, the draft
+    /// authors (most first), and whether any draft is by someone other than the
+    /// submitting human. Only `draft`-kind comments count — local notes are never
+    /// sent — matching what the submit flow actually posts.
+    fn draft_summary(&self) -> (usize, usize, Vec<(String, usize)>, bool) {
         let mut new_inline = 0;
         let mut replies = 0;
+        let mut authors: Vec<(String, usize)> = Vec::new();
         for thread in &self.review.threads {
             for (i, comment) in thread.comments.iter().enumerate() {
-                if comment.remote_id.is_some() {
+                if !comment.is_draft() {
+                    continue;
+                }
+                // A root only posts when it is line-anchored (an inline comment);
+                // a reply always posts. Tally the author of what actually sends.
+                let sends = if i == 0 {
+                    matches!(thread.anchor, Anchor::Line { .. })
+                } else {
+                    true
+                };
+                if !sends {
                     continue;
                 }
                 if i == 0 {
-                    if matches!(thread.anchor, Anchor::Line { .. }) {
-                        new_inline += 1;
-                    }
+                    new_inline += 1;
                 } else {
                     replies += 1;
                 }
+                match authors.iter_mut().find(|(name, _)| *name == comment.author) {
+                    Some(entry) => entry.1 += 1,
+                    None => authors.push((comment.author.clone(), 1)),
+                }
             }
         }
-        (new_inline, replies)
+        authors.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let foreign = authors.iter().any(|(name, _)| *name != self.author);
+        (new_inline, replies, authors, foreign)
     }
 
     /// Open the review-submission modal (pull requests only).
@@ -966,12 +991,14 @@ impl App {
         if self.pr.is_none() {
             return;
         }
-        let (new_count, reply_count) = self.draft_counts();
+        let (new_count, reply_count, authors, foreign) = self.draft_summary();
         self.submit = Some(SubmitModal {
             selected: 0,
             body: TextArea::default(),
             new_count,
             reply_count,
+            authors,
+            foreign,
         });
     }
 
@@ -3668,20 +3695,42 @@ impl App {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
+        let total = modal.new_count + modal.reply_count;
+        let by = modal
+            .authors
+            .iter()
+            .map(|(name, n)| format!("{n} by {name}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
         let mut lines = vec![
             TextLine::from(TextSpan::styled(
                 format!(
-                    "{} new comment(s), {} repl(y/ies) to send",
-                    modal.new_count, modal.reply_count
+                    "{total} draft(s) to send ({} new · {} repl{})",
+                    modal.new_count,
+                    modal.reply_count,
+                    if modal.reply_count == 1 { "y" } else { "ies" }
                 ),
                 Style::default().fg(Color::Gray),
             )),
-            TextLine::from(""),
             TextLine::from(TextSpan::styled(
-                "event:",
+                format!("  {by}"),
                 Style::default().fg(Color::DarkGray),
             )),
         ];
+        // These go under the human's GitHub identity — warn on any not-yours.
+        if modal.foreign {
+            lines.push(TextLine::from(TextSpan::styled(
+                "  ⚠ includes drafts not authored by you — they send as you on GitHub",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+        lines.push(TextLine::from(""));
+        lines.push(TextLine::from(TextSpan::styled(
+            "event:",
+            Style::default().fg(Color::DarkGray),
+        )));
         for (i, (label, _)) in SUBMIT_EVENTS.iter().enumerate() {
             let marker = if i == modal.selected { "●" } else { "○" };
             let style = if i == modal.selected {
@@ -6215,6 +6264,50 @@ mod tests {
             pr.review.threads[1].root().unwrap().is_draft(),
             "--draft queues the comment"
         );
+    }
+
+    #[test]
+    fn submit_summary_counts_drafts_and_flags_other_authors() {
+        // sample_app's author is "tester" — the submitting human.
+        let mut app = pr_app();
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "mine",
+            CommentKind::Draft,
+        );
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 1),
+            "fable",
+            "agent draft",
+            CommentKind::Draft,
+        );
+        // A local note by an agent must not be counted (it is never sent).
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 1),
+            "fable",
+            "just a note",
+            CommentKind::Local,
+        );
+        let (new, reply, authors, foreign) = app.draft_summary();
+        assert_eq!((new, reply), (2, 0), "two drafts, the local note excluded");
+        assert!(authors.contains(&("tester".to_string(), 1)));
+        assert!(authors.contains(&("fable".to_string(), 1)));
+        assert!(
+            foreign,
+            "a draft by someone other than the human is flagged"
+        );
+
+        // Only the human's own drafts: no flag.
+        let mut solo = pr_app();
+        solo.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "mine",
+            CommentKind::Draft,
+        );
+        let (_, _, _, foreign) = solo.draft_summary();
+        assert!(!foreign, "only the human's own drafts — no warning");
     }
 
     #[test]
