@@ -109,6 +109,10 @@ pub struct Session {
     pub author: String,
     /// Minimum body width for `auto` layout to choose side-by-side.
     pub split_min_width: usize,
+    /// A diff with more files than this opens with every file collapsed.
+    pub auto_collapse_files: usize,
+    /// A diff with more changed lines than this opens with every file collapsed.
+    pub auto_collapse_lines: usize,
     /// The repository directory, for reconstructing outdated comment lines from
     /// history (`git show <commit>:<path>`). `None` for patch sources.
     pub repo_dir: Option<PathBuf>,
@@ -192,6 +196,8 @@ pub fn run(session: Session) -> Result<()> {
         store,
         author,
         split_min_width,
+        auto_collapse_files,
+        auto_collapse_lines,
         repo_dir,
         loader,
         notice,
@@ -208,7 +214,14 @@ pub fn run(session: Session) -> Result<()> {
     );
     app.mode = mode;
     app.split_min_width = split_min_width;
+    app.auto_collapse_files = auto_collapse_files;
+    app.auto_collapse_lines = auto_collapse_lines;
     app.status = notice;
+    // For a directly-loaded diff (not a background PR load), apply auto-collapse
+    // now; the PR path does it in install_loaded once the diff arrives.
+    if loader.is_none() {
+        app.maybe_auto_collapse();
+    }
 
     // Host the control plane so agents can read, steer, comment, and wait. A
     // failure here degrades to a plain UI (no `lr session`), never a crash.
@@ -464,6 +477,13 @@ struct App {
     conv_blocks: Vec<Vec<TextLine<'static>>>,
     /// Thread ids whose inline/Conversation body is collapsed to its header.
     collapsed: HashSet<String>,
+    /// File display paths that are collapsed to their header (contents hidden;
+    /// highlighting is skipped for them).
+    collapsed_files: HashSet<String>,
+    /// A diff with more files than this opens with every file collapsed.
+    auto_collapse_files: usize,
+    /// A diff with more changed lines than this opens with every file collapsed.
+    auto_collapse_lines: usize,
     /// The current top-level view.
     view: View,
     /// Selected thread index in the Conversation view.
@@ -512,7 +532,7 @@ impl App {
         let collapsed = HashSet::new();
         let comment_blocks = build_comment_blocks(&review, &highlighter, &collapsed);
         let block_lens: Vec<usize> = comment_blocks.iter().map(Vec::len).collect();
-        let layout = Layouts::build(&diff, &review, &block_lens);
+        let layout = Layouts::build(&diff, &review, &block_lens, &HashSet::new());
         let outdated = outdated_flags(&review, &layout.placed);
         let conv_blocks = build_conversation(
             &review,
@@ -560,6 +580,9 @@ impl App {
             comment_blocks,
             conv_blocks,
             collapsed: HashSet::new(),
+            collapsed_files: HashSet::new(),
+            auto_collapse_files: 50,
+            auto_collapse_lines: 20_000,
             view: View::Files,
             conv_cursor: 0,
             conv_scroll: 0,
@@ -613,6 +636,8 @@ impl App {
         self.conv_cursor = 0;
         self.conv_scroll = 0;
         self.loading = None;
+        // A large pull request opens collapsed (fast); this relays out again.
+        self.maybe_auto_collapse();
     }
 
     /// Spawn a background action and show its spinner.
@@ -923,7 +948,7 @@ impl App {
         self.comment_blocks =
             build_comment_blocks(&self.review, &self.highlighter, &self.collapsed);
         let block_lens: Vec<usize> = self.comment_blocks.iter().map(Vec::len).collect();
-        let layout = Layouts::build(&diff, &self.review, &block_lens);
+        let layout = Layouts::build(&diff, &self.review, &block_lens, &self.collapsed_files);
         let outdated = outdated_flags(&self.review, &layout.placed);
         let conv_width = self.body_width.get().clamp(40, 120);
         self.conv_blocks = build_conversation(
@@ -1112,7 +1137,7 @@ impl App {
             (KeyCode::Char('c'), false) => self.start_compose(),
             (KeyCode::Char('r'), false) => self.start_reply(),
             (KeyCode::Char('x'), false) => self.toggle_resolve(),
-            (KeyCode::Char('o'), false) => self.toggle_collapse_files(),
+            (KeyCode::Char('o'), false) => self.toggle_fold(),
             _ => {}
         }
     }
@@ -1269,11 +1294,79 @@ impl App {
         self.relayout();
     }
 
-    /// Toggle collapse of the thread at the cursor line (Files view).
-    fn toggle_collapse_files(&mut self) {
+    /// `o` in the Files view, context-dependent: expand the current file if it is
+    /// collapsed; otherwise fold the comment thread at the cursor line; otherwise
+    /// collapse the current file.
+    fn toggle_fold(&mut self) {
+        let file = self.current_file();
+        let path = self
+            .diff
+            .files
+            .get(file)
+            .map(|f| f.display_path().to_string());
+        if let Some(path) = &path
+            && self.collapsed_files.contains(path)
+        {
+            self.collapsed_files.remove(path);
+            self.status = Some(format!("expanded {}", file_name(path)));
+            self.relayout_to_file(file);
+            return;
+        }
         if let Some(idx) = self.thread_at_cursor() {
             let id = self.review.threads[idx].id.clone();
             self.toggle_collapse(id);
+            return;
+        }
+        if let Some(path) = path {
+            self.collapsed_files.insert(path.clone());
+            self.status = Some(format!("collapsed {}", file_name(&path)));
+            self.relayout_to_file(file);
+        }
+    }
+
+    /// Rebuild the layout (folds changed) and place the cursor on `file`.
+    fn relayout_to_file(&mut self, file: usize) {
+        let diff = std::mem::take(&mut self.diff);
+        self.apply_layout(diff);
+        let cursor = self
+            .file_first
+            .get(file)
+            .copied()
+            .flatten()
+            .unwrap_or(self.cursor);
+        self.cursor = cursor.min(self.clines.len().saturating_sub(1));
+        self.follow_cursor();
+    }
+
+    /// Collapse every file when the diff is large (above the configured limits),
+    /// so a big review opens fast; the reviewer expands what they want to read.
+    fn maybe_auto_collapse(&mut self) {
+        let files = self.diff.files.len();
+        let lines: usize = self
+            .diff
+            .files
+            .iter()
+            .map(|f| {
+                let (a, r) = f.line_stats();
+                (a + r) as usize
+            })
+            .sum();
+        if files > self.auto_collapse_files || lines > self.auto_collapse_lines {
+            let paths: Vec<String> = self
+                .diff
+                .files
+                .iter()
+                .map(|f| f.display_path().to_string())
+                .collect();
+            for path in paths {
+                self.collapsed_files.insert(path);
+            }
+            if self.status.is_none() {
+                self.status = Some(format!(
+                    "large diff — {files} files collapsed (o to expand)"
+                ));
+            }
+            self.relayout();
         }
     }
 
@@ -2671,15 +2764,24 @@ impl App {
             (Some(old), Some(new)) if old != new => format!("{old} → {new}"),
             _ => file.display_path().to_string(),
         };
+        let collapsed = self.collapsed_files.contains(file.display_path());
+        // A comment badge counts threads on this file (shown even when collapsed).
+        let comments = self.file_comment_count(file.display_path());
+        let badge = if comments > 0 {
+            format!("  {comments} comment{}", plural(comments))
+        } else {
+            String::new()
+        };
         // When the row is too narrow, drop the head of the path (not the tail),
-        // so the filename is always visible (DESIGN §4). The marker is 2 columns.
-        let suffix = format!("  [{}]  +{added} -{removed}", file.status.label());
+        // so the filename is always visible (DESIGN §4). The chevron is 2 columns.
+        let suffix = format!("  [{}]  +{added} -{removed}{badge}", file.status.label());
         let budget = self
             .body_width
             .get()
             .saturating_sub(2 + suffix.chars().count());
         let path = truncate_path_head(&path, budget.max(1));
-        let marker = if is_current { "▸ " } else { "  " };
+        // A chevron shows the fold state; bold/white marks the current file.
+        let chevron = if collapsed { "▸ " } else { "▾ " };
         let path_style = if is_current {
             Style::default()
                 .fg(Color::White)
@@ -2689,8 +2791,8 @@ impl App {
                 .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD)
         };
-        TextLine::from(vec![
-            TextSpan::styled(marker, Style::default().fg(Color::Cyan)),
+        let mut spans = vec![
+            TextSpan::styled(chevron, Style::default().fg(Color::Cyan)),
             TextSpan::styled(path, path_style),
             TextSpan::styled(
                 format!("  [{}]", file.status.label()),
@@ -2698,7 +2800,20 @@ impl App {
             ),
             TextSpan::styled(format!("  +{added}"), Style::default().fg(Color::Green)),
             TextSpan::styled(format!(" -{removed}"), Style::default().fg(Color::Red)),
-        ])
+        ];
+        if !badge.is_empty() {
+            spans.push(TextSpan::styled(badge, Style::default().fg(Color::Magenta)));
+        }
+        TextLine::from(spans)
+    }
+
+    /// Number of comment threads anchored to `path` (line- or file-anchored).
+    fn file_comment_count(&self, path: &str) -> usize {
+        self.review
+            .threads
+            .iter()
+            .filter(|t| t.anchor.file() == Some(path))
+            .count()
     }
 
     fn hunk_header_line(&self, fi: usize, hi: usize) -> TextLine<'static> {
@@ -2784,6 +2899,11 @@ fn note_line(msg: &str) -> TextLine<'static> {
 
 /// Truncate/pad styled `spans` to exactly `width` display columns (approximated
 /// by character count), filling any remainder with `fill`.
+/// The last path component (the filename).
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
 /// Truncate `path` to `max` columns by dropping its head (with a leading `…`),
 /// so the filename at the tail is always kept. Widths are counted in `char`s, to
 /// match [`fit`] and the rest of the renderer.
@@ -3241,8 +3361,25 @@ struct Layouts {
 }
 
 impl Layouts {
-    fn build(diff: &Diff, review: &Review, block_lens: &[usize]) -> Layouts {
+    fn build(
+        diff: &Diff,
+        review: &Review,
+        block_lens: &[usize],
+        collapsed_files: &HashSet<String>,
+    ) -> Layouts {
+        // Which line-anchored threads are present in the diff (placed); an absent
+        // one is outdated. Computed from the diff, independent of collapse — a
+        // collapsed file's threads are present, just hidden.
         let mut placed = vec![false; review.threads.len()];
+        for (idx, thread) in review.threads.iter().enumerate() {
+            if let Anchor::Line {
+                file, side, end, ..
+            } = &thread.anchor
+            {
+                placed[idx] = line_present(diff, file, *side, *end);
+            }
+        }
+
         // Map each line-anchored thread to its file and (side, line) so it can be
         // shown inline beneath that line in the unified view.
         let mut thread_at: HashMap<&str, HashMap<(Side, u32), Vec<usize>>> = HashMap::new();
@@ -3274,7 +3411,9 @@ impl Layouts {
             if fi > 0 {
                 urows.push(URow::Spacer);
             }
+            let header_row = urows.len();
             urows.push(URow::FileHeader(fi));
+            let collapsed = collapsed_files.contains(file.display_path());
             let file_threads = thread_at.get(file.display_path());
             let mut flat = Vec::new();
             let mut cof = Vec::new();
@@ -3285,6 +3424,21 @@ impl Layouts {
                     "{}, no content changes",
                     file.status.label()
                 )));
+            } else if collapsed {
+                // A collapsed file shows only its header. Build the flat list
+                // (cheap) but emit no content rows — so highlighting is skipped —
+                // and add one representative cline mapped to the header, so the
+                // cursor can rest on the file and expand it with `o`.
+                for (hi, hunk) in file.hunks.iter().enumerate() {
+                    for li in 0..hunk.lines.len() {
+                        flat.push((hi, li));
+                    }
+                }
+                if !flat.is_empty() {
+                    file_first[fi] = Some(clines.len());
+                    line_urow.push(header_row);
+                    clines.push((fi, 0));
+                }
             } else {
                 for (hi, hunk) in file.hunks.iter().enumerate() {
                     urows.push(URow::HunkHeader(fi, hi));
@@ -3317,7 +3471,6 @@ impl Layouts {
                                     && let Some(indices) = file_threads.get(&(side, n))
                                 {
                                     for &t in indices {
-                                        placed[t] = true;
                                         for k in 0..block_lens[t] {
                                             urows.push(URow::Comment(t, k));
                                         }
@@ -3339,7 +3492,9 @@ impl Layouts {
             if fi > 0 {
                 srows.push(SRow::Spacer);
             }
+            let header_srow = srows.len();
             srows.push(SRow::FileHeader(fi));
+            let collapsed = collapsed_files.contains(file.display_path());
             if file.binary {
                 srows.push(SRow::Note("binary file — contents not shown".to_string()));
             } else if file.hunks.is_empty() {
@@ -3347,6 +3502,10 @@ impl Layouts {
                     "{}, no content changes",
                     file.status.label()
                 )));
+            } else if collapsed {
+                if let Some(cursor) = file_first[fi] {
+                    line_srow[cursor] = header_srow;
+                }
             } else {
                 let file_threads = thread_at.get(file.display_path());
                 let mut flat_counter = 0usize;
@@ -3418,6 +3577,23 @@ impl Layouts {
             max_lineno,
         }
     }
+}
+
+/// Whether `line` on `side` of `file` is present in `diff`.
+fn line_present(diff: &Diff, file: &str, side: Side, line: u32) -> bool {
+    diff.files.iter().any(|f| {
+        f.display_path() == file
+            && f.hunks.iter().any(|h| {
+                h.lines.iter().any(|l| {
+                    let n = if side == Side::New {
+                        l.new_lineno
+                    } else {
+                        l.old_lineno
+                    };
+                    n == Some(line)
+                })
+            })
+    })
 }
 
 /// Pair a change block's deletions with additions positionally into old|new
@@ -3677,6 +3853,134 @@ mod tests {
         assert!(app.render.borrow()[0].is_none());
     }
 
+    // -- file collapse ------------------------------------------------------
+
+    fn one_file(path: &str) -> FileDiff {
+        FileDiff {
+            old_path: Some(path.into()),
+            new_path: Some(path.into()),
+            status: ChangeStatus::Modified,
+            binary: false,
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 2,
+                section: None,
+                lines: vec![
+                    Line {
+                        kind: LineKind::Context,
+                        content: "keep".into(),
+                        old_lineno: Some(1),
+                        new_lineno: Some(1),
+                    },
+                    Line {
+                        kind: LineKind::Addition,
+                        content: "added".into(),
+                        old_lineno: None,
+                        new_lineno: Some(2),
+                    },
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn collapsing_a_file_hides_content_and_skips_highlight() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = sample_app();
+        app.mode = Mode::Unified;
+        app.collapsed_files.insert("a.rs".to_string());
+        app.relayout_to_file(0);
+        assert_eq!(
+            app.clines.len(),
+            1,
+            "one representative cline when collapsed"
+        );
+        assert_eq!(
+            app.urows
+                .iter()
+                .filter(|r| matches!(r, URow::Line { .. }))
+                .count(),
+            0,
+            "no content rows when collapsed"
+        );
+
+        // Drawing must not highlight a collapsed file.
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(
+            app.render.borrow()[0].is_none(),
+            "collapsed file is never highlighted"
+        );
+
+        // `o` on the collapsed file expands it.
+        app.cursor = 0;
+        app.toggle_fold();
+        assert!(!app.collapsed_files.contains("a.rs"));
+        assert_eq!(
+            app.urows
+                .iter()
+                .filter(|r| matches!(r, URow::Line { .. }))
+                .count(),
+            2,
+            "content rows return when expanded"
+        );
+    }
+
+    #[test]
+    fn auto_collapse_triggers_over_the_file_threshold() {
+        let diff = Diff {
+            files: vec![one_file("a.rs"), one_file("b.rs"), one_file("c.rs")],
+            provenance: Provenance::default(),
+        };
+        let mut app = App::new(
+            "t".into(),
+            diff,
+            Review::default(),
+            None,
+            "me".into(),
+            Highlighter::new(),
+            None,
+        );
+        app.mode = Mode::Unified;
+        app.auto_collapse_files = 2; // 3 files > 2
+        app.auto_collapse_lines = 1_000_000;
+        app.maybe_auto_collapse();
+        assert_eq!(app.collapsed_files.len(), 3);
+        assert_eq!(app.clines.len(), 3, "one representative cline per file");
+    }
+
+    #[test]
+    fn a_thread_on_a_collapsed_file_stays_placed_not_outdated() {
+        let diff = Diff {
+            files: vec![one_file("a.rs")],
+            provenance: Provenance::default(),
+        };
+        let review = Review {
+            threads: vec![Thread {
+                id: "t".into(),
+                anchor: Anchor::line("a.rs", Side::New, 2),
+                state: ThreadState::Open,
+                comments: vec![Comment {
+                    id: "c".into(),
+                    author: "a".into(),
+                    body: "b".into(),
+                    created_at: 0,
+                    remote_id: None,
+                }],
+            }],
+        };
+        let mut collapsed = HashSet::new();
+        collapsed.insert("a.rs".to_string());
+        let layout = Layouts::build(&diff, &review, &[1], &collapsed);
+        assert!(
+            layout.placed[0],
+            "a present line stays placed even when its file is collapsed"
+        );
+    }
+
     // -- robustness (resize, hostile input, truncation) ---------------------
 
     #[test]
@@ -3745,7 +4049,7 @@ mod tests {
             provenance: Provenance::default(),
         };
         // Must not overflow-panic; the ceiling saturates.
-        let layout = Layouts::build(&diff, &Review::default(), &[]);
+        let layout = Layouts::build(&diff, &Review::default(), &[], &HashSet::new());
         assert_eq!(layout.max_lineno, u32::MAX);
     }
 }

@@ -121,6 +121,7 @@ fn try_run() -> Result<()> {
         .and_then(|dir| git::config(dir, "user.name"))
         .unwrap_or_else(|| "you".to_string());
 
+    let cfg = config::Config::load();
     ui::run(ui::Session {
         label,
         diff,
@@ -130,7 +131,9 @@ fn try_run() -> Result<()> {
         review,
         store,
         author,
-        split_min_width: config::Config::load().split_min_width,
+        split_min_width: cfg.split_min_width,
+        auto_collapse_files: cfg.auto_collapse_files,
+        auto_collapse_lines: cfg.auto_collapse_lines,
         repo_dir,
         loader: None,
         notice,
@@ -143,6 +146,7 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
     let dir = repo_root()?;
     let pr_query = prsync::query(query, detect).map_err(|m| anyhow!(m))?;
     let author = git::config(&dir, "user.name").unwrap_or_else(|| "you".to_string());
+    let cfg = config::Config::load();
 
     // The PR's drafts persist in this repo's store; the loader re-attaches them
     // after the pull (the same merge the refresh action uses).
@@ -181,7 +185,9 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
         review: loopreview_core::Review::default(),
         store,
         author,
-        split_min_width: config::Config::load().split_min_width,
+        split_min_width: cfg.split_min_width,
+        auto_collapse_files: cfg.auto_collapse_files,
+        auto_collapse_lines: cfg.auto_collapse_lines,
         repo_dir: session_dir,
         loader: Some(loader),
         notice: None,

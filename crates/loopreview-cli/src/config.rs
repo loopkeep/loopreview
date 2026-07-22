@@ -14,12 +14,18 @@ use serde::Deserialize;
 pub struct Config {
     /// Minimum body width (columns) at which `auto` layout chooses side-by-side.
     pub split_min_width: usize,
+    /// A diff with more changed files than this opens with every file collapsed.
+    pub auto_collapse_files: usize,
+    /// A diff with more changed lines than this opens with every file collapsed.
+    pub auto_collapse_lines: usize,
 }
 
 impl Default for Config {
     fn default() -> Config {
         Config {
             split_min_width: 160,
+            auto_collapse_files: 50,
+            auto_collapse_lines: 20_000,
         }
     }
 }
