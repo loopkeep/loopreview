@@ -16,6 +16,7 @@ mod skill;
 mod store;
 mod textarea;
 mod ui;
+mod update;
 
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
@@ -37,6 +38,7 @@ type SharedSource = Arc<dyn DiffSource + Send + Sync>;
 /// Entry point shared by both binaries: run loopreview, mapping any error to a
 /// non-zero exit code after printing it.
 pub fn run() -> ExitCode {
+    update::cleanup_stale_windows(); // Windows: sweep a prior update's `.old` binaries (a no-op elsewhere).
     match try_run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -58,6 +60,7 @@ fn try_run() -> Result<()> {
     } = match Cli::parse().dispatch() {
         Dispatch::Session(args) => return session_cli::run(args),
         Dispatch::Skill(args) => return skill::run(args),
+        Dispatch::Update { check } => return update::run(check),
         Dispatch::Tui(invocation) => invocation,
     };
 

@@ -127,6 +127,12 @@ enum Command {
     },
     /// Print the bundled agent skill document (for `lr session`).
     Skill(SkillArgs),
+    /// Update loopreview to the latest GitHub release.
+    Update {
+        /// Only report whether a newer release exists; do not install it.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 /// `lr session <verb>`: the control-plane client.
@@ -373,6 +379,11 @@ pub enum Dispatch {
     Session(SessionArgs),
     /// Run a `lr skill` verb.
     Skill(SkillArgs),
+    /// Run `lr update` (self-update from GitHub Releases).
+    Update {
+        /// Only check for a newer release; do not install.
+        check: bool,
+    },
 }
 
 impl Cli {
@@ -388,6 +399,7 @@ impl Cli {
         match command {
             Some(Command::Session(args)) => Dispatch::Session(args),
             Some(Command::Skill(args)) => Dispatch::Skill(args),
+            Some(Command::Update { check }) => Dispatch::Update { check },
             command => Dispatch::Tui(
                 Cli {
                     command,
@@ -436,6 +448,7 @@ impl Cli {
             // `session` and `skill` are peeled off by `dispatch` before this.
             Some(Command::Session(_)) => Action::NotYet("`lr session` is handled by dispatch"),
             Some(Command::Skill(_)) => Action::NotYet("`lr skill` is handled by dispatch"),
+            Some(Command::Update { .. }) => Action::NotYet("`lr update` is handled by dispatch"),
             Some(Command::Daemon { .. }) => Action::NotYet(
                 "`lr daemon` is reserved; this build hosts a socket per session (see `lr session`)",
             ),
