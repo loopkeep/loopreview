@@ -452,6 +452,45 @@ struct CursorAnchor {
     line: u32,
 }
 
+/// A hit-tested screen region (a pure mapping of a click to a pane).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Region {
+    /// The tab bar.
+    Tabs,
+    /// A sidebar file row (index from the top of the sidebar).
+    Sidebar(usize),
+    /// A diff cell: `col` is relative to the diff (past any sidebar), `row` is
+    /// relative to the body top.
+    Content { col: u16, row: usize },
+    /// Anything else (header, footer, divider column, outside the body).
+    Outside,
+}
+
+/// Map a screen cell `(x, y)` to a [`Region`], using the geometry captured at the
+/// last draw. Pure so it can be unit-tested across layout combinations.
+fn hit_region(x: u16, y: u16, hit: HitLayout) -> Region {
+    if hit.tabs_row == Some(y) {
+        return Region::Tabs;
+    }
+    if y < hit.body_top || y >= hit.body_top + hit.body_height {
+        return Region::Outside;
+    }
+    let row = (y - hit.body_top) as usize;
+    if hit.sidebar_w > 0 {
+        if x < hit.sidebar_w {
+            return Region::Sidebar(row);
+        }
+        if x == hit.sidebar_w {
+            return Region::Outside; // the divider column
+        }
+        return Region::Content {
+            col: x - (hit.sidebar_w + 1),
+            row,
+        };
+    }
+    Region::Content { col: x, row }
+}
+
 /// Where things landed on screen at the last draw, for mouse hit-testing.
 #[derive(Clone, Copy, Default)]
 struct HitLayout {
@@ -2492,61 +2531,48 @@ impl App {
     /// view; a sidebar row selects and opens a file; a file header toggles its
     /// fold; a diff line moves the cursor (and arms a drag-select).
     fn mouse_down(&mut self, column: u16, row: u16) {
-        let hit = self.hit.get();
-
-        if Some(row) == hit.tabs_row && self.has_review() {
-            if column < hit.tab_files_end {
-                self.view = View::Files;
-            } else if column > hit.tab_files_end && column < hit.tab_conv_end {
-                self.view = View::Conversation;
+        match hit_region(column, row, self.hit.get()) {
+            Region::Tabs if self.has_review() => {
+                let hit = self.hit.get();
+                if column < hit.tab_files_end {
+                    self.view = View::Files;
+                } else if column > hit.tab_files_end && column < hit.tab_conv_end {
+                    self.view = View::Conversation;
+                }
             }
-            return;
-        }
-
-        // Only the body area (between the header/tabs and the footer) is hit.
-        if row < hit.body_top || row >= hit.body_top + hit.body_height {
-            return;
-        }
-        let body_row = (row - hit.body_top) as usize;
-
-        // The sidebar column region: click a file row to open it.
-        if hit.sidebar_w > 0 && column < hit.sidebar_w {
-            let idx = self.sidebar_scroll + body_row;
-            if idx < self.diff.files.len() {
-                self.sidebar_cursor = idx;
-                self.jump_to_file(idx);
+            Region::Sidebar(row) => {
+                let idx = self.sidebar_scroll + row;
+                if idx < self.diff.files.len() {
+                    self.sidebar_cursor = idx;
+                    self.jump_to_file(idx);
+                }
             }
-            return;
-        }
-
-        let content_col = column.saturating_sub(self.content_x(hit));
-        if let Some(cursor) = self.cline_at_body(content_col, body_row) {
-            if self.clines[cursor].1 == HEADER {
-                // A header click folds/unfolds the file.
-                self.set_cursor(cursor);
-                self.toggle_fold_at(self.current_file());
-            } else {
-                self.clear_selection();
-                self.set_cursor(cursor);
-                self.drag_anchor = Some(cursor);
+            Region::Content { col, row } => {
+                if let Some(cursor) = self.cline_at_body(col, row) {
+                    if self.clines[cursor].1 == HEADER {
+                        // A header click folds/unfolds the file.
+                        self.set_cursor(cursor);
+                        self.toggle_fold_at(self.current_file());
+                    } else {
+                        self.clear_selection();
+                        self.set_cursor(cursor);
+                        self.drag_anchor = Some(cursor);
+                    }
+                }
             }
+            _ => {}
         }
     }
 
     /// Extend a range selection to the dragged-over diff line (content only).
     fn mouse_drag(&mut self, column: u16, row: u16) {
-        let hit = self.hit.get();
-        if row < hit.body_top || row >= hit.body_top + hit.body_height {
+        let Region::Content { col, row } = hit_region(column, row, self.hit.get()) else {
             return;
-        }
-        if hit.sidebar_w > 0 && column < hit.sidebar_w {
-            return; // no drag-select in the sidebar
-        }
+        };
         let Some(anchor) = self.drag_anchor else {
             return;
         };
-        let content_col = column.saturating_sub(self.content_x(hit));
-        if let Some(target) = self.cline_at_body(content_col, (row - hit.body_top) as usize)
+        if let Some(target) = self.cline_at_body(col, row)
             && self
                 .clines
                 .get(target)
@@ -2556,15 +2582,6 @@ impl App {
                 self.selection = Some(anchor);
             }
             self.set_cursor(target);
-        }
-    }
-
-    /// The first diff column, after the sidebar (and its divider) when shown.
-    fn content_x(&self, hit: HitLayout) -> u16 {
-        if hit.sidebar_w > 0 {
-            hit.sidebar_w + 1
-        } else {
-            0
         }
     }
 
@@ -5041,6 +5058,111 @@ mod tests {
         app.sidebar_action(Action::NavIn);
         assert_eq!(app.current_file(), 2);
         assert_eq!(app.focus, Focus::Body);
+    }
+
+    #[test]
+    fn hit_region_maps_across_layouts() {
+        // No tabs, no sidebar: body at screen row 1.
+        let h = HitLayout {
+            body_top: 1,
+            body_height: 20,
+            tabs_row: None,
+            tab_files_end: 0,
+            tab_conv_end: 0,
+            sidebar_w: 0,
+        };
+        assert_eq!(hit_region(5, 0, h), Region::Outside); // header
+        assert_eq!(hit_region(5, 1, h), Region::Content { col: 5, row: 0 });
+        assert_eq!(hit_region(5, 3, h), Region::Content { col: 5, row: 2 });
+
+        // Tabs present: body at screen row 2, tab bar at row 1.
+        let h = HitLayout {
+            body_top: 2,
+            tabs_row: Some(1),
+            ..h
+        };
+        assert_eq!(hit_region(5, 1, h), Region::Tabs);
+        assert_eq!(hit_region(5, 2, h), Region::Content { col: 5, row: 0 });
+        assert_eq!(hit_region(5, 4, h), Region::Content { col: 5, row: 2 });
+
+        // Sidebar 22 wide: cols [0,22) sidebar, 22 divider, 23+ diff.
+        let h = HitLayout {
+            body_top: 1,
+            tabs_row: None,
+            sidebar_w: 22,
+            ..h
+        };
+        assert_eq!(hit_region(5, 1, h), Region::Sidebar(0));
+        assert_eq!(hit_region(22, 1, h), Region::Outside); // divider
+        assert_eq!(hit_region(25, 3, h), Region::Content { col: 2, row: 2 });
+    }
+
+    /// Empirical: render, read the buffer to find the screen row of a known
+    /// line, click it, and confirm the cursor lands on that exact line — with the
+    /// tab bar present (the reported "one row down" case).
+    #[test]
+    fn a_click_selects_the_line_under_it_with_tabs() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = sample_app(); // a.rs: new 1 (context "keep"), new 2 ("added")
+        app.mode = Mode::Unified;
+        // A thread makes the tab bar appear (review context).
+        app.review.threads.push(Thread {
+            id: "t".into(),
+            anchor: Anchor::line("a.rs", Side::New, 1),
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: "c".into(),
+                author: "a".into(),
+                body: "note".into(),
+                created_at: 0,
+                remote_id: None,
+            }],
+        });
+        app.relayout();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+
+        // Find the screen row whose text contains the addition "added".
+        let buffer = term.backend().buffer();
+        let mut added_row = None;
+        for y in 0..24u16 {
+            let text: String = (0..80u16).map(|x| buffer[(x, y)].symbol()).collect();
+            if text.contains("added") {
+                added_row = Some(y);
+                break;
+            }
+        }
+        let added_row = added_row.expect("the addition line is rendered");
+
+        // Click that row in the diff area (past the default sidebar); the cursor
+        // must land on the addition (new line 2), not one line below.
+        let click_col = app.hit.get().sidebar_w + 5;
+        app.mouse_down(click_col, added_row);
+        assert_eq!(clicked_line(&app), "added", "with the sidebar shown");
+
+        // Same, with the sidebar hidden (tabs still shift the body down a row).
+        app.cursor = 0;
+        app.sidebar_override = Some(false);
+        term.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(app.hit.get().sidebar_w, 0);
+        let buffer = term.backend().buffer();
+        let mut y2 = None;
+        for y in 0..24u16 {
+            let text: String = (0..80u16).map(|x| buffer[(x, y)].symbol()).collect();
+            if text.contains("added") {
+                y2 = Some(y);
+                break;
+            }
+        }
+        app.mouse_down(5, y2.expect("addition rendered"));
+        assert_eq!(clicked_line(&app), "added", "with the sidebar hidden");
+    }
+
+    fn clicked_line(app: &App) -> String {
+        let (file, flat) = app.cursor_content().expect("cursor on a content line");
+        let (h, l) = app.flats[file][flat];
+        app.diff.files[file].hunks[h].lines[l].content.clone()
     }
 
     fn hit(body_top: u16, sidebar_w: u16, tabs_row: Option<u16>, files_end: u16) -> HitLayout {
