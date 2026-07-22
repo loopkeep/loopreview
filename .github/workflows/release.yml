@@ -1,0 +1,146 @@
+name: Release
+
+# Publishes prebuilt binaries so users can install without a Rust toolchain.
+# Triggered by pushing a version tag, e.g. `git tag v0.1.0 && git push --tags`.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+# Canonical release asset naming:
+#     loopreview-<version>-<target>.tar.gz   (unix: holds `loopreview` and `lr`)
+#     loopreview-<version>-<target>.zip       (windows: `loopreview.exe`, `lr.exe`)
+#     checksums.txt                            (sha256 of every archive)
+# <version> is the workspace manifest version with no leading `v`; the tag is
+# `v<version>`. Both binaries share one archive because `lr` is a real alias
+# binary, not a download shim.
+
+jobs:
+  # Fail fast (before spending build minutes) if the tag and the workspace
+  # manifest disagree, which would otherwise ship a release whose asset names
+  # do not match the tag users installed.
+  verify:
+    name: Verify tag matches manifest version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version
+        id: check
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          # Only the top-level Cargo.toml carries a literal version (the crates
+          # use `version.workspace = true`), so the first match is authoritative.
+          cargo_version="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+          echo "tag (without v):    $tag"
+          echo "workspace version:  $cargo_version"
+          if [ -z "$cargo_version" ]; then
+            echo "::error::Could not read the workspace version from Cargo.toml."
+            exit 1
+          fi
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "::error::Tag v$tag does not match the workspace version $cargo_version. Bump [workspace.package] version in Cargo.toml to match the tag (or retag) and push again."
+            exit 1
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple silicon runner: aarch64 is native, x86_64 cross-compiles with
+          # the macOS SDK (no extra toolchain, just the added rustup target).
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          # Native Linux builds on each arch (GitHub's arm runner avoids cross).
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          # Native Windows build; ships a .zip of the .exe binaries.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package tarball (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          version="${{ needs.verify.outputs.version }}"
+          triple="${{ matrix.target }}"
+          asset="loopreview-${version}-${triple}.tar.gz"
+          staging="$(mktemp -d)"
+          cp "target/${triple}/release/loopreview" "${staging}/loopreview"
+          cp "target/${triple}/release/lr" "${staging}/lr"
+          tar -C "${staging}" -czf "${asset}" loopreview lr
+          echo "ASSET=${asset}" >> "$GITHUB_ENV"
+      - name: Package zip (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ needs.verify.outputs.version }}"
+          $triple = "${{ matrix.target }}"
+          $asset = "loopreview-$version-$triple.zip"
+          $staging = Join-Path $env:RUNNER_TEMP "staging"
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          Copy-Item "target/$triple/release/loopreview.exe" (Join-Path $staging "loopreview.exe")
+          Copy-Item "target/$triple/release/lr.exe" (Join-Path $staging "lr.exe")
+          Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $asset -Force
+          "ASSET=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish GitHub Release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: |
+          sha256sum loopreview-*.tar.gz loopreview-*.zip | sort -k2 > checksums.txt
+          cat checksums.txt
+      - name: Publish release with gh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ needs.verify.outputs.version }}"
+          # Idempotent: create the release, or upload/clobber onto an existing
+          # one if this tag is re-run.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
+              dist/loopreview-*.tar.gz dist/loopreview-*.zip dist/checksums.txt
+          else
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "v${version}" --generate-notes \
+              dist/loopreview-*.tar.gz dist/loopreview-*.zip dist/checksums.txt
+          fi
