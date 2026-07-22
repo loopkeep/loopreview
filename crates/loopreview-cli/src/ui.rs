@@ -58,7 +58,7 @@ const AUTO_SBS_MIN_WIDTH: usize = 160;
 
 /// The diff layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub enum Mode {
     /// Pick unified or side-by-side by terminal width.
     Auto,
     Unified,
@@ -74,8 +74,10 @@ pub fn run(
     diff: Diff,
     source: Arc<dyn DiffSource + Send + Sync>,
     watch_root: Option<PathBuf>,
+    mode: Mode,
 ) -> Result<()> {
     let mut app = App::new(label, diff, Highlighter::new());
+    app.mode = mode;
     let updates = watch_root.map(|root| spawn_watcher(root, source));
     app.watching = updates.is_some();
 

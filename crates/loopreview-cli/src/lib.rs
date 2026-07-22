@@ -20,7 +20,7 @@ use loopreview_core::{
     DiffError, DiffSource, FilePatchSource, RefSource, StdinPatchSource, WorktreeSource, git,
 };
 
-use cli::{Action, Cli};
+use cli::{Action, Cli, Invocation, LayoutMode};
 
 /// A diff source usable from the watch thread.
 type SharedSource = Arc<dyn DiffSource + Send + Sync>;
@@ -39,10 +39,14 @@ pub fn run() -> ExitCode {
 
 fn try_run() -> Result<()> {
     // clap handles `--help` / `--version` (printing and exiting) before this.
-    let (action, no_watch) = Cli::parse().resolve();
+    let Invocation {
+        action,
+        no_watch,
+        mode,
+    } = Cli::parse().resolve();
 
     // A reserved verb is a usage error; report it regardless of the terminal.
-    if let Action::NotYet(message) = action {
+    if let Action::NotYet(message) = &action {
         bail!("{message}");
     }
 
@@ -70,7 +74,16 @@ fn try_run() -> Result<()> {
         return Ok(());
     }
 
-    ui::run(label, diff, source, watch_root)
+    ui::run(label, diff, source, watch_root, layout_mode(mode))
+}
+
+/// Map the CLI layout choice to the UI's layout mode.
+fn layout_mode(mode: LayoutMode) -> ui::Mode {
+    match mode {
+        LayoutMode::Auto => ui::Mode::Auto,
+        LayoutMode::Unified => ui::Mode::Unified,
+        LayoutMode::Split => ui::Mode::SideBySide,
+    }
 }
 
 /// Choose the diff source from the resolved action and the environment. Returns

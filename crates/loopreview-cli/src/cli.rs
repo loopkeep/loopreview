@@ -8,7 +8,18 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// The diff layout to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LayoutMode {
+    /// Choose unified or split by terminal width.
+    Auto,
+    /// Always unified (one column).
+    Unified,
+    /// Always side-by-side (old | new).
+    Split,
+}
 
 /// Parsed command line for loopreview.
 #[derive(Parser, Debug)]
@@ -27,6 +38,19 @@ pub struct Cli {
     /// Do not auto-refresh a live diff as the working tree changes.
     #[arg(long, global = true)]
     no_watch: bool,
+    /// Diff layout: auto (by width), unified, or split.
+    #[arg(long, value_enum, default_value_t = LayoutMode::Auto, global = true)]
+    mode: LayoutMode,
+}
+
+/// The fully-resolved command line: what to do and how.
+pub struct Invocation {
+    /// The diff to review.
+    pub action: Action,
+    /// Whether auto-refresh is disabled.
+    pub no_watch: bool,
+    /// The requested diff layout.
+    pub mode: LayoutMode,
 }
 
 /// The subcommands loopreview accepts.
@@ -102,10 +126,15 @@ pub enum Action {
 }
 
 impl Cli {
-    /// Resolve into an [`Action`] and whether watching is disabled.
-    pub fn resolve(self) -> (Action, bool) {
+    /// Resolve the parsed command line into an [`Invocation`].
+    pub fn resolve(self) -> Invocation {
         let no_watch = self.no_watch;
-        (self.action(), no_watch)
+        let mode = self.mode;
+        Invocation {
+            action: self.action(),
+            no_watch,
+            mode,
+        }
     }
 
     /// Resolve the parsed command line into an [`Action`].
@@ -198,13 +227,30 @@ mod tests {
 
     #[test]
     fn no_watch_is_a_global_flag() {
-        let (action, no_watch) = Cli::parse_from(["lr", "--no-watch"]).resolve();
-        assert_eq!(action, Action::Dispatch);
-        assert!(no_watch);
-        let (_, no_watch) = Cli::parse_from(["lr", "diff", "--no-watch"]).resolve();
-        assert!(no_watch);
-        let (_, no_watch) = Cli::parse_from(["lr", "diff"]).resolve();
-        assert!(!no_watch);
+        let inv = Cli::parse_from(["lr", "--no-watch"]).resolve();
+        assert_eq!(inv.action, Action::Dispatch);
+        assert!(inv.no_watch);
+        assert!(
+            Cli::parse_from(["lr", "diff", "--no-watch"])
+                .resolve()
+                .no_watch
+        );
+        assert!(!Cli::parse_from(["lr", "diff"]).resolve().no_watch);
+    }
+
+    #[test]
+    fn mode_defaults_to_auto_and_parses_globally() {
+        assert_eq!(Cli::parse_from(["lr"]).resolve().mode, LayoutMode::Auto);
+        assert_eq!(
+            Cli::parse_from(["lr", "--mode", "unified"]).resolve().mode,
+            LayoutMode::Unified
+        );
+        assert_eq!(
+            Cli::parse_from(["lr", "diff", "--mode", "split"])
+                .resolve()
+                .mode,
+            LayoutMode::Split
+        );
     }
 
     #[test]
