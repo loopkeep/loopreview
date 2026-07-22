@@ -1,0 +1,54 @@
+name: mirror-skills
+
+# Mirror the bundled agent skill to the public loopkeep/skills repo. Sync only
+# on release tags (the same `v*` as release.yml), never main: the published
+# skill must describe a released binary, not unreleased behavior.
+#
+# The target repo hosts one directory per skill; this workflow owns only
+# `loopreview/` and never touches the repo root (README/LICENSE) or other
+# skills' directories. No tags are pushed to the target — which release a sync
+# corresponds to is recorded in the sync commit message (app tag + source SHA).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: mirror-skills
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    # Skip prerelease tags (v*-*): the public skills repo carries only content
+    # matching stable releases users actually installed.
+    if: ${{ github.ref_type != 'tag' || !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No subtree/history export — push a plain snapshot as one commit so the
+      # source repo's commit history stays out of the public mirror.
+      - name: Push snapshot to loopkeep/skills
+        env:
+          DEPLOY_KEY: ${{ secrets.SKILLS_MIRROR_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git clone --depth 1 git@github.com:loopkeep/skills.git /tmp/skills
+          rsync -a --delete skills/loopreview/ /tmp/skills/loopreview/
+          # SKILL.md's source of truth is the copy bundled into the binary
+          # (`lr skill path`), so the published skill and the shipped binary
+          # can never drift apart.
+          cp crates/loopreview-cli/skill/SKILL.md /tmp/skills/loopreview/SKILL.md
+          cd /tmp/skills
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No content changes to mirror."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "Sync loopreview ${GITHUB_REF_NAME} (${GITHUB_SHA::12})"
+          git push origin HEAD:main
