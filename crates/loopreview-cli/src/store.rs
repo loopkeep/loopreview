@@ -46,6 +46,16 @@ pub struct Store {
 }
 
 impl Store {
+    /// Construct a store at an explicit path (for tests, to keep them off the
+    /// real config directory).
+    #[cfg(test)]
+    pub(crate) fn at(path: PathBuf, repo: impl Into<String>) -> Store {
+        Store {
+            path,
+            repo: repo.into(),
+        }
+    }
+
     /// The store for the repository whose shared git directory is `common_dir`,
     /// or `None` when no config directory can be determined.
     pub fn for_repo(common_dir: &Path) -> Option<Store> {

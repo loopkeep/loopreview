@@ -3395,4 +3395,173 @@ mod tests {
         let text: String = long.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "abc");
     }
+
+    // -- control plane (handle_control against a real App) -----------------
+
+    use loopreview_core::{ChangeStatus, FileDiff, Hunk, Line, Provenance};
+
+    /// An App over a one-file diff (context line 1, addition line 2), with a
+    /// local review store disabled (so persistence is a no-op).
+    fn sample_app() -> App {
+        let file = FileDiff {
+            old_path: Some("a.rs".into()),
+            new_path: Some("a.rs".into()),
+            status: ChangeStatus::Modified,
+            binary: false,
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 2,
+                section: None,
+                lines: vec![
+                    Line {
+                        kind: LineKind::Context,
+                        content: "keep".into(),
+                        old_lineno: Some(1),
+                        new_lineno: Some(1),
+                    },
+                    Line {
+                        kind: LineKind::Addition,
+                        content: "added".into(),
+                        old_lineno: None,
+                        new_lineno: Some(2),
+                    },
+                ],
+            }],
+        };
+        let diff = Diff {
+            files: vec![file],
+            provenance: Provenance {
+                base: Some("base".into()),
+                head: None,
+            },
+        };
+        // A store is needed for comments; an explicit temp path keeps the test
+        // off the real config. Persistence itself is covered by store's tests.
+        let path = std::env::temp_dir().join(format!(
+            "lr-ui-{}-{}/review.json",
+            std::process::id(),
+            app_counter()
+        ));
+        App::new(
+            "working tree".into(),
+            diff,
+            Review::default(),
+            Some(Store::at(path, "test-repo")),
+            "tester".into(),
+            Highlighter::new(),
+            None,
+        )
+    }
+
+    fn app_counter() -> u32 {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static C: AtomicU32 = AtomicU32::new(0);
+        C.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[test]
+    fn control_comment_add_creates_a_thread_and_emits_an_event() {
+        let mut app = sample_app();
+        let before = app.events.latest_seq();
+        let response = app.handle_control(Request::CommentAdd(protocol::CommentAdd {
+            file: "a.rs".into(),
+            side: Side::New,
+            line: 2,
+            body: "look here".into(),
+            author: "agent".into(),
+        }));
+        match response {
+            Response::Ok(Reply::Comment(result)) => {
+                assert!(!result.draft, "a working-tree comment is not a draft");
+                assert_eq!(app.review.threads.len(), 1);
+                let thread = &app.review.threads[0];
+                assert_eq!(thread.id, result.thread);
+                assert_eq!(thread.comments[0].author, "agent");
+                assert_eq!(thread.comments[0].body, "look here");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        assert_eq!(app.events.latest_seq(), before + 1, "a Comment event fired");
+    }
+
+    #[test]
+    fn control_comment_add_rejects_a_line_not_in_the_diff() {
+        let mut app = sample_app();
+        let response = app.handle_control(Request::CommentAdd(protocol::CommentAdd {
+            file: "a.rs".into(),
+            side: Side::New,
+            line: 99,
+            body: "x".into(),
+            author: "agent".into(),
+        }));
+        assert!(matches!(response, Response::Error(_)));
+        assert!(app.review.threads.is_empty());
+    }
+
+    #[test]
+    fn control_resolve_refuses_a_published_thread() {
+        let mut app = sample_app();
+        app.review.threads.push(Thread {
+            id: "t1".into(),
+            anchor: Anchor::line("a.rs", Side::New, 2),
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: "c1".into(),
+                author: "reviewer".into(),
+                body: "b".into(),
+                created_at: 0,
+                remote_id: Some("R1".into()), // published
+            }],
+        });
+        let response = app.handle_control(Request::CommentResolve(protocol::CommentResolve {
+            thread: "t1".into(),
+            resolved: true,
+            author: "agent".into(),
+        }));
+        assert!(matches!(response, Response::Error(_)));
+        assert!(!app.review.threads[0].is_resolved(), "state unchanged");
+    }
+
+    #[test]
+    fn control_navigate_reports_a_missing_target() {
+        let mut app = sample_app();
+        let response = app.handle_control(Request::Navigate(protocol::Navigate {
+            thread: None,
+            file: Some("a.rs".into()),
+            side: Some(Side::New),
+            line: Some(999),
+        }));
+        match response {
+            Response::Ok(Reply::Navigate(result)) => assert!(!result.moved),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_review_and_list_expose_the_diff_and_threads() {
+        let mut app = sample_app();
+        let _ = app.handle_control(Request::CommentAdd(protocol::CommentAdd {
+            file: "a.rs".into(),
+            side: Side::New,
+            line: 1,
+            body: "note".into(),
+            author: "agent".into(),
+        }));
+        match app.handle_control(Request::Review {
+            include_patch: true,
+        }) {
+            Response::Ok(Reply::Review(info)) => {
+                assert_eq!(info.files.len(), 1);
+                assert_eq!(info.files[0].hunks[0].lines.as_ref().unwrap().len(), 2);
+                assert_eq!(info.threads.len(), 1);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match app.handle_control(Request::CommentList) {
+            Response::Ok(Reply::Threads { threads }) => assert_eq!(threads.len(), 1),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
 }
