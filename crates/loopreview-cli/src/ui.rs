@@ -5364,6 +5364,76 @@ mod tests {
         app.diff.files[file].hunks[h].lines[l].content.clone()
     }
 
+    /// The diff text at a `clines` index (content lines only).
+    fn cline_text(app: &App, cidx: usize) -> String {
+        let (file, flat) = app.clines[cidx];
+        let (h, l) = app.flats[file][flat];
+        app.diff.files[file].hunks[h].lines[l].content.clone()
+    }
+
+    /// Reported symptom, drag half: press on one diff line, drag to another with
+    /// the tab bar present, and confirm the selection spans exactly the pressed
+    /// and dragged rows — not one row below either end.
+    #[test]
+    fn a_drag_selects_the_lines_under_it_with_tabs() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = sample_app(); // a.rs: new 1 (context "keep"), new 2 ("added")
+        app.mode = Mode::Unified;
+        // A thread makes the tab bar appear (review context).
+        app.review.threads.push(Thread {
+            id: "t".into(),
+            anchor: Anchor::line("a.rs", Side::New, 1),
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: "c".into(),
+                author: "a".into(),
+                body: "note".into(),
+                created_at: 0,
+                remote_id: None,
+            }],
+        });
+        app.relayout();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+
+        let row_of = |term: &Terminal<TestBackend>, needle: &str| -> u16 {
+            let buffer = term.backend().buffer();
+            for y in 0..24u16 {
+                let text: String = (0..80u16).map(|x| buffer[(x, y)].symbol()).collect();
+                if text.contains(needle) {
+                    return y;
+                }
+            }
+            panic!("row containing {needle:?} is rendered");
+        };
+        let keep_row = row_of(&term, "keep");
+        let added_row = row_of(&term, "added");
+        assert!(
+            added_row > keep_row,
+            "the addition renders below the context"
+        );
+
+        // Press on "keep", drag down to "added". Both must be selected; the
+        // range must resolve to exactly those two lines, off-by-one and all.
+        let col = app.hit.get().sidebar_w + 5;
+        app.mouse_down(col, keep_row);
+        app.mouse_drag(col, added_row);
+        let (lo, hi) = app
+            .selection_range()
+            .expect("dragging across two lines forms a selection");
+        assert_eq!(
+            cline_text(&app, lo),
+            "keep",
+            "selection starts at the press row"
+        );
+        assert_eq!(
+            cline_text(&app, hi),
+            "added",
+            "selection ends at the drag row"
+        );
+    }
+
     fn hit(body_top: u16, sidebar_w: u16, tabs_row: Option<u16>, files_end: u16) -> HitLayout {
         HitLayout {
             body_top,
