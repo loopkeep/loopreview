@@ -7,7 +7,7 @@
 //! [`loopreview_core`]; this module lays out rows, routes events, and paints.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -408,6 +408,8 @@ struct App {
     comment_blocks: Vec<Vec<TextLine<'static>>>,
     /// Rendered Conversation block per thread (root, replies), same order.
     conv_blocks: Vec<Vec<TextLine<'static>>>,
+    /// Thread ids whose inline/Conversation body is collapsed to its header.
+    collapsed: HashSet<String>,
     /// The current top-level view.
     view: View,
     /// Selected thread index in the Conversation view.
@@ -444,11 +446,18 @@ impl App {
         author: String,
         highlighter: Highlighter,
     ) -> App {
-        let comment_blocks = build_comment_blocks(&review, &highlighter);
+        let collapsed = HashSet::new();
+        let comment_blocks = build_comment_blocks(&review, &highlighter, &collapsed);
         let block_lens: Vec<usize> = comment_blocks.iter().map(Vec::len).collect();
         let layout = Layouts::build(&diff, &review, &block_lens);
         let outdated = outdated_flags(&review, &layout.placed);
-        let conv_blocks = build_conversation(&review, CONV_DEFAULT_WIDTH, &highlighter, &outdated);
+        let conv_blocks = build_conversation(
+            &review,
+            CONV_DEFAULT_WIDTH,
+            &highlighter,
+            &outdated,
+            &collapsed,
+        );
         let num_width = digits(layout.max_lineno).max(3);
         let file_count = diff.files.len();
         let cline_index = layout
@@ -486,6 +495,7 @@ impl App {
             submit: None,
             comment_blocks,
             conv_blocks,
+            collapsed: HashSet::new(),
             view: View::Files,
             conv_cursor: 0,
             conv_scroll: 0,
@@ -812,13 +822,19 @@ impl App {
     /// Recompute the layout and inline comment blocks from `diff` and the
     /// current review, replacing derived state. The caller restores the cursor.
     fn apply_layout(&mut self, diff: Diff) {
-        self.comment_blocks = build_comment_blocks(&self.review, &self.highlighter);
+        self.comment_blocks =
+            build_comment_blocks(&self.review, &self.highlighter, &self.collapsed);
         let block_lens: Vec<usize> = self.comment_blocks.iter().map(Vec::len).collect();
         let layout = Layouts::build(&diff, &self.review, &block_lens);
         let outdated = outdated_flags(&self.review, &layout.placed);
         let conv_width = self.body_width.get().clamp(40, 120);
-        self.conv_blocks =
-            build_conversation(&self.review, conv_width, &self.highlighter, &outdated);
+        self.conv_blocks = build_conversation(
+            &self.review,
+            conv_width,
+            &self.highlighter,
+            &outdated,
+            &self.collapsed,
+        );
         self.conv_cursor = self
             .conv_cursor
             .min(self.review.threads.len().saturating_sub(1));
@@ -996,6 +1012,7 @@ impl App {
             (KeyCode::Char('c'), false) => self.start_compose(),
             (KeyCode::Char('r'), false) => self.start_reply(),
             (KeyCode::Char('x'), false) => self.toggle_resolve(),
+            (KeyCode::Char('o'), false) => self.toggle_collapse_files(),
             _ => {}
         }
     }
@@ -1150,6 +1167,29 @@ impl App {
         self.relayout();
     }
 
+    /// Toggle collapse of the thread at the cursor line (Files view).
+    fn toggle_collapse_files(&mut self) {
+        if let Some(idx) = self.thread_at_cursor() {
+            let id = self.review.threads[idx].id.clone();
+            self.toggle_collapse(id);
+        }
+    }
+
+    /// Toggle collapse of the selected Conversation thread.
+    fn toggle_collapse_conv(&mut self) {
+        if let Some(thread) = self.review.threads.get(self.conv_cursor) {
+            let id = thread.id.clone();
+            self.toggle_collapse(id);
+        }
+    }
+
+    fn toggle_collapse(&mut self, id: String) {
+        if !self.collapsed.remove(&id) {
+            self.collapsed.insert(id);
+        }
+        self.relayout();
+    }
+
     /// Route a key in the Conversation view.
     fn on_key_conversation(&mut self, code: KeyCode, mods: KeyModifiers) {
         let ctrl = mods.contains(KeyModifiers::CONTROL);
@@ -1172,6 +1212,7 @@ impl App {
                 self.resolve_thread(self.conv_cursor)
             }
             (KeyCode::Char('X'), false) if self.has_review() => self.confirming_close = true,
+            (KeyCode::Char('o'), false) => self.toggle_collapse_conv(),
             _ => {}
         }
     }
@@ -1988,9 +2029,9 @@ impl App {
             spans.push(TextSpan::styled(status.clone(), bar.fg(Color::Yellow)));
         } else {
             let help = if self.view == View::Conversation {
-                "j/k thread · r reply · x resolve · X close review · tab files · q quit"
+                "j/k thread · o fold · r reply · x resolve · X close · tab files · q quit"
             } else {
-                "j/k move · n/p file · c comment · r reply · x resolve · v split · q quit"
+                "j/k move · n/p file · c comment · r reply · x resolve · o fold · q quit"
             };
             spans.push(TextSpan::styled(help, bar.fg(Color::DarkGray)));
             if self.pr.is_some() {
@@ -2340,16 +2381,21 @@ const INLINE_COMMENT_WRAP: usize = 76;
 
 /// Render each thread's inline block (index-aligned to `review.threads`): a
 /// header naming the author and state, then the root comment's body as markdown.
-fn build_comment_blocks(review: &Review, highlighter: &Highlighter) -> Vec<Vec<TextLine<'static>>> {
+fn build_comment_blocks(
+    review: &Review,
+    highlighter: &Highlighter,
+    collapsed: &HashSet<String>,
+) -> Vec<Vec<TextLine<'static>>> {
     let bar = Style::default().fg(COMMENT_BAR);
     review
         .threads
         .iter()
         .map(|thread| {
-            let mut lines = Vec::new();
+            let is_collapsed = collapsed.contains(&thread.id);
             let author = thread.root().map(|c| c.author.clone()).unwrap_or_default();
             let mut header = vec![
                 TextSpan::styled("  ▏ ", bar),
+                TextSpan::styled(if is_collapsed { "▸ " } else { "▾ " }, bar),
                 TextSpan::styled("💬 ", Style::default().fg(Color::Cyan)),
                 TextSpan::styled(
                     author,
@@ -2374,8 +2420,8 @@ fn build_comment_blocks(review: &Review, highlighter: &Highlighter) -> Vec<Vec<T
                     Style::default().fg(Color::DarkGray),
                 ));
             }
-            lines.push(TextLine::from(header));
-            if let Some(root) = thread.root() {
+            let mut lines = vec![TextLine::from(header)];
+            if !is_collapsed && let Some(root) = thread.root() {
                 for body in
                     crate::markdown::render(&root.body, Some(INLINE_COMMENT_WRAP), highlighter)
                 {
@@ -2397,6 +2443,7 @@ fn build_conversation(
     width: usize,
     highlighter: &Highlighter,
     outdated: &[bool],
+    collapsed: &HashSet<String>,
 ) -> Vec<Vec<TextLine<'static>>> {
     let now = now();
     review
@@ -2405,11 +2452,18 @@ fn build_conversation(
         .enumerate()
         .map(|(ti, thread)| {
             let is_outdated = outdated.get(ti).copied().unwrap_or(false);
+            let is_collapsed = collapsed.contains(&thread.id);
             let mut lines = Vec::new();
-            let mut header = vec![TextSpan::styled(
-                anchor_label(&thread.anchor),
-                Style::default().fg(Color::DarkGray),
-            )];
+            let mut header = vec![
+                TextSpan::styled(
+                    if is_collapsed { "▸ " } else { "▾ " },
+                    Style::default().fg(Color::DarkGray),
+                ),
+                TextSpan::styled(
+                    anchor_label(&thread.anchor),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ];
             if thread.is_resolved() {
                 header.push(TextSpan::styled(
                     "  [resolved]",
@@ -2423,6 +2477,10 @@ fn build_conversation(
                 ));
             }
             lines.push(TextLine::from(header));
+
+            if is_collapsed {
+                return lines;
+            }
 
             // For an outdated thread, show the context saved at creation so the
             // reviewer can still see the line it was left on.
