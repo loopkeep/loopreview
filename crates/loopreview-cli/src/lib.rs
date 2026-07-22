@@ -64,6 +64,12 @@ fn try_run() -> Result<()> {
         );
     }
 
+    // A pull-request review loads its diff and comments over the network, so it
+    // opens on a spinner and fetches on a background thread.
+    if let Action::Pr { query, detect } = action {
+        return run_pr(query, detect, mode);
+    }
+
     let (source, repo_dir) = build_source(action, exclude_untracked)?;
     let label = source.describe();
     let diff = source
@@ -105,6 +111,55 @@ fn try_run() -> Result<()> {
         store,
         author,
         split_min_width: config::Config::load().split_min_width,
+        loader: None,
+    })
+}
+
+/// Review a GitHub pull request: resolve, fetch the diff, and pull comments on a
+/// background thread while the UI shows a spinner.
+fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
+    use loopreview_github::{GithubClient, PrQuery};
+
+    let dir = repo_root()?;
+    let pr_query = if detect {
+        PrQuery::Detect
+    } else {
+        let text = query.ok_or_else(|| {
+            anyhow!("give a pull request (number, URL, or owner/repo#N), or pass --detect")
+        })?;
+        PrQuery::parse(&text).ok_or_else(|| {
+            anyhow!("`{text}` is not a pull request number, URL, or owner/repo#N reference")
+        })?
+    };
+
+    let author = git::config(&dir, "user.name").unwrap_or_else(|| "you".to_string());
+    let client = GithubClient::new(dir);
+    let loader: ui::Loader = Box::new(move |progress| {
+        progress("resolving pull request…");
+        let pr = client.resolve_pr(&pr_query).map_err(|e| e.to_string())?;
+        progress(&format!("fetching {} diff…", pr.label()));
+        let diff = client.pr_source(&pr).load().map_err(|e| e.to_string())?;
+        progress("fetching comments…");
+        let threads = client.pull(&pr).map_err(|e| e.to_string())?;
+        Ok(ui::Loaded {
+            label: pr.label(),
+            diff,
+            review: loopreview_core::Review { threads },
+        })
+    });
+
+    ui::run(ui::Session {
+        label: "pull request".to_string(),
+        diff: loopreview_core::Diff::default(),
+        // Unused: a PR is not file-watched (watch_root is None below).
+        source: Arc::new(StdinPatchSource::new()),
+        watch_root: None,
+        mode: layout_mode(mode),
+        review: loopreview_core::Review::default(),
+        store: None,
+        author,
+        split_min_width: config::Config::load().split_min_width,
+        loader: Some(loader),
     })
 }
 
@@ -160,7 +215,8 @@ fn build_source(
             }
             Ok((Arc::new(StdinPatchSource::new()), None))
         }
-        // Handled in try_run before the terminal is touched.
+        // Handled in try_run before build_source is reached.
+        Action::Pr { .. } => unreachable!("pull requests are handled by run_pr"),
         Action::NotYet(_) => unreachable!("reserved verbs are reported earlier"),
     }
 }

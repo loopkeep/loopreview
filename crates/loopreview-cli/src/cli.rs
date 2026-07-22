@@ -83,11 +83,13 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Reserved: pull-request review (arrives in M2).
-    #[command(hide = true)]
+    /// Review a GitHub pull request (by number, URL, or owner/repo#N).
     Pr {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// The pull request; omit and pass --detect to use the current branch.
+        query: Option<String>,
+        /// Detect the pull request for the current branch.
+        #[arg(long)]
+        detect: bool,
     },
     /// Reserved: control-plane session commands (arrive in M3).
     #[command(hide = true)]
@@ -126,6 +128,8 @@ pub enum Action {
     PatchFile(PathBuf),
     /// `lr patch`: a patch from standard input.
     PatchStdin,
+    /// `lr pr [query] [--detect]`: review a GitHub pull request.
+    Pr { query: Option<String>, detect: bool },
     /// A reserved verb that is not implemented yet.
     NotYet(&'static str),
 }
@@ -160,10 +164,8 @@ impl Cli {
             }) => Action::Worktree { staged, pathspec },
             Some(Command::Patch { file: Some(path) }) => Action::PatchFile(path),
             Some(Command::Patch { file: None }) => Action::PatchStdin,
+            Some(Command::Pr { query, detect }) => Action::Pr { query, detect },
             Some(Command::Show { .. }) => Action::NotYet("`lr show` (commit review) arrives in M2"),
-            Some(Command::Pr { .. }) => {
-                Action::NotYet("`lr pr` (pull-request review) arrives in M2")
-            }
             Some(Command::Session { .. }) => {
                 Action::NotYet("`lr session` (control plane) arrives in M3")
             }
@@ -261,8 +263,25 @@ mod tests {
     }
 
     #[test]
+    fn pr_verb_parses_query_and_detect() {
+        assert_eq!(
+            action_of(&["lr", "pr", "123"]),
+            Action::Pr {
+                query: Some("123".to_string()),
+                detect: false,
+            }
+        );
+        assert_eq!(
+            action_of(&["lr", "pr", "--detect"]),
+            Action::Pr {
+                query: None,
+                detect: true,
+            }
+        );
+    }
+
+    #[test]
     fn reserved_verbs_report_their_milestone() {
-        assert!(matches!(action_of(&["lr", "pr", "123"]), Action::NotYet(_)));
         assert!(matches!(
             action_of(&["lr", "session", "list"]),
             Action::NotYet(_)

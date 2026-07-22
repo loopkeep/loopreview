@@ -845,6 +845,7 @@ dependencies = [
  "clap",
  "crossterm",
  "loopreview-core",
+ "loopreview-github",
  "notify",
  "pulldown-cmark",
  "ratatui",

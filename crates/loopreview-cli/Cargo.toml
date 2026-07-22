@@ -22,6 +22,7 @@ anyhow = "1.0.104"
 clap = { version = "4.6.4", features = ["derive"] }
 crossterm = "0.29.0"
 loopreview-core = { path = "../loopreview-core" }
+loopreview-github = { version = "0.1.0", path = "../loopreview-github" }
 notify = "8.2.0"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = "0.30.2"

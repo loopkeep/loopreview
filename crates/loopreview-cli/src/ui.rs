@@ -101,7 +101,40 @@ pub struct Session {
     pub author: String,
     /// Minimum body width for `auto` layout to choose side-by-side.
     pub split_min_width: usize,
+    /// A background loader (used by `lr pr`): when present, the UI opens on a
+    /// spinner and this runs off-thread to produce the diff and threads.
+    pub loader: Option<Loader>,
 }
+
+/// The result of a background load: the diff and threads to show.
+pub struct Loaded {
+    /// Source description for the header.
+    pub label: String,
+    /// The loaded diff.
+    pub diff: Diff,
+    /// The review threads to seed (e.g. a PR's pulled comments).
+    pub review: Review,
+}
+
+/// A background load job: reports progress via the callback, then yields the
+/// diff and threads (or an error message).
+pub type Loader = Box<dyn FnOnce(&dyn Fn(&str)) -> Result<Loaded, String> + Send>;
+
+/// A message streamed from a running [`Loader`].
+enum LoadMsg {
+    Stage(String),
+    Ready(Box<Loaded>),
+    Failed(String),
+}
+
+/// The state of an in-progress background load.
+struct Loading {
+    stage: String,
+    rx: Receiver<LoadMsg>,
+}
+
+/// Spinner frames shown while a background load runs.
+const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// Enter the alternate screen, run the review UI, then restore the terminal.
 pub fn run(session: Session) -> Result<()> {
@@ -115,11 +148,15 @@ pub fn run(session: Session) -> Result<()> {
         store,
         author,
         split_min_width,
+        loader,
     } = session;
 
     let mut app = App::new(label, diff, review, store, author, Highlighter::new());
     app.mode = mode;
     app.split_min_width = split_min_width;
+    if let Some(loader) = loader {
+        app.start_loading(loader);
+    }
     let updates = watch_root.map(|root| spawn_watcher(root, source));
     app.watching = updates.is_some();
 
@@ -321,6 +358,12 @@ struct App {
     split_min_width: usize,
     /// True while awaiting confirmation to close (delete) the review.
     confirming_close: bool,
+    /// An in-progress background load (spinner), for `lr pr`.
+    loading: Option<Loading>,
+    /// A fatal load error to show instead of the diff.
+    load_error: Option<String>,
+    /// Repaint tick, for the spinner animation.
+    tick: usize,
     /// A transient status message (feedback or error).
     status: Option<String>,
     quit: bool,
@@ -381,9 +424,76 @@ impl App {
             conv_scroll: 0,
             split_min_width: 160,
             confirming_close: false,
+            loading: None,
+            load_error: None,
+            tick: 0,
             status: None,
             reloaded_at: None,
             quit: false,
+        }
+    }
+
+    /// Spawn `loader` on a background thread and enter the loading state.
+    fn start_loading(&mut self, loader: Loader) {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let stage_tx = tx.clone();
+            let progress = move |stage: &str| {
+                let _ = stage_tx.send(LoadMsg::Stage(stage.to_string()));
+            };
+            let message = match loader(&progress) {
+                Ok(loaded) => LoadMsg::Ready(Box::new(loaded)),
+                Err(reason) => LoadMsg::Failed(reason),
+            };
+            let _ = tx.send(message);
+        });
+        self.loading = Some(Loading {
+            stage: "loading…".to_string(),
+            rx,
+        });
+    }
+
+    /// Install a completed load: swap in the diff and threads.
+    fn install_loaded(&mut self, loaded: Loaded) {
+        self.label = loaded.label;
+        self.review = loaded.review;
+        self.apply_layout(loaded.diff);
+        self.cursor = 0;
+        self.scroll = 0;
+        self.conv_cursor = 0;
+        self.conv_scroll = 0;
+        self.loading = None;
+    }
+
+    /// Drain the load channel, updating the stage or finishing the load.
+    fn poll_loading(&mut self) {
+        // Take the state out so the stage can be mutated without aliasing.
+        let Some(mut loading) = self.loading.take() else {
+            return;
+        };
+        let mut outcome: Option<Result<Box<Loaded>, String>> = None;
+        loop {
+            match loading.rx.try_recv() {
+                Ok(LoadMsg::Stage(stage)) => loading.stage = stage,
+                Ok(LoadMsg::Ready(loaded)) => {
+                    outcome = Some(Ok(loaded));
+                    break;
+                }
+                Ok(LoadMsg::Failed(reason)) => {
+                    outcome = Some(Err(reason));
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    outcome = Some(Err("the load ended unexpectedly".to_string()));
+                    break;
+                }
+            }
+        }
+        match outcome {
+            Some(Ok(loaded)) => self.install_loaded(*loaded),
+            Some(Err(reason)) => self.load_error = Some(reason),
+            None => self.loading = Some(loading), // still running
         }
     }
 
@@ -395,6 +505,9 @@ impl App {
         updates: Option<Receiver<WatchMsg>>,
     ) -> Result<()> {
         while !self.quit {
+            self.tick = self.tick.wrapping_add(1);
+            self.poll_loading();
+
             // Drain watch messages: apply the newest diff, or record an error.
             // Held back while composing so an incoming change can't reshuffle the
             // diff under the open comment.
@@ -531,6 +644,15 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // While loading or showing a load error, only quit is accepted.
+        if self.loading.is_some() || self.load_error.is_some() {
+            if matches!(code, KeyCode::Esc | KeyCode::Char('q'))
+                || (code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL))
+            {
+                self.quit = true;
+            }
+            return;
+        }
         // While composing, keys edit the comment (or submit/cancel).
         if self.input.is_some() {
             self.on_key_compose(code, mods);
@@ -1110,6 +1232,14 @@ impl App {
     // -- rendering --------------------------------------------------------
 
     fn draw(&self, f: &mut Frame) {
+        if let Some(loading) = &self.loading {
+            self.draw_loading(f, &loading.stage);
+            return;
+        }
+        if let Some(error) = &self.load_error {
+            self.draw_load_error(f, error);
+            return;
+        }
         // A tab bar appears once the review has threads.
         let tabs = self.has_review();
         let constraints = if tabs {
@@ -1159,6 +1289,55 @@ impl App {
         if self.confirming_close {
             self.draw_close_confirm(f);
         }
+    }
+
+    /// The full-screen spinner shown while a background load runs.
+    fn draw_loading(&self, f: &mut Frame, stage: &str) {
+        let spinner = SPINNER[self.tick % SPINNER.len()];
+        let area = centered_rect(60, 20, f.area());
+        let lines = vec![
+            TextLine::from(""),
+            TextLine::from(TextSpan::styled(
+                format!("  {spinner}  {stage}"),
+                Style::default().fg(Color::Cyan),
+            )),
+            TextLine::from(""),
+            TextLine::from(TextSpan::styled(
+                "  q to cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines), area);
+    }
+
+    /// The full-screen error shown when a background load fails.
+    fn draw_load_error(&self, f: &mut Frame, error: &str) {
+        let area = centered_rect(70, 40, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Could not load ")
+            .border_style(Style::default().fg(Color::Red));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let mut lines: Vec<TextLine> = error
+            .lines()
+            .map(|l| {
+                TextLine::from(TextSpan::styled(
+                    l.to_string(),
+                    Style::default().fg(Color::White),
+                ))
+            })
+            .collect();
+        lines.push(TextLine::from(""));
+        lines.push(TextLine::from(TextSpan::styled(
+            "press q to quit",
+            Style::default().fg(Color::DarkGray),
+        )));
+        f.render_widget(
+            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+            inner,
+        );
     }
 
     /// The "close review?" confirmation modal.
