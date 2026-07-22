@@ -1,4 +1,5 @@
-//! User settings, read from `<config-dir>/loopreview/config.json`.
+//! User settings, read from `<config-dir>/loopreview/config.toml` (a legacy
+//! `config.json` is still read, with a migration hint).
 //!
 //! Settings are optional — a missing or unreadable file falls back to defaults —
 //! so the tool always runs. This is separate from the review store (comment

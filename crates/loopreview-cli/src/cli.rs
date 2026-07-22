@@ -2,9 +2,10 @@
 //!
 //! Bare `lr` is dispatch sugar (a piped patch, otherwise the working tree).
 //! `lr diff` reviews a VCS diff and never reads stdin; `lr patch` reviews a
-//! unified-diff patch from a file or stdin. Later milestones' verbs (`show`,
-//! `pr`, `session`, `daemon`) are reserved here so the namespace is stable.
-//! `--help` / `--version` are handled by clap before the TTY guard.
+//! unified-diff patch from a file or stdin. The hidden `show` and `daemon` verbs
+//! are reserved for later milestones so the namespace stays stable (`pr`,
+//! `session`, and `update` are implemented). `--help` / `--version` are handled
+//! by clap before the TTY guard.
 
 use std::path::PathBuf;
 
@@ -324,7 +325,8 @@ pub enum CommentAction {
         #[arg(long)]
         json: bool,
     },
-    /// Withdraw a draft comment or thread (drafts only; never published).
+    /// Withdraw an unpublished comment or thread (a draft or local note; never
+    /// published).
     #[command(group(
         clap::ArgGroup::new("rm_target")
             .required(true)

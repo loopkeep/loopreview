@@ -47,7 +47,8 @@ pub enum Request {
     CommentEdit(CommentEdit),
     /// Resolve or reopen a thread (local reviews only).
     CommentResolve(CommentResolve),
-    /// Withdraw a draft comment or thread (drafts only, never published).
+    /// Withdraw an unpublished comment or thread (a draft or local note, never
+    /// published).
     CommentRm(CommentRm),
     /// List the review's threads.
     CommentList,
@@ -129,7 +130,7 @@ pub struct CommentResolve {
     pub author: String,
 }
 
-/// Withdraw a draft comment or thread by id.
+/// Withdraw an unpublished comment or thread by id.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommentRm {
     /// A comment id (removes that draft, and its thread if it becomes empty) or a

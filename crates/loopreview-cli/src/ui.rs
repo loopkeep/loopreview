@@ -3433,9 +3433,9 @@ impl App {
         })
     }
 
-    /// Withdraw a draft comment or thread by id (drafts only). A comment id
-    /// removes that draft (and its thread when it empties); a thread id removes
-    /// the whole draft thread. Published comments are refused.
+    /// Withdraw an unpublished comment or thread by id — a draft or a local
+    /// note, never a published comment. A comment id removes that comment (and
+    /// its thread when it empties); a thread id removes the whole thread.
     fn control_comment_rm(
         &mut self,
         rm: protocol::CommentRm,
@@ -3454,7 +3454,8 @@ impl App {
         } else {
             return Err(format!("no comment or thread {id}"));
         };
-        // Drafts only — never delete anything published to GitHub.
+        // Unpublished only (a draft or a local note) — never delete anything
+        // published to GitHub.
         let published = match ci {
             Some(ci) => self.review.threads[ti].comments[ci].remote_id.is_some(),
             None => self.review.threads[ti]
@@ -3463,9 +3464,7 @@ impl App {
                 .any(|c| c.remote_id.is_some()),
         };
         if published {
-            return Err(
-                "only drafts can be removed — published comments stay on GitHub".to_string(),
-            );
+            return Err("a published comment can't be withdrawn — it stays on GitHub".to_string());
         }
         let (thread_id, removed_thread) = self.remove_draft(ti, ci);
         self.status = Some("agent: draft removed".to_string());
@@ -6829,7 +6828,7 @@ mod tests {
         });
         app.relayout();
         match app.handle_control(Request::CommentRm(protocol::CommentRm { id: "t".into() })) {
-            Response::Error(msg) => assert!(msg.contains("drafts"), "friendly refusal: {msg}"),
+            Response::Error(msg) => assert!(msg.contains("published"), "friendly refusal: {msg}"),
             other => panic!("expected an error, got {other:?}"),
         }
         assert_eq!(app.review.threads.len(), 1, "a published thread stays");
