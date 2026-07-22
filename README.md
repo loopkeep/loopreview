@@ -115,7 +115,8 @@ files from a working-tree review.
 | `r` | Reply to the thread on the cursor line |
 | `x` | Resolve / reopen that thread |
 | `o` | Fold: expand the current file if collapsed, else fold the thread at the cursor, else collapse the current file |
-| Wheel / click | Scroll / move the cursor |
+| Wheel | Scroll |
+| Click | Move the cursor; a file header folds/unfolds it; a sidebar row opens that file; a tab switches views |
 | Drag | Select a line range (then `c` to comment) |
 
 **Sidebar** (focused after `b`)

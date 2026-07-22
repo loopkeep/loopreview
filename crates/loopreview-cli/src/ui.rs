@@ -447,6 +447,23 @@ struct CursorAnchor {
     line: u32,
 }
 
+/// Where things landed on screen at the last draw, for mouse hit-testing.
+#[derive(Clone, Copy, Default)]
+struct HitLayout {
+    /// First body row (below the header and tab bar).
+    body_top: u16,
+    /// Body height in rows.
+    body_height: u16,
+    /// The tab bar row, when the tabs are shown.
+    tabs_row: Option<u16>,
+    /// The Files tab occupies columns `[0, tab_files_end)`.
+    tab_files_end: u16,
+    /// The Conversation tab occupies `[tab_files_end + 1, tab_conv_end)`.
+    tab_conv_end: u16,
+    /// Sidebar column count (0 = hidden); the diff starts past `sidebar_w`.
+    sidebar_w: u16,
+}
+
 /// Cached render data for one file, aligned to that file's flat line list.
 ///
 /// Highlighting is incremental: `highlight` holds only the lines shown so far
@@ -544,6 +561,8 @@ struct App {
     selection: Option<usize>,
     /// The cursor line a mouse-drag started on (to distinguish a click).
     drag_anchor: Option<usize>,
+    /// Screen geometry from the last draw, for mouse hit-testing.
+    hit: Cell<HitLayout>,
     /// Selected thread index in the Conversation view.
     conv_cursor: usize,
     /// Scroll offset (in lines) of the Conversation view.
@@ -651,6 +670,7 @@ impl App {
             finder: None,
             selection: None,
             drag_anchor: None,
+            hit: Cell::new(HitLayout::default()),
             conv_cursor: 0,
             conv_scroll: 0,
             split_min_width: 160,
@@ -2456,6 +2476,7 @@ impl App {
     fn on_mouse(&mut self, mouse: MouseEvent) {
         if self.input.is_some()
             || self.submit.is_some()
+            || self.finder.is_some()
             || self.job.is_some()
             || self.loading.is_some()
         {
@@ -2464,14 +2485,8 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollDown => self.scroll_view(3),
             MouseEventKind::ScrollUp => self.scroll_view(-3),
-            MouseEventKind::Down(MouseButton::Left) => {
-                // A press starts fresh: move the cursor and arm a possible drag.
-                self.clear_selection();
-                self.click(mouse.column, mouse.row);
-                self.drag_anchor = Some(self.cursor);
-            }
-            // Dragging with the button held extends a line-range selection.
-            MouseEventKind::Drag(MouseButton::Left) => self.drag_to(mouse.column, mouse.row),
+            MouseEventKind::Down(MouseButton::Left) => self.mouse_down(mouse.column, mouse.row),
+            MouseEventKind::Drag(MouseButton::Left) => self.mouse_drag(mouse.column, mouse.row),
             _ => {}
         }
     }
@@ -2483,15 +2498,91 @@ impl App {
         self.scroll = (self.scroll as isize + delta).clamp(0, max_scroll) as usize;
     }
 
-    /// The cursor line under a body cell, if any.
-    fn cline_at(&self, column: u16, row: u16) -> Option<usize> {
-        // Row 0 is the header; the body starts at row 1.
-        if row < 1 {
-            return None;
+    /// Route a left-button press by the region it lands in: a tab switches the
+    /// view; a sidebar row selects and opens a file; a file header toggles its
+    /// fold; a diff line moves the cursor (and arms a drag-select).
+    fn mouse_down(&mut self, column: u16, row: u16) {
+        let hit = self.hit.get();
+
+        if Some(row) == hit.tabs_row && self.has_review() {
+            if column < hit.tab_files_end {
+                self.view = View::Files;
+            } else if column > hit.tab_files_end && column < hit.tab_conv_end {
+                self.view = View::Conversation;
+            }
+            return;
         }
-        let body_row = (row - 1) as usize;
+
+        // Only the body area (between the header/tabs and the footer) is hit.
+        if row < hit.body_top || row >= hit.body_top + hit.body_height {
+            return;
+        }
+        let body_row = (row - hit.body_top) as usize;
+
+        // The sidebar column region: click a file row to open it.
+        if hit.sidebar_w > 0 && column < hit.sidebar_w {
+            let idx = self.sidebar_scroll + body_row;
+            if idx < self.diff.files.len() {
+                self.sidebar_cursor = idx;
+                self.jump_to_file(idx);
+            }
+            return;
+        }
+
+        let content_col = column.saturating_sub(self.content_x(hit));
+        if let Some(cursor) = self.cline_at_body(content_col, body_row) {
+            if self.clines[cursor].1 == HEADER {
+                // A header click folds/unfolds the file.
+                self.set_cursor(cursor);
+                self.toggle_fold_at(self.current_file());
+            } else {
+                self.clear_selection();
+                self.set_cursor(cursor);
+                self.drag_anchor = Some(cursor);
+            }
+        }
+    }
+
+    /// Extend a range selection to the dragged-over diff line (content only).
+    fn mouse_drag(&mut self, column: u16, row: u16) {
+        let hit = self.hit.get();
+        if row < hit.body_top || row >= hit.body_top + hit.body_height {
+            return;
+        }
+        if hit.sidebar_w > 0 && column < hit.sidebar_w {
+            return; // no drag-select in the sidebar
+        }
+        let Some(anchor) = self.drag_anchor else {
+            return;
+        };
+        let content_col = column.saturating_sub(self.content_x(hit));
+        if let Some(target) = self.cline_at_body(content_col, (row - hit.body_top) as usize)
+            && self
+                .clines
+                .get(target)
+                .is_some_and(|&(_, flat)| flat != HEADER)
+        {
+            if target != anchor {
+                self.selection = Some(anchor);
+            }
+            self.set_cursor(target);
+        }
+    }
+
+    /// The first diff column, after the sidebar (and its divider) when shown.
+    fn content_x(&self, hit: HitLayout) -> u16 {
+        if hit.sidebar_w > 0 {
+            hit.sidebar_w + 1
+        } else {
+            0
+        }
+    }
+
+    /// The cursor line at a body cell (`column` relative to the diff, `body_row`
+    /// relative to the body top), if any.
+    fn cline_at_body(&self, column: u16, body_row: usize) -> Option<usize> {
         if body_row >= self.body_height.get() {
-            return None; // footer or below
+            return None;
         }
         let row_index = self.scroll + body_row;
         if row_index >= self.rows_len() {
@@ -2501,26 +2592,6 @@ impl App {
             self.sbs_click(row_index, column as usize)
         } else {
             self.unified_click(row_index)
-        }
-    }
-
-    /// Move the cursor to the diff line under a click, if any.
-    fn click(&mut self, column: u16, row: u16) {
-        if let Some(cursor) = self.cline_at(column, row) {
-            self.set_cursor(cursor);
-        }
-    }
-
-    /// Extend a line-range selection to the dragged-over line.
-    fn drag_to(&mut self, column: u16, row: u16) {
-        let Some(anchor) = self.drag_anchor else {
-            return;
-        };
-        if let Some(target) = self.cline_at(column, row) {
-            if target != anchor {
-                self.selection = Some(anchor);
-            }
-            self.set_cursor(target);
         }
     }
 
@@ -2767,6 +2838,7 @@ impl App {
         // wide enough (it auto-hides on a narrow terminal — the finder still
         // works there).
         let mut content = body;
+        let mut sidebar_cols = 0u16;
         if let Some(sidebar_w) = self.sidebar_width(body.width as usize) {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
@@ -2784,8 +2856,21 @@ impl App {
                 .collect();
             f.render_widget(Paragraph::new(divider), cols[1]);
             content = cols[2];
+            sidebar_cols = sidebar_w as u16;
         }
         self.body_width.set(content.width as usize);
+
+        // Record the geometry for mouse hit-testing.
+        let (files_label, conv_label) = self.tab_labels();
+        let files_w = files_label.chars().count() as u16;
+        self.hit.set(HitLayout {
+            body_top: body.y,
+            body_height: body.height,
+            tabs_row: tabs.then(|| chunks[1].y),
+            tab_files_end: files_w,
+            tab_conv_end: files_w + 1 + conv_label.chars().count() as u16,
+            sidebar_w: sidebar_cols,
+        });
 
         self.draw_header(f, header);
         if tabs {
@@ -2989,14 +3074,22 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
+    /// The two tab labels (Files, Conversation), shared by drawing and mouse
+    /// hit-testing so their widths stay in sync.
+    fn tab_labels(&self) -> (String, String) {
+        (
+            format!(" Files ({}) ", self.diff.files.len()),
+            format!(" Conversation ({}) ", self.review.threads.len()),
+        )
+    }
+
     fn draw_tabs(&self, f: &mut Frame, area: Rect) {
         let active = Style::default()
             .fg(Color::Black)
             .bg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
         let idle = Style::default().fg(Color::Gray);
-        let files = format!(" Files ({}) ", self.diff.files.len());
-        let conv = format!(" Conversation ({}) ", self.review.threads.len());
+        let (files, conv) = self.tab_labels();
         let line = TextLine::from(vec![
             TextSpan::styled(
                 files,
@@ -4942,6 +5035,66 @@ mod tests {
         assert_eq!(app.sidebar_cursor, 2);
         app.on_key_sidebar(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(app.current_file(), 2);
+        assert_eq!(app.focus, Focus::Body);
+    }
+
+    fn hit(body_top: u16, sidebar_w: u16, tabs_row: Option<u16>, files_end: u16) -> HitLayout {
+        HitLayout {
+            body_top,
+            body_height: 20,
+            tabs_row,
+            tab_files_end: files_end,
+            tab_conv_end: files_end + 1 + 20,
+            sidebar_w,
+        }
+    }
+
+    #[test]
+    fn mouse_click_on_a_header_toggles_the_fold() {
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        app.mode = Mode::Unified;
+        app.hit.set(hit(1, 0, None, 0));
+        // Body row 0 (screen row 1) is the first file's header.
+        app.mouse_down(0, 1);
+        assert!(app.collapsed_files.contains("a.rs"), "a header click folds");
+        app.mouse_down(0, 1);
+        assert!(!app.collapsed_files.contains("a.rs"), "and unfolds");
+    }
+
+    #[test]
+    fn mouse_click_on_a_tab_switches_the_view() {
+        let mut app = multi_file_app(&["a.rs"]);
+        app.review.threads.push(Thread {
+            id: "t".into(),
+            anchor: Anchor::line("a.rs", Side::New, 2),
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: "c".into(),
+                author: "a".into(),
+                body: "b".into(),
+                created_at: 0,
+                remote_id: None,
+            }],
+        });
+        app.relayout();
+        let files_end = app.tab_labels().0.chars().count() as u16;
+        app.hit.set(hit(2, 0, Some(1), files_end));
+        app.mouse_down(files_end + 2, 1); // in the Conversation tab
+        assert_eq!(app.view, View::Conversation);
+        app.mouse_down(1, 1); // in the Files tab
+        assert_eq!(app.view, View::Files);
+    }
+
+    #[test]
+    fn mouse_click_in_the_sidebar_opens_the_file() {
+        let mut app = multi_file_app(&["a.rs", "b.rs", "c.rs"]);
+        app.mode = Mode::Unified;
+        app.sidebar_override = Some(true);
+        app.body_width.set(120);
+        app.hit.set(hit(1, 22, None, 0));
+        // Sidebar body row 2 (screen row 3) is the third file.
+        app.mouse_down(3, 3);
+        assert_eq!(app.current_file(), 2, "a sidebar-row click opens that file");
         assert_eq!(app.focus, Focus::Body);
     }
 
