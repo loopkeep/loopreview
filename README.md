@@ -40,7 +40,7 @@ features use the `gh` CLI.
   (Comment / Approve / Request changes / Pending).
 - **Agent control plane** — a running review hosts a local socket so an agent can
   read the diff structure, move your cursor, leave local notes (or drafts to
-  submit), and block on review events (`lr session …`, `lr skill …`).
+  submit), and block on review events (`lr session …`).
 - **Small dependency surface** — plain diff viewing needs only `git`; `gh` is
   required only for the pull-request features.
 
@@ -222,8 +222,9 @@ review for you to read, never sent. It marks the few worth publishing with
 as they happen, and `wait` lets it hold a turn open until you reply, resolve, or
 submit.
 
-`lr skill path` writes a bundled `SKILL.md` — a full reference to the workflow and
-etiquette — and prints its path, so you can hand the manual straight to an agent.
+A full `SKILL.md` — the workflow and etiquette an agent needs to drive a review —
+is published to [`loopkeep/skills`](https://github.com/loopkeep/skills). Install
+it into an agent with `npx skills add loopkeep/skills -s loopreview-session`.
 
 ## Configuration
 

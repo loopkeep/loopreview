@@ -31,7 +31,7 @@ wait on events instead of polling.
 
 ## Selecting a session
 
-Every verb except `list` and `skill` accepts a target:
+Every verb except `list` accepts a target:
 
 - `--repo <path>` — match the session by its repository root (defaults to the
   current directory).

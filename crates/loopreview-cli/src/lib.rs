@@ -12,7 +12,6 @@ mod keys;
 mod markdown;
 mod prsync;
 mod session_cli;
-mod skill;
 mod store;
 mod textarea;
 mod ui;
@@ -59,7 +58,6 @@ fn try_run() -> Result<()> {
         mode,
     } = match Cli::parse().dispatch() {
         Dispatch::Session(args) => return session_cli::run(args),
-        Dispatch::Skill(args) => return skill::run(args),
         Dispatch::Update { check } => return update::run(check),
         Dispatch::Tui(invocation) => invocation,
     };

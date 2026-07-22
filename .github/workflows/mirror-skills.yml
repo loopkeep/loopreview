@@ -37,11 +37,9 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
           git clone --depth 1 git@github.com:loopkeep/skills.git /tmp/skills
+          # `skills/loopreview/` (SKILL.md included) is the single source of
+          # truth; snapshot it wholesale into the mirror.
           rsync -a --delete skills/loopreview/ /tmp/skills/loopreview/
-          # SKILL.md's source of truth is the copy bundled into the binary
-          # (`lr skill path`), so the published skill and the shipped binary
-          # can never drift apart.
-          cp crates/loopreview-cli/skill/SKILL.md /tmp/skills/loopreview/SKILL.md
           cd /tmp/skills
           git add -A
           if git diff --cached --quiet; then

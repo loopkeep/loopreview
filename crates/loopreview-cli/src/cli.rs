@@ -3,8 +3,8 @@
 //! Bare `lr` is dispatch sugar (a piped patch, otherwise the working tree).
 //! `lr diff` reviews a VCS diff and never reads stdin; `lr patch` reviews a
 //! unified-diff patch from a file or stdin. Later milestones' verbs (`show`,
-//! `pr`, `session`, `daemon`, `skill`) are reserved here so the namespace is
-//! stable. `--help` / `--version` are handled by clap before the TTY guard.
+//! `pr`, `session`, `daemon`) are reserved here so the namespace is stable.
+//! `--help` / `--version` are handled by clap before the TTY guard.
 
 use std::path::PathBuf;
 
@@ -125,8 +125,6 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Print the bundled agent skill document (for `lr session`).
-    Skill(SkillArgs),
     /// Update loopreview to the latest GitHub release.
     Update {
         /// Only report whether a newer release exists; do not install it.
@@ -330,23 +328,6 @@ pub struct Target {
     pub repo: Option<PathBuf>,
 }
 
-/// `lr skill <verb>`: the bundled agent skill document.
-#[derive(Args, Debug)]
-pub struct SkillArgs {
-    /// The skill verb (defaults to `path`).
-    #[command(subcommand)]
-    pub verb: Option<SkillVerb>,
-}
-
-/// The `lr skill` verbs.
-#[derive(Subcommand, Debug)]
-pub enum SkillVerb {
-    /// Write the skill document to disk and print its path.
-    Path,
-    /// Print the skill document to standard output.
-    Show,
-}
-
 /// What loopreview should do, resolved from the command line (before consulting
 /// the terminal for dispatch).
 #[derive(Debug, PartialEq, Eq)]
@@ -377,8 +358,6 @@ pub enum Dispatch {
     Tui(Invocation),
     /// Run a `lr session` verb against a live session.
     Session(SessionArgs),
-    /// Run a `lr skill` verb.
-    Skill(SkillArgs),
     /// Run `lr update` (self-update from GitHub Releases).
     Update {
         /// Only check for a newer release; do not install.
@@ -387,8 +366,8 @@ pub enum Dispatch {
 }
 
 impl Cli {
-    /// Split the parsed command line into a [`Dispatch`]. The control-plane verbs
-    /// (`session`, `skill`) run without a terminal; everything else opens the UI.
+    /// Split the parsed command line into a [`Dispatch`]. The control-plane verb
+    /// `session` runs without a terminal; everything else opens the UI.
     pub fn dispatch(self) -> Dispatch {
         let Cli {
             command,
@@ -398,7 +377,6 @@ impl Cli {
         } = self;
         match command {
             Some(Command::Session(args)) => Dispatch::Session(args),
-            Some(Command::Skill(args)) => Dispatch::Skill(args),
             Some(Command::Update { check }) => Dispatch::Update { check },
             command => Dispatch::Tui(
                 Cli {
@@ -445,9 +423,8 @@ impl Cli {
             Some(Command::Show { .. }) => {
                 Action::NotYet("`lr show` (commit review) is planned but not yet available")
             }
-            // `session` and `skill` are peeled off by `dispatch` before this.
+            // `session` is peeled off by `dispatch` before this.
             Some(Command::Session(_)) => Action::NotYet("`lr session` is handled by dispatch"),
-            Some(Command::Skill(_)) => Action::NotYet("`lr skill` is handled by dispatch"),
             Some(Command::Update { .. }) => Action::NotYet("`lr update` is handled by dispatch"),
             Some(Command::Daemon { .. }) => Action::NotYet(
                 "`lr daemon` is reserved; this build hosts a socket per session (see `lr session`)",
@@ -566,14 +543,10 @@ mod tests {
     }
 
     #[test]
-    fn session_and_skill_dispatch_off_the_ui() {
+    fn session_dispatches_off_the_ui() {
         assert!(matches!(
             Cli::parse_from(["lr", "session", "list"]).dispatch(),
             Dispatch::Session(_)
-        ));
-        assert!(matches!(
-            Cli::parse_from(["lr", "skill", "path"]).dispatch(),
-            Dispatch::Skill(_)
         ));
         assert!(matches!(
             Cli::parse_from(["lr", "diff"]).dispatch(),
