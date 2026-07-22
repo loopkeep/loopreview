@@ -1,6 +1,6 @@
 ---
 name: loopreview-session
-description: Read and steer a live loopreview diff-review session over its control plane. Inspect the diff structure and threads, move the human reviewer's view, leave draft comments, and wait for the human to reply or resolve. Use when a loopreview (lr) session is running and you are helping review a changeset.
+description: Read and steer a live loopreview diff-review session over its control plane. Inspect the diff structure and threads, move the human reviewer's view, leave local notes (or drafts to submit), and wait for the human to reply or resolve. Use when a loopreview (lr) session is running and you are helping review a changeset.
 ---
 
 # loopreview session control
@@ -21,7 +21,7 @@ If no session is live, ask the human to open one (`lr` in their repository, or
 2. lr session review --json             # understand the diff structure + threads
 3. lr session review --patch --json     # read the actual lines for a closer look
 4. lr session navigate --file F --line N  # steer the human's view to what matters
-5. lr session comment add ...           # leave one focused note (author required)
+5. lr session comment add ...           # leave one focused local note (--draft to queue for GitHub)
 6. lr session wait --for reply          # block until the human answers, then continue
 ```
 
@@ -74,26 +74,37 @@ outdated or file-level anchor opens the Conversation view instead of a diff line
 
 ## Commenting
 
-`author` is required — your notes are attributed. In a pull-request review your
-comments and replies are **drafts**; only the human publishes them (Ctrl-S in the
-TUI). You cannot publish, and you cannot resolve a published pull-request thread.
+Your comments carry a **kind**. By default they are **local** — attached to the
+review for the human to read, but never sent to GitHub. Pass `--draft` to make a
+comment a **draft**: on a pull request the human can submit drafts to GitHub
+(Ctrl-S in the TUI). This split is deliberate — an agent converses in local
+notes, and marks the few worth publishing with `--draft`, so nothing reaches
+GitHub by accident. Outside a pull request there is nowhere to submit, so
+`--draft` is a no-op and everything stays local. You never publish, and you
+cannot resolve a published pull-request thread — that stays the human's call.
+
+`--author` names who is speaking; it defaults to `agent`. Prefer a stable,
+specific name (your role or model) so a multi-agent conversation reads clearly.
 
 ```bash
 lr session comment add --repo . --file src/app.rs --line 120 \
-  --body "This retries without a backoff — is that intended under load?" --author agent
-lr session comment reply --repo . --thread <id> --body "Good point, updated." --author agent
-lr session comment resolve --repo . --thread <id> --author agent        # local reviews
-lr session comment resolve --repo . --thread <id> --reopen --author agent
-lr session comment rm --repo . <comment-or-thread-id>                    # withdraw a draft
+  --body "This retries without a backoff — is that intended under load?"
+lr session comment add --repo . --file src/app.rs --line 120 --draft --author reviewer-bot \
+  --body "Nit: use the shared client here."         # queued for the human to submit
+lr session comment reply --repo . --thread <id> --body "Good point — flagged."
+lr session comment resolve --repo . --thread <id> --author agent   # local reviews and your own drafts
+lr session comment rm --repo . <comment-or-thread-id>              # withdraw a local note or draft
 ```
 
-- `comment add` needs `--file`, `--line`, `--body`, and `--author`; `--side`
-  defaults to `new`. The line must be one shown in the current diff.
-- `comment resolve` works on local-review threads (and your own drafts). It
-  refuses a published pull-request thread — resolving that is the human's call.
-- `comment rm <id>` withdraws one of your own drafts — pass a comment id (removes
-  that draft, and its thread if it empties) or a thread id (removes the thread).
-  It refuses anything published to GitHub.
+- `comment add` needs `--file`, `--line`, and `--body`; `--side` defaults to
+  `new` and `--author` to `agent`. The line must be one shown in the current diff.
+- `--draft` queues a comment for the human to submit; without it the comment (or
+  reply) is a local note. `--draft` only matters on a pull request.
+- `comment resolve` works on local-review threads and your own drafts (`--reopen`
+  flips it back). It refuses a published pull-request thread — the human's call.
+- `comment rm <id>` withdraws one of your own unpublished comments — pass a
+  comment id (removes that comment, and its thread if it empties) or a thread id
+  (removes the thread). It refuses anything published to GitHub.
 
 ## Waiting for the human
 
@@ -140,7 +151,8 @@ Guidelines:
 - Navigate before commenting so the human sees the code you mean.
 - Keep notes focused: intent, structure, risks, follow-ups — not every hunk.
 - Do not churn the human's screen: navigate deliberately, one place at a time.
-- Never publish for the human; leave drafts and let them submit.
+- Never publish for the human; converse in local notes and mark only the few
+  worth sending with `--draft`, for the human to submit.
 
 ## Common errors
 

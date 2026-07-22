@@ -12,7 +12,7 @@ side-by-side layout. Leave inline comments and threads on a local review, or pul
 a GitHub pull request into the same TUI — comments, replies, resolve, and submit
 included — without checking anything out. And because reviewing agent work means
 an agent is often on the other side, loopreview exposes a control plane so an
-agent can read the diff, steer your view, and leave draft comments while you
+agent can read the diff, steer your view, and leave notes while you
 watch.
 
 It ships as a single static binary (`loopreview`, with the short alias `lr`) for
@@ -39,8 +39,8 @@ features use the `gh` CLI.
   two-way comment sync, drafts that persist across sessions, and a submit modal
   (Comment / Approve / Request changes / Pending).
 - **Agent control plane** — a running review hosts a local socket so an agent can
-  read the diff structure, move your cursor, leave draft comments, and block on
-  review events (`lr session …`, `lr skill …`).
+  read the diff structure, move your cursor, leave local notes (or drafts to
+  submit), and block on review events (`lr session …`, `lr skill …`).
 - **Small dependency surface** — plain diff viewing needs only `git`; `gh` is
   required only for the pull-request features.
 
@@ -116,6 +116,8 @@ files from a working-tree review.
 | `V` | Start / cancel a line-range selection (`j` / `k` to extend, then `c`) |
 | `r` | Reply to the thread on the cursor line |
 | `x` | Resolve / reopen that thread |
+| `d` | Withdraw the unpublished thread at the cursor (a draft or a local note; never a published comment) |
+| `t` | Toggle that thread between a draft and a local note (pull requests) |
 | `o` | Fold: expand the current file if collapsed, else fold the thread at the cursor, else collapse the current file |
 | Wheel | Scroll the diff (or the sidebar, when the pointer is over it) |
 | Click | Move the cursor; a file header folds/unfolds it; a sidebar row toggles that file (opens it, or collapses an open one); a tab switches views; the footer's layout indicator (`[unified]`/`[split]`) toggles the layout |
@@ -146,11 +148,15 @@ move; `Enter` opens the file; `Esc` closes.
 | `Ctrl-D` / `Ctrl-U` (or `PageDown` / `PageUp`) | Scroll |
 | `r` | Reply to the selected thread |
 | `x` | Resolve / reopen |
+| `d` | Withdraw the selected thread if unpublished (a draft or local note) |
+| `t` | Toggle the selected thread between a draft and a local note (pull requests) |
 | `o` | Collapse / expand |
 | `X` | Close the review (asks to confirm) |
 
-**Comment composer** (after `c` or `r`): type or paste markdown (multi-line);
-`Ctrl-S` saves, `Esc` discards (confirming if the comment is non-empty).
+**Comment composer** (after `c` or `r`): type or paste markdown (multi-line).
+`Enter` saves; a newline is `Shift+Enter` (or `Alt+Enter` where the terminal
+does not report Shift+Enter); `Esc` discards (confirming if non-empty). On a pull
+request, `Ctrl-S` submits — it never saves the composer.
 
 ## Reviewing
 
@@ -176,12 +182,20 @@ history — you can still read and reply to it.
 `lr pr <number | url | owner/repo#n | #n>` (or `lr pr --detect` for the current
 branch) opens a pull request in the same TUI, fetching the diff and existing
 review threads without touching your working tree. Your comments and replies are
-kept as **drafts** — they persist across sessions — until you submit. `Ctrl-S`
-opens the submit modal to choose the review event and an optional summary;
-`Ctrl-R` re-pulls from GitHub while keeping your drafts. Resolving a published
-thread syncs to GitHub. Multi-line comments round-trip as ranges (GitHub's
-`start_line` / `startLine`). (The pull-request features use the `gh` CLI, which
-must be installed and authenticated.)
+kept as **drafts** (a `[draft]` badge) — they persist across sessions — until you
+submit. `Ctrl-S` opens the submit modal, which lists what will be sent and by
+whom (flagging any draft not authored by you, since it goes out under your
+identity); pick the review event and an optional summary. `Ctrl-R` re-pulls from
+GitHub while keeping your drafts. Resolving a published thread syncs to GitHub.
+Multi-line comments round-trip as ranges (GitHub's `start_line` / `startLine`).
+(The pull-request features use the `gh` CLI, which must be installed and
+authenticated.)
+
+A comment also has a **kind**. Yours default to drafts; an agent's default to
+**local notes** (a `[local]` badge) — attached to the review but never sent. `t`
+toggles the selected thread between the two, so you can adopt an agent's note as
+a draft to send, or drop one of your drafts to a local note. Only drafts are ever
+submitted; local notes stay off GitHub.
 
 ## Agent integration
 
@@ -196,15 +210,17 @@ lr session review --json                     # diff structure + threads
 lr session review --patch --json             # ...including the raw lines
 lr session navigate --file src/app.rs --line 42
 lr session comment add --file src/app.rs --line 42 \
-  --body "Is this retry safe under load?" --author agent
+  --body "Is this retry safe under load?"          # a local note; add --draft to queue it
 lr session wait --for reply                  # block until the human replies
 ```
 
 The design keeps the human in charge: an agent reads, navigates (moving _your_
-cursor and view, for explanation), and leaves **draft** comments — it cannot
-publish a pull-request review (that stays your `Ctrl-S`) and cannot resolve a
-published thread. Its actions appear in your status line as they happen, and
-`wait` lets it hold a turn open until you reply, resolve, or submit.
+cursor and view, for explanation), and leaves **local notes** — attached to the
+review for you to read, never sent. It marks the few worth publishing with
+`--draft`; even then it cannot submit a pull-request review (that stays your
+`Ctrl-S`) or resolve a published thread. Its actions appear in your status line
+as they happen, and `wait` lets it hold a turn open until you reply, resolve, or
+submit.
 
 `lr skill path` writes a bundled `SKILL.md` — a full reference to the workflow and
 etiquette — and prints its path, so you can hand the manual straight to an agent.
