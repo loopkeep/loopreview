@@ -334,9 +334,10 @@ impl App {
         highlighter: Highlighter,
     ) -> App {
         let comment_blocks = build_comment_blocks(&review, &highlighter);
-        let conv_blocks = build_conversation(&review, CONV_DEFAULT_WIDTH, &highlighter);
         let block_lens: Vec<usize> = comment_blocks.iter().map(Vec::len).collect();
         let layout = Layouts::build(&diff, &review, &block_lens);
+        let outdated = outdated_flags(&review, &layout.placed);
+        let conv_blocks = build_conversation(&review, CONV_DEFAULT_WIDTH, &highlighter, &outdated);
         let num_width = digits(layout.max_lineno).max(3);
         let file_count = diff.files.len();
         let cline_index = layout
@@ -435,13 +436,15 @@ impl App {
     /// current review, replacing derived state. The caller restores the cursor.
     fn apply_layout(&mut self, diff: Diff) {
         self.comment_blocks = build_comment_blocks(&self.review, &self.highlighter);
+        let block_lens: Vec<usize> = self.comment_blocks.iter().map(Vec::len).collect();
+        let layout = Layouts::build(&diff, &self.review, &block_lens);
+        let outdated = outdated_flags(&self.review, &layout.placed);
         let conv_width = self.body_width.get().clamp(40, 120);
-        self.conv_blocks = build_conversation(&self.review, conv_width, &self.highlighter);
+        self.conv_blocks =
+            build_conversation(&self.review, conv_width, &self.highlighter, &outdated);
         self.conv_cursor = self
             .conv_cursor
             .min(self.review.threads.len().saturating_sub(1));
-        let block_lens: Vec<usize> = self.comment_blocks.iter().map(Vec::len).collect();
-        let layout = Layouts::build(&diff, &self.review, &block_lens);
         self.num_width = digits(layout.max_lineno).max(3);
         self.cline_index = layout
             .clines
@@ -1754,12 +1757,15 @@ fn build_conversation(
     review: &Review,
     width: usize,
     highlighter: &Highlighter,
+    outdated: &[bool],
 ) -> Vec<Vec<TextLine<'static>>> {
     let now = now();
     review
         .threads
         .iter()
-        .map(|thread| {
+        .enumerate()
+        .map(|(ti, thread)| {
+            let is_outdated = outdated.get(ti).copied().unwrap_or(false);
             let mut lines = Vec::new();
             let mut header = vec![TextSpan::styled(
                 anchor_label(&thread.anchor),
@@ -1771,7 +1777,24 @@ fn build_conversation(
                     Style::default().fg(Color::Green),
                 ));
             }
+            if is_outdated {
+                header.push(TextSpan::styled(
+                    "  [outdated]",
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
             lines.push(TextLine::from(header));
+
+            // For an outdated thread, show the context saved at creation so the
+            // reviewer can still see the line it was left on.
+            if is_outdated && let Anchor::Line { context, .. } = &thread.anchor {
+                for snippet in context {
+                    lines.push(TextLine::from(TextSpan::styled(
+                        format!("  │ {snippet}"),
+                        Style::default().fg(Color::Rgb(90, 90, 100)),
+                    )));
+                }
+            }
 
             if let Some(root) = thread.root() {
                 lines.push(comment_meta_line(&root.author, root.created_at, now, false));
@@ -1817,6 +1840,19 @@ fn comment_meta_line(author: &str, created_at: u64, now: u64, reply: bool) -> Te
             Style::default().fg(Color::DarkGray),
         ),
     ])
+}
+
+/// Which threads are outdated: line-anchored, but their line is not in the
+/// current diff (so they were not shown inline).
+fn outdated_flags(review: &Review, placed: &[bool]) -> Vec<bool> {
+    review
+        .threads
+        .iter()
+        .enumerate()
+        .map(|(i, thread)| {
+            matches!(thread.anchor, Anchor::Line { .. }) && !placed.get(i).copied().unwrap_or(false)
+        })
+        .collect()
 }
 
 /// A human label for where a thread is anchored.
@@ -1915,11 +1951,15 @@ struct Layouts {
     file_first: Vec<Option<usize>>,
     hunk_first: Vec<usize>,
     flats: Vec<Vec<(usize, usize)>>,
+    /// Whether each thread's anchor was found in the current diff (shown inline);
+    /// a line-anchored thread that was not is outdated.
+    placed: Vec<bool>,
     max_lineno: u32,
 }
 
 impl Layouts {
     fn build(diff: &Diff, review: &Review, block_lens: &[usize]) -> Layouts {
+        let mut placed = vec![false; review.threads.len()];
         // Map each line-anchored thread to its file and (side, line) so it can be
         // shown inline beneath that line in the unified view.
         let mut thread_at: HashMap<&str, HashMap<(Side, u32), Vec<usize>>> = HashMap::new();
@@ -1993,6 +2033,7 @@ impl Layouts {
                                     && let Some(indices) = file_threads.get(&(side, n))
                                 {
                                     for &t in indices {
+                                        placed[t] = true;
                                         for k in 0..block_lens[t] {
                                             urows.push(URow::Comment(t, k));
                                         }
@@ -2074,6 +2115,7 @@ impl Layouts {
             file_first,
             hunk_first,
             flats,
+            placed,
             max_lineno,
         }
     }
