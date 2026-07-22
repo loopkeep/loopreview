@@ -100,6 +100,20 @@ pub(crate) struct ReplyPayload<'a> {
     pub in_reply_to: u64,
 }
 
+/// The payload for editing a comment's body (`PATCH .../comments/{id}`).
+#[derive(Debug, Serialize)]
+pub(crate) struct BodyPayload<'a> {
+    pub body: &'a str,
+}
+
+/// The REST endpoint path for editing or deleting one published comment by its
+/// numeric id. An inline review comment and a PR conversation (issue) comment
+/// live under different collections, so `review` picks between them.
+pub(crate) fn comment_endpoint(owner: &str, repo: &str, id: u64, review: bool) -> String {
+    let kind = if review { "pulls" } else { "issues" };
+    format!("repos/{owner}/{repo}/{kind}/comments/{id}")
+}
+
 /// Decide which draft threads become inline review comments.
 ///
 /// A thread contributes exactly one comment when it is a brand-new inline draft:
@@ -291,6 +305,25 @@ mod tests {
         assert_eq!(ReviewEvent::Approve.as_api(), "APPROVE");
         assert_eq!(ReviewEvent::RequestChanges.as_api(), "REQUEST_CHANGES");
         assert_eq!(ReviewEvent::Pending.as_api(), "");
+    }
+
+    #[test]
+    fn comment_endpoint_picks_the_collection() {
+        // An inline review comment vs a PR conversation (issue) comment.
+        assert_eq!(
+            comment_endpoint("o", "r", 42, true),
+            "repos/o/r/pulls/comments/42"
+        );
+        assert_eq!(
+            comment_endpoint("o", "r", 42, false),
+            "repos/o/r/issues/comments/42"
+        );
+    }
+
+    #[test]
+    fn edit_payload_is_just_the_body() {
+        let json = serde_json::to_string(&BodyPayload { body: "revised" }).unwrap();
+        assert_eq!(json, r#"{"body":"revised"}"#);
     }
 
     #[test]

@@ -381,6 +381,50 @@ impl GithubClient {
         parse_created_comment(&out, body)
     }
 
+    /// The authenticated GitHub user's login (`gh api user`). Used to gate
+    /// editing/deleting a published comment to the viewer's own comments — the
+    /// comment's stored author is a GitHub login, so this is the identity to
+    /// compare against (not a local git `user.name`).
+    pub fn viewer_login(&self) -> Result<String, GithubError> {
+        let out = cmd::run_ok("gh", &["api", "user", "--jq", ".login"], &self.dir, None)?;
+        Ok(out.trim().to_string())
+    }
+
+    /// Edit a published comment's body. `comment_id` is the numeric REST id a
+    /// pulled comment carries in `remote_id`; `review` selects the inline
+    /// review-comment endpoint over the PR conversation (issue) one.
+    pub fn edit_comment(
+        &self,
+        pr: &ResolvedPr,
+        comment_id: u64,
+        review: bool,
+        body: &str,
+    ) -> Result<(), GithubError> {
+        let path = push::comment_endpoint(&pr.owner, &pr.repo, comment_id, review);
+        let payload = serde_json::to_string(&push::BodyPayload { body })
+            .map_err(|e| GithubError::parse("edit payload", e))?;
+        cmd::run_ok(
+            "gh",
+            &["api", "-X", "PATCH", &path, "--input", "-"],
+            &self.dir,
+            Some(&payload),
+        )?;
+        Ok(())
+    }
+
+    /// Delete a published comment. Irreversible on GitHub — the caller confirms
+    /// with the human first. `comment_id`/`review` are as in [`Self::edit_comment`].
+    pub fn delete_comment(
+        &self,
+        pr: &ResolvedPr,
+        comment_id: u64,
+        review: bool,
+    ) -> Result<(), GithubError> {
+        let path = push::comment_endpoint(&pr.owner, &pr.repo, comment_id, review);
+        cmd::run_ok("gh", &["api", "-X", "DELETE", &path], &self.dir, None)?;
+        Ok(())
+    }
+
     /// Mark a review thread resolved (GraphQL `resolveReviewThread`).
     ///
     /// `thread_node_id` is the GraphQL node id a pulled thread carries as its
