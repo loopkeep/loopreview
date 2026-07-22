@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod control;
 mod highlight;
+mod keys;
 mod markdown;
 mod prsync;
 mod session_cli;
@@ -121,7 +122,7 @@ fn try_run() -> Result<()> {
         .and_then(|dir| git::config(dir, "user.name"))
         .unwrap_or_else(|| "you".to_string());
 
-    let cfg = config::Config::load();
+    let (cfg, keymap, cfg_notice) = load_config()?;
     ui::run(ui::Session {
         label,
         diff,
@@ -136,10 +137,24 @@ fn try_run() -> Result<()> {
         auto_collapse_lines: cfg.auto_collapse_lines,
         sidebar_mode: cfg.sidebar,
         sidebar_min_content: cfg.sidebar_min_content,
+        keymap,
         repo_dir,
         loader: None,
-        notice,
+        notice: notice.or(cfg_notice),
     })
+}
+
+/// Load the config and build the key map, failing fast (before the UI opens) on
+/// an invalid key binding so the error is legible.
+fn load_config() -> Result<(config::Config, keys::Keymap, Option<String>)> {
+    let (cfg, notice) = config::Config::load();
+    let keymap = keys::Keymap::from_overrides(&cfg.keys).map_err(|errors| {
+        anyhow!(
+            "invalid key bindings in config.toml:\n  {}",
+            errors.join("\n  ")
+        )
+    })?;
+    Ok((cfg, keymap, notice))
 }
 
 /// Review a GitHub pull request: resolve, fetch the diff, and pull comments on a
@@ -148,7 +163,7 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
     let dir = repo_root()?;
     let pr_query = prsync::query(query, detect).map_err(|m| anyhow!(m))?;
     let author = git::config(&dir, "user.name").unwrap_or_else(|| "you".to_string());
-    let cfg = config::Config::load();
+    let (cfg, keymap, cfg_notice) = load_config()?;
 
     // The PR's drafts persist in this repo's store; the loader re-attaches them
     // after the pull (the same merge the refresh action uses).
@@ -192,9 +207,10 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
         auto_collapse_lines: cfg.auto_collapse_lines,
         sidebar_mode: cfg.sidebar,
         sidebar_min_content: cfg.sidebar_min_content,
+        keymap,
         repo_dir: session_dir,
         loader: Some(loader),
-        notice: None,
+        notice: cfg_notice,
     })
 }
 

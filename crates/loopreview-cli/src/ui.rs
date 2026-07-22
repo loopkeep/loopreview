@@ -43,6 +43,7 @@ use loopreview_core::{
 
 use crate::control::{self, UiRequest};
 use crate::highlight::{Highlighter, LineHighlighter, Span as HlSpan};
+use crate::keys::Action;
 use crate::prsync::PrHandle;
 use crate::store::Store;
 use crate::textarea::TextArea;
@@ -149,6 +150,8 @@ pub struct Session {
     pub sidebar_mode: crate::config::SidebarMode,
     /// Minimum diff width kept beside the sidebar.
     pub sidebar_min_content: usize,
+    /// The resolved key bindings.
+    pub keymap: crate::keys::Keymap,
     /// The repository directory, for reconstructing outdated comment lines from
     /// history (`git show <commit>:<path>`). `None` for patch sources.
     pub repo_dir: Option<PathBuf>,
@@ -236,6 +239,7 @@ pub fn run(session: Session) -> Result<()> {
         auto_collapse_lines,
         sidebar_mode,
         sidebar_min_content,
+        keymap,
         repo_dir,
         loader,
         notice,
@@ -256,6 +260,7 @@ pub fn run(session: Session) -> Result<()> {
     app.auto_collapse_lines = auto_collapse_lines;
     app.sidebar_mode = sidebar_mode;
     app.sidebar_min_content = sidebar_min_content;
+    app.keymap = keymap;
     app.status = notice;
     // For a directly-loaded diff (not a background PR load), apply auto-collapse
     // now; the PR path does it in install_loaded once the diff arrives.
@@ -563,6 +568,8 @@ struct App {
     drag_anchor: Option<usize>,
     /// Screen geometry from the last draw, for mouse hit-testing.
     hit: Cell<HitLayout>,
+    /// The resolved key bindings (defaults plus config overrides).
+    keymap: crate::keys::Keymap,
     /// Selected thread index in the Conversation view.
     conv_cursor: usize,
     /// Scroll offset (in lines) of the Conversation view.
@@ -671,6 +678,7 @@ impl App {
             selection: None,
             drag_anchor: None,
             hit: Cell::new(HitLayout::default()),
+            keymap: crate::keys::Keymap::defaults(),
             conv_cursor: 0,
             conv_scroll: 0,
             split_min_width: 160,
@@ -1172,25 +1180,6 @@ impl App {
             self.on_key_finder(code, mods);
             return;
         }
-        // Ctrl-P opens the fuzzy file finder from anywhere.
-        if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('p') {
-            self.open_finder();
-            return;
-        }
-        // PR sync shortcuts, available in either view.
-        if mods.contains(KeyModifiers::CONTROL) && self.pr.is_some() {
-            match code {
-                KeyCode::Char('r') => {
-                    self.refresh();
-                    return;
-                }
-                KeyCode::Char('s') => {
-                    self.open_submit();
-                    return;
-                }
-                _ => {}
-            }
-        }
         // While confirming a close: y/Enter closes, anything else cancels.
         if self.confirming_close {
             self.confirming_close = false;
@@ -1201,15 +1190,21 @@ impl App {
             }
             return;
         }
-        // Esc first cancels an active range selection rather than quitting.
-        if self.selection.is_some() && code == KeyCode::Esc {
-            self.clear_selection();
-            self.status = Some("selection cleared".to_string());
-            return;
+        let in_sidebar =
+            self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some();
+        // Esc cancels a selection, or leaves the sidebar, before it can quit.
+        if code == KeyCode::Esc {
+            if self.selection.is_some() {
+                self.clear_selection();
+                self.status = Some("selection cleared".to_string());
+                return;
+            }
+            if in_sidebar {
+                self.focus = Focus::Body;
+                return;
+            }
         }
-        self.status = None;
-
-        // Tab switches views once a review exists; Esc/q/^c always quit.
+        // Structural keys (not remappable): quit and view switch.
         match (code, mods.contains(KeyModifiers::CONTROL)) {
             (KeyCode::Esc, _) | (KeyCode::Char('q'), false) | (KeyCode::Char('c'), true) => {
                 self.quit = true;
@@ -1222,50 +1217,53 @@ impl App {
                 };
                 return;
             }
-            // `b` toggles the file-explorer sidebar.
-            (KeyCode::Char('b'), false) => {
-                self.toggle_sidebar();
-                return;
-            }
             _ => {}
         }
+        self.status = None;
 
-        // The sidebar takes keys while focused and visible; else the active view.
-        if self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some() {
-            self.on_key_sidebar(code, mods);
+        // Resolve the remappable action; dispatch globals, then the active context.
+        let Some(action) = self.keymap.action(code, mods) else {
+            return;
+        };
+        match action {
+            Action::ToggleSidebar => return self.toggle_sidebar(),
+            Action::FileFinder => return self.open_finder(),
+            Action::Refresh if self.pr.is_some() => return self.refresh(),
+            Action::Submit if self.pr.is_some() => return self.open_submit(),
+            _ => {}
+        }
+        if in_sidebar {
+            self.sidebar_action(action);
         } else if self.view == View::Conversation {
-            self.on_key_conversation(code, mods);
+            self.conversation_action(action);
         } else {
-            self.on_key_files(code, mods);
+            self.files_action(action);
         }
     }
 
-    fn on_key_files(&mut self, code: KeyCode, mods: KeyModifiers) {
-        let ctrl = mods.contains(KeyModifiers::CONTROL);
+    fn files_action(&mut self, action: Action) {
         let page = self.body_height.get().max(1) as isize;
-        match (code, ctrl) {
-            (KeyCode::Char('j'), false) | (KeyCode::Down, _) => self.move_cursor(1),
-            (KeyCode::Char('k'), false) | (KeyCode::Up, _) => self.move_cursor(-1),
-            (KeyCode::Char('d'), true) => self.move_cursor(page / 2),
-            (KeyCode::Char('u'), true) => self.move_cursor(-page / 2),
-            (KeyCode::PageDown, _) | (KeyCode::Char(' '), false) => self.move_cursor(page - 1),
-            (KeyCode::PageUp, _) => self.move_cursor(-(page - 1)),
-            (KeyCode::Char('g'), false) | (KeyCode::Home, _) => self.set_cursor(0),
-            (KeyCode::Char('G'), false) | (KeyCode::End, _) => {
-                self.set_cursor(self.clines.len().saturating_sub(1))
-            }
-            (KeyCode::Char('n'), false) => self.goto_file(1),
-            (KeyCode::Char('p'), false) => self.goto_file(-1),
-            (KeyCode::Char('}'), false) | (KeyCode::Char(']'), false) => self.goto_hunk(1),
-            (KeyCode::Char('{'), false) | (KeyCode::Char('['), false) => self.goto_hunk(-1),
-            (KeyCode::Char('v'), false) => self.toggle_mode(),
-            (KeyCode::Char('c'), false) => self.start_compose(),
-            (KeyCode::Char('r'), false) => self.start_reply(),
-            (KeyCode::Char('x'), false) => self.toggle_resolve(),
-            (KeyCode::Char('o'), false) => self.toggle_fold(),
-            (KeyCode::Char('l'), false) | (KeyCode::Right, _) => self.nav_in(),
-            (KeyCode::Char('h'), false) | (KeyCode::Left, _) => self.nav_out(),
-            (KeyCode::Char('V'), false) => self.start_selection(),
+        match action {
+            Action::MoveDown => self.move_cursor(1),
+            Action::MoveUp => self.move_cursor(-1),
+            Action::HalfPageDown => self.move_cursor(page / 2),
+            Action::HalfPageUp => self.move_cursor(-page / 2),
+            Action::PageDown => self.move_cursor(page - 1),
+            Action::PageUp => self.move_cursor(-(page - 1)),
+            Action::Top => self.set_cursor(0),
+            Action::Bottom => self.set_cursor(self.clines.len().saturating_sub(1)),
+            Action::NextFile => self.goto_file(1),
+            Action::PrevFile => self.goto_file(-1),
+            Action::NextHunk => self.goto_hunk(1),
+            Action::PrevHunk => self.goto_hunk(-1),
+            Action::ToggleLayout => self.toggle_mode(),
+            Action::Comment => self.start_compose(),
+            Action::Reply => self.start_reply(),
+            Action::Resolve => self.toggle_resolve(),
+            Action::Fold => self.toggle_fold(),
+            Action::NavIn => self.nav_in(),
+            Action::NavOut => self.nav_out(),
+            Action::Select => self.start_selection(),
             _ => {}
         }
     }
@@ -1746,33 +1744,30 @@ impl App {
     }
 
     /// Route a key while the sidebar has focus.
-    fn on_key_sidebar(&mut self, code: KeyCode, _mods: KeyModifiers) {
+    fn sidebar_action(&mut self, action: Action) {
         let files = self.diff.files.len();
-        match code {
-            KeyCode::Char('j') | KeyCode::Down => {
+        match action {
+            Action::MoveDown => {
                 if self.sidebar_cursor + 1 < files {
                     self.sidebar_cursor += 1;
                     self.follow_sidebar();
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            Action::MoveUp => {
                 self.sidebar_cursor = self.sidebar_cursor.saturating_sub(1);
                 self.follow_sidebar();
             }
-            KeyCode::Char('g') | KeyCode::Home => {
+            Action::Top => {
                 self.sidebar_cursor = 0;
                 self.follow_sidebar();
             }
-            KeyCode::Char('G') | KeyCode::End => {
+            Action::Bottom => {
                 self.sidebar_cursor = files.saturating_sub(1);
                 self.follow_sidebar();
             }
-            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
-                self.jump_to_file(self.sidebar_cursor)
-            }
-            KeyCode::Char('o') => self.toggle_fold_at(self.sidebar_cursor),
-            KeyCode::Esc => self.focus = Focus::Body,
-            // `h` / Left are a no-op: the sidebar is the outermost level.
+            // `l` / Enter open the file; `h` is a no-op (the outermost level).
+            Action::NavIn => self.jump_to_file(self.sidebar_cursor),
+            Action::Fold => self.toggle_fold_at(self.sidebar_cursor),
             _ => {}
         }
     }
@@ -1876,29 +1871,24 @@ impl App {
         self.relayout();
     }
 
-    /// Route a key in the Conversation view.
-    fn on_key_conversation(&mut self, code: KeyCode, mods: KeyModifiers) {
-        let ctrl = mods.contains(KeyModifiers::CONTROL);
+    /// Route an action in the Conversation view.
+    fn conversation_action(&mut self, action: Action) {
         let page = self.body_height.get().max(1);
-        match (code, ctrl) {
-            (KeyCode::Char('j'), false) | (KeyCode::Down, _) => self.move_conv(1),
-            (KeyCode::Char('k'), false) | (KeyCode::Up, _) => self.move_conv(-1),
-            (KeyCode::Char('g'), false) | (KeyCode::Home, _) => self.set_conv(0),
-            (KeyCode::Char('G'), false) | (KeyCode::End, _) => {
-                self.set_conv(self.review.threads.len().saturating_sub(1))
-            }
-            (KeyCode::Char('d'), true) | (KeyCode::PageDown, _) => {
+        match action {
+            Action::MoveDown => self.move_conv(1),
+            Action::MoveUp => self.move_conv(-1),
+            Action::Top => self.set_conv(0),
+            Action::Bottom => self.set_conv(self.review.threads.len().saturating_sub(1)),
+            Action::HalfPageDown | Action::PageDown => {
                 self.conv_scroll = (self.conv_scroll + page / 2).min(self.conv_max_scroll())
             }
-            (KeyCode::Char('u'), true) | (KeyCode::PageUp, _) => {
+            Action::HalfPageUp | Action::PageUp => {
                 self.conv_scroll = self.conv_scroll.saturating_sub(page / 2)
             }
-            (KeyCode::Char('r'), false) if self.has_review() => self.open_reply(self.conv_cursor),
-            (KeyCode::Char('x'), false) if self.has_review() => {
-                self.resolve_thread(self.conv_cursor)
-            }
-            (KeyCode::Char('X'), false) if self.has_review() => self.confirming_close = true,
-            (KeyCode::Char('o'), false) => self.toggle_collapse_conv(),
+            Action::Reply if self.has_review() => self.open_reply(self.conv_cursor),
+            Action::Resolve if self.has_review() => self.resolve_thread(self.conv_cursor),
+            Action::CloseReview if self.has_review() => self.confirming_close = true,
+            Action::Fold => self.toggle_collapse_conv(),
             _ => {}
         }
     }
@@ -5025,15 +5015,30 @@ mod tests {
     }
 
     #[test]
+    fn a_remapped_key_triggers_its_action() {
+        let mut over = std::collections::HashMap::new();
+        over.insert("cursor_down".to_string(), "s".to_string());
+        let mut app = multi_file_app(&["a.rs"]);
+        app.keymap = crate::keys::Keymap::from_overrides(&over).unwrap();
+        app.cursor = 0;
+        // `s` now moves the cursor down.
+        app.on_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        assert_eq!(app.cursor, 1);
+        // The old default `j` is unbound after the remap.
+        app.on_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.cursor, 1);
+    }
+
+    #[test]
     fn sidebar_toggle_selects_and_jumps() {
         let mut app = multi_file_app(&["a.rs", "b.rs", "c.rs"]);
         // The sidebar is auto-visible at the test's default width; `b` focuses it.
         app.toggle_sidebar();
         assert_eq!(app.focus, Focus::Sidebar);
-        app.on_key_sidebar(KeyCode::Char('j'), KeyModifiers::NONE);
-        app.on_key_sidebar(KeyCode::Char('j'), KeyModifiers::NONE);
+        app.sidebar_action(Action::MoveDown);
+        app.sidebar_action(Action::MoveDown);
         assert_eq!(app.sidebar_cursor, 2);
-        app.on_key_sidebar(KeyCode::Enter, KeyModifiers::NONE);
+        app.sidebar_action(Action::NavIn);
         assert_eq!(app.current_file(), 2);
         assert_eq!(app.focus, Focus::Body);
     }

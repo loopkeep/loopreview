@@ -4,6 +4,7 @@
 //! so the tool always runs. This is separate from the review store (comment
 //! data); this holds preferences.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -35,6 +36,8 @@ pub struct Config {
     /// Minimum diff width (columns) kept beside the sidebar; below this the
     /// sidebar auto-hides so the diff stays usable.
     pub sidebar_min_content: usize,
+    /// Per-action key overrides (the `[keys]` table); action name → key string.
+    pub keys: HashMap<String, String>,
 }
 
 impl Default for Config {
@@ -45,19 +48,43 @@ impl Default for Config {
             auto_collapse_lines: 20_000,
             sidebar: SidebarMode::Auto,
             sidebar_min_content: 44,
+            keys: HashMap::new(),
         }
     }
 }
 
 impl Config {
-    /// Load settings, falling back to defaults when the file is absent or
-    /// malformed.
-    pub fn load() -> Config {
-        config_dir()
-            .map(|dir| dir.join("loopreview").join("config.json"))
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+    /// Load settings from `config.toml`, falling back to the deprecated
+    /// `config.json` (with a warning) and then to built-in defaults. The second
+    /// return value is a one-line notice to surface (a migration hint, or a
+    /// parse warning), or `None`.
+    pub fn load() -> (Config, Option<String>) {
+        let Some(dir) = config_dir().map(|d| d.join("loopreview")) else {
+            return (Config::default(), None);
+        };
+
+        // Preferred: config.toml.
+        if let Ok(text) = std::fs::read_to_string(dir.join("config.toml")) {
+            return match toml::from_str(&text) {
+                Ok(config) => (config, None),
+                Err(e) => (
+                    Config::default(),
+                    Some(format!("config.toml is invalid ({e}); using defaults")),
+                ),
+            };
+        }
+
+        // Deprecated: config.json (still read, but nudge toward TOML).
+        if let Ok(text) = std::fs::read_to_string(dir.join("config.json"))
+            && let Ok(config) = serde_json::from_str(&text)
+        {
+            return (
+                config,
+                Some("config.json is deprecated — move your settings to config.toml".to_string()),
+            );
+        }
+
+        (Config::default(), None)
     }
 }
 

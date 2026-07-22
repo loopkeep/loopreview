@@ -205,13 +205,37 @@ etiquette — and prints its path, so you can hand the manual straight to an age
 
 ## Configuration
 
-Settings live in `<config-dir>/loopreview/config.json` (all keys optional):
+Settings live in `<config-dir>/loopreview/config.toml` (all keys optional). A
+legacy `config.json` is still read with a migration hint, but TOML is preferred.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `split_min_width` | integer | `160` | Body width, in columns, at which `auto` layout switches to side-by-side |
 | `auto_collapse_files` | integer | `50` | A diff with more changed files than this opens with every file collapsed |
 | `auto_collapse_lines` | integer | `20000` | A diff with more changed lines than this opens with every file collapsed |
+| `sidebar` | `"auto"` / `"open"` / `"closed"` | `"auto"` | Whether the file-explorer sidebar is shown by default (`auto` = when wide enough) |
+| `sidebar_min_content` | integer | `44` | Minimum diff width kept beside the sidebar; below this it auto-hides |
+
+### Key bindings
+
+Every command's key can be remapped in a `[keys]` table by action name. Keys are
+written like `j`, `V` (or `shift+v`), `ctrl+p`, `enter`, `esc`, `tab`, `space`,
+`pageup`. The arrow, page, and home/end keys always work and are not remappable;
+an invalid binding is reported at startup with the offending line. Action names:
+`cursor_down`, `cursor_up`, `half_page_down`, `half_page_up`, `top`, `bottom`,
+`next_file`, `prev_file`, `next_hunk`, `prev_hunk`, `nav_in`, `nav_out`,
+`layout_toggle`, `comment`, `reply`, `resolve`, `fold`, `select`, `close_review`,
+`sidebar`, `file_finder`, `refresh`, `submit`.
+
+```toml
+split_min_width = 160
+sidebar = "auto"
+
+[keys]
+comment = "m"
+file_finder = "ctrl+t"
+layout_toggle = "s"
+```
 
 Data is stored under the same directory: local reviews in `reviews/`, live
 control-plane sessions in `sessions/`. `<config-dir>` is `$XDG_CONFIG_HOME` (or
