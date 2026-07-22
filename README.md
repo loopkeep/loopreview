@@ -142,11 +142,14 @@ files from a working-tree review.
 
 The sidebar and the diff are framed side by side; the pane holding focus has an
 accent-colored frame, and the inactive pane's cursor dims — so it is always
-clear where your keys will land.
+clear where your keys will land. Files are grouped under dim directory headers
+(root files first, headerless), each row led by a colored change-status glyph
+(`A`/`D`/`M`/`R`/`C`). Headers are labels only — the cursor and clicks land on
+files. Pin a fixed width with the `sidebar_width` config key.
 
 | Key | Action |
 | --- | --- |
-| `j` / `k` | Select a file (the list scrolls to follow; wheel also scrolls it) |
+| `j` / `k` | Select a file (skipping directory headers; the list scrolls to follow, wheel also scrolls it) |
 | `Enter` (or `l` / `→`) | Toggle the file: open a collapsed one (jumping the diff to it), or collapse an open one |
 | `o` | Fold / unfold the selected file in place |
 | `Esc` (or `h` / `←`) | Return focus to the diff |

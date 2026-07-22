@@ -1425,12 +1425,11 @@ impl App {
     /// thread).
     fn set_view(&mut self, view: View) {
         self.view = view;
-        let sel = if view == View::Conversation {
-            self.conv_cursor
+        if view == View::Conversation {
+            self.reveal_in_sidebar(self.conv_cursor);
         } else {
-            self.current_file()
-        };
-        self.reveal_in_sidebar(sel);
+            self.reveal_file_in_sidebar(self.current_file());
+        }
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
@@ -2276,10 +2275,19 @@ impl App {
     fn follow_sidebar(&mut self) {
         let files = self.diff.files.len();
         self.sidebar_cursor = self.sidebar_cursor.min(files.saturating_sub(1));
-        self.reveal_in_sidebar(self.sidebar_cursor);
+        self.reveal_file_in_sidebar(self.sidebar_cursor);
     }
 
-    /// Scroll the sidebar's viewport so file index `row` is within it.
+    /// Scroll the file sidebar so `file`'s display row (headers shift it) is in
+    /// view. The thread index has one row per thread and reveals directly.
+    fn reveal_file_in_sidebar(&mut self, file: usize) {
+        let rows = sidebar_rows(&self.file_entries());
+        if let Some(row) = row_of_file(&rows, file) {
+            self.reveal_in_sidebar(row);
+        }
+    }
+
+    /// Scroll the sidebar's viewport so display `row` is within it.
     fn reveal_in_sidebar(&mut self, row: usize) {
         let height = self.body_height.get().max(1);
         if row < self.sidebar_scroll {
@@ -2290,11 +2298,16 @@ impl App {
     }
 
     /// Scroll the sidebar list under the wheel (independent of the selection),
-    /// clamped so the last file stays reachable.
+    /// clamped so the last row stays reachable. Rows count display rows — file
+    /// rows plus directory headers, or the threads in the Conversation index.
     fn scroll_sidebar(&mut self, delta: isize) {
-        let files = self.diff.files.len();
+        let total = if self.view == View::Conversation {
+            self.conv_order.len()
+        } else {
+            sidebar_rows(&self.file_entries()).len()
+        };
         let height = self.body_height.get().max(1);
-        let max = files.saturating_sub(height) as isize;
+        let max = total.saturating_sub(height) as isize;
         self.sidebar_scroll = (self.sidebar_scroll as isize + delta).clamp(0, max) as usize;
     }
 
@@ -2305,31 +2318,47 @@ impl App {
             self.thread_index_action(action);
             return;
         }
-        let files = self.diff.files.len();
         match action {
-            Action::MoveDown => {
-                if self.sidebar_cursor + 1 < files {
-                    self.sidebar_cursor += 1;
-                    self.follow_sidebar();
-                }
-            }
-            Action::MoveUp => {
-                self.sidebar_cursor = self.sidebar_cursor.saturating_sub(1);
-                self.follow_sidebar();
-            }
-            Action::Top => {
-                self.sidebar_cursor = 0;
-                self.follow_sidebar();
-            }
-            Action::Bottom => {
-                self.sidebar_cursor = files.saturating_sub(1);
-                self.follow_sidebar();
-            }
+            // j/k step through file rows in display order (skipping the directory
+            // headers, which are not selectable).
+            Action::MoveDown => self.move_sidebar_file(1),
+            Action::MoveUp => self.move_sidebar_file(-1),
+            Action::Top => self.jump_sidebar_file(SidebarEnd::First),
+            Action::Bottom => self.jump_sidebar_file(SidebarEnd::Last),
             // `l` / Enter toggle the file (expand + jump, or collapse in place);
             // `o` is a pure fold toggle; `h` is a no-op (the outermost level).
             Action::NavIn => self.sidebar_activate(self.sidebar_cursor),
             Action::Fold => self.toggle_fold_at(self.sidebar_cursor),
             _ => {}
+        }
+    }
+
+    /// Move the sidebar cursor by `delta` file rows in display order (directory
+    /// headers are skipped).
+    fn move_sidebar_file(&mut self, delta: isize) {
+        let order = sidebar_file_order(&sidebar_rows(&self.file_entries()));
+        if order.is_empty() {
+            return;
+        }
+        let pos = order
+            .iter()
+            .position(|&f| f == self.sidebar_cursor)
+            .unwrap_or(0);
+        let next = (pos as isize + delta).clamp(0, order.len() as isize - 1) as usize;
+        self.sidebar_cursor = order[next];
+        self.follow_sidebar();
+    }
+
+    /// Jump the sidebar cursor to the first/last file row in display order.
+    fn jump_sidebar_file(&mut self, end: SidebarEnd) {
+        let order = sidebar_file_order(&sidebar_rows(&self.file_entries()));
+        let target = match end {
+            SidebarEnd::First => order.first(),
+            SidebarEnd::Last => order.last(),
+        };
+        if let Some(&file) = target {
+            self.sidebar_cursor = file;
+            self.follow_sidebar();
         }
     }
 
@@ -3639,8 +3668,9 @@ impl App {
                 let idx = self.sidebar_scroll + row;
                 if self.view == View::Conversation {
                     self.jump_to_thread(idx);
-                } else {
-                    self.sidebar_activate(idx);
+                } else if let Some(file) = file_at_row(&sidebar_rows(&self.file_entries()), idx) {
+                    // A click on a directory header maps to no file — ignored.
+                    self.sidebar_activate(file);
                 }
             }
             Region::Content { col, row } => {
@@ -3868,7 +3898,7 @@ impl App {
         self.scroll = self.scroll.min(self.rows_len().saturating_sub(height));
         // Browsing the body scrolls the sidebar to keep the current file in view.
         if self.focus == Focus::Body {
-            self.reveal_in_sidebar(self.current_file());
+            self.reveal_file_in_sidebar(self.current_file());
         }
     }
 
@@ -4900,52 +4930,67 @@ impl App {
             return;
         }
         let entries = self.file_entries();
-        // Group by directory: the first file in each directory shows its full
-        // path; a run of files sharing that directory shows an indented basename,
-        // so the list reads as a shallow tree without separate header rows (which
-        // would break the file-indexed cursor and scroll).
-        let labels = grouped_labels(&entries);
+        // The list is grouped under directory headers (a shallow tree). Headers
+        // are dim, non-selectable rows; files show their basename. The cursor and
+        // scroll index display rows via the mappings, so headers never confuse
+        // navigation.
+        let rows = sidebar_rows(&entries);
         let width = area.width as usize;
         let height = area.height as usize;
         let current = self.current_file();
         let sidebar_focused = self.focus == Focus::Sidebar;
-        let start = self.sidebar_scroll.min(entries.len());
-        let end = (start + height).min(entries.len());
-        // Three states are shown and must be told apart by intensity, carried in
-        // a leading marker column: the sidebar cursor while the sidebar has focus
-        // (a clear blue fill + a bright white bar + bold); the file open in the
-        // body (a subtle blue tint + a cyan bar, always); and — when focus is in
-        // the body — the sidebar's resting cursor (a faint fill + a dim bar).
-        let lines: Vec<TextLine> = entries[start..end]
+        let start = self.sidebar_scroll.min(rows.len());
+        let end = (start + height).min(rows.len());
+        // Three file states are told apart by intensity in a leading marker
+        // column: the sidebar cursor while the sidebar has focus (a clear blue
+        // fill + a bright white bar + bold); the file open in the body (a subtle
+        // blue tint + a cyan bar, always); and — when focus is in the body — the
+        // sidebar's resting cursor (a faint fill + a dim bar).
+        let lines: Vec<TextLine> = rows[start..end]
             .iter()
-            .enumerate()
-            .map(|(k, e)| {
-                let label = &labels[start + k];
-                let is_sel = e.index == self.sidebar_cursor;
-                let is_current = e.index == current;
-                let (base, marker, marker_fg) = if sidebar_focused && is_sel {
-                    (
-                        Style::default().bg(SEL_BG).add_modifier(Modifier::BOLD),
-                        "▎",
-                        Color::White,
-                    )
-                } else if is_current {
-                    (Style::default().bg(SIDEBAR_CURRENT_BG), "▎", Color::Cyan)
-                } else if is_sel {
-                    (
-                        Style::default().bg(SIDEBAR_SEL_DIM_BG),
-                        "▎",
-                        Color::DarkGray,
-                    )
-                } else {
-                    (Style::default(), " ", Color::Reset)
-                };
-                let mut spans = vec![TextSpan::styled(
-                    marker.to_string(),
-                    base.fg(marker_fg).add_modifier(Modifier::BOLD),
-                )];
-                spans.extend(self.file_row_spans(e, label, width.saturating_sub(1), base, &[]));
-                TextLine::from(spans)
+            .map(|row| match row {
+                SidebarRow::DirHeader(dir) => TextLine::from(TextSpan::styled(
+                    format!("  {}", head_truncate(dir, width.saturating_sub(2))),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                SidebarRow::File(fi) => {
+                    let e = &entries[*fi];
+                    // The directory is in the header above; show the basename.
+                    let base_name = &e.path[dir_of(&e.path).len()..];
+                    let is_sel = e.index == self.sidebar_cursor;
+                    let is_current = e.index == current;
+                    let (base, marker, marker_fg) = if sidebar_focused && is_sel {
+                        (
+                            Style::default().bg(SEL_BG).add_modifier(Modifier::BOLD),
+                            "▎",
+                            Color::White,
+                        )
+                    } else if is_current {
+                        (Style::default().bg(SIDEBAR_CURRENT_BG), "▎", Color::Cyan)
+                    } else if is_sel {
+                        (
+                            Style::default().bg(SIDEBAR_SEL_DIM_BG),
+                            "▎",
+                            Color::DarkGray,
+                        )
+                    } else {
+                        (Style::default(), " ", Color::Reset)
+                    };
+                    let mut spans = vec![TextSpan::styled(
+                        marker.to_string(),
+                        base.fg(marker_fg).add_modifier(Modifier::BOLD),
+                    )];
+                    spans.extend(self.file_row_spans(
+                        e,
+                        base_name,
+                        width.saturating_sub(1),
+                        base,
+                        &[],
+                    ));
+                    TextLine::from(spans)
+                }
             })
             .collect();
         f.render_widget(Paragraph::new(lines), area);
@@ -5496,6 +5541,17 @@ fn status_color(status: loopreview_core::ChangeStatus) -> Color {
     }
 }
 
+/// Clip a string to `max` characters keeping its tail (a leading `…`), so a
+/// long directory header shows its most specific segments.
+fn head_truncate(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max || max == 0 {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(n + 1 - max).collect();
+    format!("…{tail}")
+}
+
 /// The directory portion of a path (through the last `/`), or `""` at the root.
 fn dir_of(path: &str) -> &str {
     match path.rfind('/') {
@@ -5504,23 +5560,71 @@ fn dir_of(path: &str) -> &str {
     }
 }
 
-/// The sidebar label for each file, grouping by directory: the first file in a
-/// directory keeps its full path; a following file in the same directory shows
-/// its basename indented, so a run reads as one group. Index-aligned to
-/// `entries`.
-fn grouped_labels(entries: &[FileEntry]) -> Vec<String> {
-    let mut labels = Vec::with_capacity(entries.len());
-    let mut prev_dir = "";
+/// Which end of the sidebar file list to jump to (`g` / `G`).
+#[derive(Clone, Copy)]
+enum SidebarEnd {
+    First,
+    Last,
+}
+
+/// One rendered row of the file sidebar. A `DirHeader` is a dim, non-selectable
+/// grouping label; a `File` carries an index into the diff's files (the cursor
+/// lands only on these).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SidebarRow {
+    /// A directory grouping header (its path, with a trailing slash).
+    DirHeader(String),
+    /// A file row (index into `review`/diff files).
+    File(usize),
+}
+
+/// The file sidebar as a list of display rows, grouping files under directory
+/// headers: root files come first with no header, then each directory (in
+/// first-appearance order) as a header followed by its files. A pure function of
+/// the entries so the row model and its mappings are testable in isolation.
+fn sidebar_rows(entries: &[FileEntry]) -> Vec<SidebarRow> {
+    let mut root: Vec<usize> = Vec::new();
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
     for entry in entries {
         let dir = dir_of(&entry.path);
-        if !dir.is_empty() && dir == prev_dir {
-            labels.push(format!("  {}", &entry.path[dir.len()..]));
+        if dir.is_empty() {
+            root.push(entry.index);
+        } else if let Some((_, files)) = groups.iter_mut().find(|(d, _)| d == dir) {
+            files.push(entry.index);
         } else {
-            labels.push(entry.path.clone());
+            groups.push((dir.to_string(), vec![entry.index]));
         }
-        prev_dir = dir;
     }
-    labels
+    let mut rows: Vec<SidebarRow> = root.into_iter().map(SidebarRow::File).collect();
+    for (dir, files) in groups {
+        rows.push(SidebarRow::DirHeader(dir));
+        rows.extend(files.into_iter().map(SidebarRow::File));
+    }
+    rows
+}
+
+/// The display-row position of a file (for scroll/reveal), or `None`.
+fn row_of_file(rows: &[SidebarRow], file: usize) -> Option<usize> {
+    rows.iter().position(|r| *r == SidebarRow::File(file))
+}
+
+/// The file at a display row, or `None` for a header row (click routing).
+fn file_at_row(rows: &[SidebarRow], row: usize) -> Option<usize> {
+    match rows.get(row) {
+        Some(SidebarRow::File(i)) => Some(*i),
+        _ => None,
+    }
+}
+
+/// The file indices in display order — the sequence `j`/`k` steps through,
+/// skipping headers.
+fn sidebar_file_order(rows: &[SidebarRow]) -> Vec<usize> {
+    rows.iter()
+        .filter_map(|r| match r {
+            SidebarRow::File(i) => Some(*i),
+            SidebarRow::DirHeader(_) => None,
+        })
+        .collect()
 }
 
 /// The one-character status marker for a file's change kind (`A`/`D`/`M`/`R`/`C`).
@@ -8545,9 +8649,8 @@ mod tests {
         assert_eq!(app.sidebar_width(200), Some(SIDEBAR_MIN));
     }
 
-    #[test]
-    fn grouped_labels_indent_runs_within_a_directory() {
-        let mk = |i: usize, p: &str| FileEntry {
+    fn sidebar_entry(i: usize, p: &str) -> FileEntry {
+        FileEntry {
             index: i,
             path: p.into(),
             status: ChangeStatus::Modified,
@@ -8555,18 +8658,73 @@ mod tests {
             removed: 0,
             comments: 0,
             collapsed: false,
-        };
+        }
+    }
+
+    #[test]
+    fn sidebar_rows_group_files_under_directory_headers() {
+        // Root files first (no header), then each directory once with its files;
+        // note b.rs and c.rs are in the same dir but not adjacent in diff order.
         let entries = vec![
-            mk(0, "src/a.rs"),
-            mk(1, "src/b.rs"),
-            mk(2, "tests/c.rs"),
-            mk(3, "top.rs"),
+            sidebar_entry(0, "src/a/b.rs"),
+            sidebar_entry(1, "top.rs"),
+            sidebar_entry(2, "src/a/c.rs"),
+            sidebar_entry(3, "tests/d.rs"),
         ];
-        let labels = grouped_labels(&entries);
-        assert_eq!(labels[0], "src/a.rs", "first of its directory: full path");
-        assert_eq!(labels[1], "  b.rs", "same directory: indented basename");
-        assert_eq!(labels[2], "tests/c.rs", "a new directory: full path again");
-        assert_eq!(labels[3], "top.rs", "a root file keeps its name");
+        let rows = sidebar_rows(&entries);
+        assert_eq!(
+            rows,
+            vec![
+                SidebarRow::File(1), // root file, no header
+                SidebarRow::DirHeader("src/a/".into()),
+                SidebarRow::File(0),
+                SidebarRow::File(2), // gathered into its directory group
+                SidebarRow::DirHeader("tests/".into()),
+                SidebarRow::File(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn sidebar_navigation_skips_directory_headers() {
+        // Display rows: File(0=root), DirHeader(src/), File(1), File(2).
+        let mut app = multi_file_app(&["z_root.rs", "src/a.rs", "src/b.rs"]);
+        app.toggle_sidebar();
+        assert_eq!(app.focus, Focus::Sidebar);
+        app.sidebar_cursor = 0;
+        // j moves to the next file row (1), stepping over the directory header.
+        app.sidebar_action(Action::MoveDown);
+        assert_eq!(
+            app.sidebar_cursor, 1,
+            "j skipped the header to the next file"
+        );
+        app.sidebar_action(Action::MoveDown);
+        assert_eq!(app.sidebar_cursor, 2);
+        // At the end, j holds; G/g reach the last/first file.
+        app.sidebar_action(Action::MoveDown);
+        assert_eq!(app.sidebar_cursor, 2, "j clamps at the last file");
+        app.sidebar_action(Action::Top);
+        assert_eq!(app.sidebar_cursor, 0);
+        app.sidebar_action(Action::Bottom);
+        assert_eq!(app.sidebar_cursor, 2);
+    }
+
+    #[test]
+    fn sidebar_row_mappings_are_bidirectional() {
+        let entries = vec![
+            sidebar_entry(0, "src/a.rs"),
+            sidebar_entry(1, "top.rs"),
+            sidebar_entry(2, "src/b.rs"),
+        ];
+        let rows = sidebar_rows(&entries);
+        // rows: [File(1), DirHeader(src/), File(0), File(2)]
+        assert_eq!(sidebar_file_order(&rows), vec![1, 0, 2]);
+        // cursor (a file) -> its display row, and back.
+        assert_eq!(row_of_file(&rows, 0), Some(2));
+        assert_eq!(row_of_file(&rows, 1), Some(0));
+        assert_eq!(file_at_row(&rows, 2), Some(0));
+        // A header row maps to no file (non-selectable, non-clickable).
+        assert_eq!(file_at_row(&rows, 1), None);
         assert_eq!(dir_of("src/a.rs"), "src/");
         assert_eq!(dir_of("top.rs"), "");
     }
