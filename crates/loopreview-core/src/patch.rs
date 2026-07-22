@@ -82,7 +82,10 @@ pub fn parse(input: &str) -> Result<Diff, DiffError> {
     if let Some(b) = current.take() {
         files.push(b.finish());
     }
-    Ok(Diff { files })
+    Ok(Diff {
+        files,
+        ..Diff::default()
+    })
 }
 
 /// Accumulates one file's metadata and hunks while parsing.

@@ -22,5 +22,7 @@ pub mod source;
 
 pub use error::DiffError;
 pub use intraline::{Segment, word_diff};
-pub use model::{ChangeStatus, Diff, DiffStats, FileDiff, Hunk, Line, LineAnchor, LineKind, Side};
-pub use source::{DiffSource, RefSource, StdinPatchSource, WorktreeSource};
+pub use model::{
+    ChangeStatus, Diff, DiffStats, FileDiff, Hunk, Line, LineAnchor, LineKind, Provenance, Side,
+};
+pub use source::{DiffSource, FilePatchSource, RefSource, StdinPatchSource, WorktreeSource};

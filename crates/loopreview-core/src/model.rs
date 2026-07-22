@@ -221,11 +221,28 @@ impl FileDiff {
     }
 }
 
-/// A whole diff: an ordered list of changed files.
+/// Where the two sides of a diff came from: the commit each side is anchored
+/// to, when known.
+///
+/// This is the foundation for reconstructing the history behind an outdated
+/// review comment — a comment can be re-placed against `git show <sha>:<path>`.
+/// A side that is not a commit (the working tree or the index) is `None`, as is
+/// everything for a patch read from stdin.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Provenance {
+    /// Commit SHA of the old ("before") side, when it is a commit.
+    pub base: Option<String>,
+    /// Commit SHA of the new ("after") side, `None` for the working tree/index.
+    pub head: Option<String>,
+}
+
+/// A whole diff: an ordered list of changed files plus where they came from.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Diff {
     /// The changed files, in the order they should be presented.
     pub files: Vec<FileDiff>,
+    /// The commits (if any) the two sides are anchored to.
+    pub provenance: Provenance,
 }
 
 /// Aggregate counts for a [`Diff`], suitable for a summary line.
@@ -424,7 +441,10 @@ mod tests {
         };
         assert_eq!(file.line_stats(), (2, 1));
 
-        let diff = Diff { files: vec![file] };
+        let diff = Diff {
+            files: vec![file],
+            ..Diff::default()
+        };
         let stats = diff.stats();
         assert_eq!(stats.files, 1);
         assert_eq!(stats.insertions, 2);

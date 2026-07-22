@@ -2,15 +2,16 @@
 //!
 //! loopreview loads every diff through this trait so the rest of the program
 //! never cares whether the changes came from the working tree, a ref
-//! comparison, or a patch on standard input. Future sources (a pull request, an
-//! agent run's output) implement the same trait and slot in unchanged.
+//! comparison, or a patch (from stdin or a file). Future sources (a pull
+//! request, an agent run's output) implement the same trait and slot in
+//! unchanged.
 
 use std::io::Read;
 use std::path::PathBuf;
 
 use crate::error::DiffError;
 use crate::git;
-use crate::model::Diff;
+use crate::model::{Diff, Provenance};
 use crate::patch;
 
 /// A provider of a [`Diff`], plus a short human-readable description of what it
@@ -24,27 +25,56 @@ pub trait DiffSource {
     fn describe(&self) -> String;
 }
 
-/// The working tree compared against `HEAD`: staged and unstaged changes to
-/// tracked files.
+/// The working tree (or the index) compared against `HEAD`.
 pub struct WorktreeSource {
     dir: PathBuf,
+    staged: bool,
+    pathspec: Vec<String>,
 }
 
 impl WorktreeSource {
     /// Compare the working tree rooted at `dir` against `HEAD`.
     pub fn new(dir: impl Into<PathBuf>) -> WorktreeSource {
-        WorktreeSource { dir: dir.into() }
+        WorktreeSource {
+            dir: dir.into(),
+            staged: false,
+            pathspec: Vec::new(),
+        }
+    }
+
+    /// When `true`, compare only the staged index against `HEAD` (`--cached`)
+    /// rather than the full working tree.
+    pub fn staged(mut self, staged: bool) -> WorktreeSource {
+        self.staged = staged;
+        self
+    }
+
+    /// Restrict the diff to paths matching `pathspec`.
+    pub fn pathspec(mut self, pathspec: Vec<String>) -> WorktreeSource {
+        self.pathspec = pathspec;
+        self
     }
 }
 
 impl DiffSource for WorktreeSource {
     fn load(&self) -> Result<Diff, DiffError> {
-        let text = git::diff_worktree(&self.dir)?;
-        patch::parse(&text)
+        let text = git::diff_worktree(&self.dir, self.staged, &self.pathspec)?;
+        let mut diff = patch::parse(&text)?;
+        // The old side is HEAD; the new side is the working tree or index, which
+        // are not commits.
+        diff.provenance = Provenance {
+            base: git::head_sha(&self.dir),
+            head: None,
+        };
+        Ok(diff)
     }
 
     fn describe(&self) -> String {
-        "working tree".to_string()
+        if self.staged {
+            "staged changes".to_string()
+        } else {
+            "working tree".to_string()
+        }
     }
 }
 
@@ -53,6 +83,7 @@ impl DiffSource for WorktreeSource {
 pub struct RefSource {
     dir: PathBuf,
     target: String,
+    pathspec: Vec<String>,
 }
 
 impl RefSource {
@@ -62,13 +93,22 @@ impl RefSource {
         RefSource {
             dir: dir.into(),
             target: target.into(),
+            pathspec: Vec::new(),
         }
+    }
+
+    /// Restrict the diff to paths matching `pathspec`.
+    pub fn pathspec(mut self, pathspec: Vec<String>) -> RefSource {
+        self.pathspec = pathspec;
+        self
     }
 }
 
 impl DiffSource for RefSource {
     fn load(&self) -> Result<Diff, DiffError> {
-        let text = git::diff_target(&self.dir, &self.target)?;
+        let text = git::diff_target(&self.dir, &self.target, &self.pathspec)?;
+        // Provenance for an arbitrary range is left unresolved in M1 (a best
+        // effort would have to interpret git's `..` / `...` range grammar).
         patch::parse(&text)
     }
 
@@ -97,5 +137,28 @@ impl DiffSource for StdinPatchSource {
 
     fn describe(&self) -> String {
         "stdin patch".to_string()
+    }
+}
+
+/// A unified-diff patch read from a file (`lr patch <file>`).
+pub struct FilePatchSource {
+    path: PathBuf,
+}
+
+impl FilePatchSource {
+    /// Create a source that reads a patch from `path` when loaded.
+    pub fn new(path: impl Into<PathBuf>) -> FilePatchSource {
+        FilePatchSource { path: path.into() }
+    }
+}
+
+impl DiffSource for FilePatchSource {
+    fn load(&self) -> Result<Diff, DiffError> {
+        let text = std::fs::read_to_string(&self.path)?;
+        patch::parse(&text)
+    }
+
+    fn describe(&self) -> String {
+        format!("patch {}", self.path.display())
     }
 }
