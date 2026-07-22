@@ -2780,6 +2780,10 @@ impl App {
                 Ok(result) => Reply::Comment(result),
                 Err(message) => return Response::Error(message),
             },
+            Request::CommentEdit(edit) => match self.control_comment_edit(edit) {
+                Ok(result) => Reply::Comment(result),
+                Err(message) => return Response::Error(message),
+            },
             Request::CommentResolve(resolve) => match self.control_comment_resolve(resolve) {
                 Ok(result) => Reply::Resolve(result),
                 Err(message) => return Response::Error(message),
@@ -3069,6 +3073,53 @@ impl App {
             thread: reply.thread,
             comment,
             draft: kind == CommentKind::Draft,
+        })
+    }
+
+    /// Edit a comment's body by id (a control-plane `comment edit`). An agent
+    /// may edit only its own unpublished comment — a draft or a local note it
+    /// authored. A published comment is refused (writing to GitHub is a human
+    /// action), and another author's comment is refused (that would misattribute
+    /// it). Works on a root or a reply, wherever the id points.
+    fn control_comment_edit(
+        &mut self,
+        edit: protocol::CommentEdit,
+    ) -> Result<protocol::CommentResult, String> {
+        let id = &edit.id;
+        let Some((ti, ci)) = self.review.threads.iter().enumerate().find_map(|(ti, t)| {
+            t.comments
+                .iter()
+                .position(|c| c.id == *id)
+                .map(|ci| (ti, ci))
+        }) else {
+            return Err(format!("no comment {id}"));
+        };
+        {
+            let comment = &self.review.threads[ti].comments[ci];
+            if comment.is_published() {
+                return Err(
+                    "a published comment can't be edited by an agent — writing to GitHub is a human action"
+                        .to_string(),
+                );
+            }
+            if comment.author != edit.author {
+                return Err(format!(
+                    "only the author can edit their own comment ({} can't edit {}'s)",
+                    edit.author, comment.author
+                ));
+            }
+        }
+        self.review.threads[ti].comments[ci].body = edit.body.clone();
+        let thread_id = self.review.threads[ti].id.clone();
+        let comment_id = self.review.threads[ti].comments[ci].id.clone();
+        let draft = self.review.threads[ti].comments[ci].is_draft();
+        let done = self.persist("comment edited").unwrap_or_default();
+        self.relayout();
+        self.status = Some(format!("agent: {done}"));
+        Ok(protocol::CommentResult {
+            thread: thread_id,
+            comment: comment_id,
+            draft,
         })
     }
 
@@ -6293,6 +6344,85 @@ mod tests {
             other => panic!("expected an error, got {other:?}"),
         }
         assert_eq!(app.review.threads.len(), 1, "a published thread stays");
+    }
+
+    #[test]
+    fn control_comment_edit_replaces_own_comment_body() {
+        let mut app = sample_app();
+        let add = app.handle_control(Request::CommentAdd(protocol::CommentAdd {
+            file: "a.rs".into(),
+            side: Side::New,
+            line: 2,
+            body: "before".into(),
+            author: "agent".into(),
+            draft: false,
+        }));
+        let comment_id = match add {
+            Response::Ok(Reply::Comment(r)) => r.comment,
+            other => panic!("unexpected: {other:?}"),
+        };
+        match app.handle_control(Request::CommentEdit(protocol::CommentEdit {
+            id: comment_id.clone(),
+            body: "after".into(),
+            author: "agent".into(),
+        })) {
+            Response::Ok(Reply::Comment(r)) => assert_eq!(r.comment, comment_id),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(app.review.threads[0].root().unwrap().body, "after");
+        assert_eq!(app.review.threads[0].comments.len(), 1, "still one comment");
+    }
+
+    #[test]
+    fn control_comment_edit_refuses_published_and_other_authors() {
+        let mut app = sample_app();
+        // An agent's own local note, plus a published comment by someone else.
+        let add = app.handle_control(Request::CommentAdd(protocol::CommentAdd {
+            file: "a.rs".into(),
+            side: Side::New,
+            line: 2,
+            body: "mine".into(),
+            author: "agent".into(),
+            draft: false,
+        }));
+        let own = match add {
+            Response::Ok(Reply::Comment(r)) => r.comment,
+            other => panic!("unexpected: {other:?}"),
+        };
+        // Another author can't edit the agent's comment.
+        match app.handle_control(Request::CommentEdit(protocol::CommentEdit {
+            id: own.clone(),
+            body: "hijacked".into(),
+            author: "someone-else".into(),
+        })) {
+            Response::Error(msg) => assert!(msg.contains("author"), "refusal: {msg}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert_eq!(app.review.threads[0].root().unwrap().body, "mine");
+
+        // A published comment can't be edited by an agent at all.
+        app.review.threads.push(Thread {
+            id: "t".into(),
+            anchor: Anchor::line("a.rs", Side::New, 1),
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: "cpub".into(),
+                author: "agent".into(),
+                body: "posted".into(),
+                created_at: 0,
+                remote_id: Some("PRRC_1".into()),
+                kind: loopreview_core::CommentKind::Draft,
+            }],
+        });
+        app.relayout();
+        match app.handle_control(Request::CommentEdit(protocol::CommentEdit {
+            id: "cpub".into(),
+            body: "changed".into(),
+            author: "agent".into(),
+        })) {
+            Response::Error(msg) => assert!(msg.contains("human action"), "refusal: {msg}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
     }
 
     #[test]

@@ -92,6 +92,7 @@ lr session comment add --repo . --file src/app.rs --line 120 \
 lr session comment add --repo . --file src/app.rs --line 120 --draft --author reviewer-bot \
   --body "Nit: use the shared client here."         # queued for the human to submit
 lr session comment reply --repo . --thread <id> --body "Good point — flagged."
+lr session comment edit --repo . --comment <id> --body "Revised: use the shared client."  # fix your own wording
 lr session comment resolve --repo . --thread <id> --author agent   # local reviews and your own drafts
 lr session comment rm --repo . <comment-or-thread-id>              # withdraw a local note or draft
 ```
@@ -100,6 +101,10 @@ lr session comment rm --repo . <comment-or-thread-id>              # withdraw a 
   `new` and `--author` to `agent`. The line must be one shown in the current diff.
 - `--draft` queues a comment for the human to submit; without it the comment (or
   reply) is a local note. `--draft` only matters on a pull request.
+- `comment edit --comment <id> --body <text>` replaces the body of one of your
+  own unpublished comments (a draft or local note, root or reply). It refuses a
+  published comment (writing to GitHub is the human's action) and another
+  author's comment (that would misattribute it).
 - `comment resolve` works on local-review threads and your own drafts (`--reopen`
   flips it back). It refuses a published pull-request thread — the human's call.
 - `comment rm <id>` withdraws one of your own unpublished comments — pass a

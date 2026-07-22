@@ -43,6 +43,8 @@ pub enum Request {
     CommentAdd(CommentAdd),
     /// Reply to an existing thread.
     CommentReply(CommentReply),
+    /// Edit an existing comment's body (own draft/local only).
+    CommentEdit(CommentEdit),
     /// Resolve or reopen a thread (local reviews only).
     CommentResolve(CommentResolve),
     /// Withdraw a draft comment or thread (drafts only, never published).
@@ -102,6 +104,18 @@ pub struct CommentReply {
     /// Queue this reply as a draft to submit (pull requests only).
     #[serde(default)]
     pub draft: bool,
+}
+
+/// Edit an existing comment's body by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommentEdit {
+    /// The comment to edit (a comment id, not a thread id).
+    pub id: String,
+    /// The new body (markdown), replacing the old one.
+    pub body: String,
+    /// The editing author; must match the comment's author — an agent may edit
+    /// only its own comment.
+    pub author: String,
 }
 
 /// Resolve or reopen a thread.
@@ -164,7 +178,8 @@ pub enum Reply {
     Navigate(NavigateResult),
     /// Answer to [`Request::Reload`].
     Reload(ReloadResult),
-    /// Answer to [`Request::CommentAdd`] / [`Request::CommentReply`].
+    /// Answer to [`Request::CommentAdd`] / [`Request::CommentReply`] /
+    /// [`Request::CommentEdit`].
     Comment(CommentResult),
     /// Answer to [`Request::CommentResolve`].
     Resolve(ResolveResult),
@@ -480,6 +495,11 @@ mod tests {
                 body: "and here".into(),
                 author: "agent".into(),
                 draft: false,
+            }),
+            Request::CommentEdit(CommentEdit {
+                id: "c1".into(),
+                body: "actually, here".into(),
+                author: "agent".into(),
             }),
             Request::CommentResolve(CommentResolve {
                 thread: "t1".into(),

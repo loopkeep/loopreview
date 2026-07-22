@@ -306,6 +306,24 @@ pub enum CommentAction {
         #[arg(long)]
         json: bool,
     },
+    /// Edit a comment's body (your own draft/local comment only; never published).
+    Edit {
+        #[command(flatten)]
+        target: Target,
+        /// The comment to edit (a comment id).
+        #[arg(long)]
+        comment: String,
+        /// The new body (markdown), replacing the old one.
+        #[arg(long)]
+        body: String,
+        /// The editing author; must match the comment's author. Defaults to
+        /// `agent`.
+        #[arg(long)]
+        author: Option<String>,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Withdraw a draft comment or thread (drafts only; never published).
     Rm {
         #[command(flatten)]

@@ -265,6 +265,28 @@ fn comment(action: CommentAction) -> Result<()> {
                 Ok(())
             }
         }
+        CommentAction::Edit {
+            target,
+            comment,
+            body,
+            author,
+            json,
+        } => {
+            let request = Request::CommentEdit(protocol::CommentEdit {
+                id: comment,
+                body,
+                author: author.unwrap_or_else(|| "agent".to_string()),
+            });
+            let Reply::Comment(result) = call(&target, request)? else {
+                bail!("unexpected reply");
+            };
+            if json {
+                emit(&result)
+            } else {
+                print_comment(&result);
+                Ok(())
+            }
+        }
         CommentAction::Rm { target, id, json } => {
             let request = Request::CommentRm(protocol::CommentRm { id });
             let Reply::Removed(result) = call(&target, request)? else {
