@@ -2065,10 +2065,12 @@ impl App {
     fn conversation_action(&mut self, action: Action) {
         let page = self.body_height.get().max(1);
         match action {
+            // j/k keep selecting threads (the scroll snaps to follow); the wheel
+            // and the page/end keys scroll the pane freely without changing it.
             Action::MoveDown => self.move_conv(1),
             Action::MoveUp => self.move_conv(-1),
-            Action::Top => self.set_conv(0),
-            Action::Bottom => self.set_conv(self.review.threads.len().saturating_sub(1)),
+            Action::Top => self.conv_scroll = 0,
+            Action::Bottom => self.conv_scroll = self.conv_max_scroll(),
             Action::HalfPageDown | Action::PageDown => {
                 self.conv_scroll = (self.conv_scroll + page / 2).min(self.conv_max_scroll())
             }
@@ -2703,13 +2705,23 @@ impl App {
     }
 
     /// A vertical wheel notch scrolls the sidebar list when the pointer is over
-    /// it, otherwise the diff body (hit-tested against the last draw).
+    /// it, otherwise the body — the Conversation thread pane (freely) or the diff
+    /// (hit-tested against the last draw).
     fn scroll_wheel(&mut self, col: u16, row: u16, delta: isize) {
         if let Region::Sidebar(_) = hit_region(col, row, self.hit.get()) {
             self.scroll_sidebar(delta);
+        } else if self.view == View::Conversation {
+            self.scroll_conv(delta);
         } else {
             self.scroll_view(delta);
         }
+    }
+
+    /// Freely scroll the Conversation thread pane, clamped to its content (the
+    /// same defensive clamp the side-by-side pass uses).
+    fn scroll_conv(&mut self, delta: isize) {
+        let max = self.conv_max_scroll() as isize;
+        self.conv_scroll = (self.conv_scroll as isize + delta).clamp(0, max) as usize;
     }
 
     /// Scroll the viewport without moving the cursor (wheel scrolling).
@@ -4714,7 +4726,8 @@ fn anchor_label(anchor: &Anchor) -> String {
             format!("{file}:{range} ({side})")
         }
         Anchor::File { file } => file.clone(),
-        Anchor::Review => "changeset".to_string(),
+        // "conversation" everywhere in the UI; "changeset" stays design-internal.
+        Anchor::Review => "conversation".to_string(),
     }
 }
 
@@ -5991,6 +6004,59 @@ mod tests {
         assert_eq!(app.selected_thread(), Some(2), "next is the file thread");
         app.sidebar_action(Action::MoveDown);
         assert_eq!(app.selected_thread(), Some(0), "last is the newest inline");
+    }
+
+    /// A single thread whose body is taller than any small viewport.
+    fn app_with_tall_thread() -> App {
+        let mut app = multi_file_app(&["a.rs"]);
+        let mut comments = vec![Comment {
+            id: "root".into(),
+            author: "a".into(),
+            body: "root".into(),
+            created_at: 0,
+            remote_id: None,
+        }];
+        for i in 0..40u64 {
+            comments.push(Comment {
+                id: format!("r{i}"),
+                author: "b".into(),
+                body: format!("reply {i}"),
+                created_at: i + 1,
+                remote_id: None,
+            });
+        }
+        app.review.threads.push(Thread {
+            id: "t".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments,
+        });
+        app.relayout();
+        app.view = View::Conversation;
+        app
+    }
+
+    #[test]
+    fn conversation_free_scroll_reaches_a_tall_thread() {
+        let mut app = app_with_tall_thread();
+        app.body_height.set(10);
+        let max = app.conv_max_scroll();
+        assert!(max > 0, "the thread is taller than the viewport");
+        // g/G scroll to the ends without moving the selection.
+        app.conversation_action(Action::Bottom);
+        assert_eq!(app.conv_scroll, max, "G reaches the content end");
+        app.scroll_conv(10_000);
+        assert_eq!(app.conv_scroll, max, "the wheel clamps at the end");
+        app.scroll_conv(-10_000);
+        assert_eq!(app.conv_scroll, 0, "and at the top");
+        assert_eq!(app.conv_cursor, 0, "free scroll leaves the selection alone");
+    }
+
+    #[test]
+    fn review_anchor_reads_conversation_everywhere() {
+        let anchor = Anchor::Review;
+        assert_eq!(anchor_label(&anchor), "conversation");
+        assert_eq!(thread_index_label(&anchor), "conversation");
     }
 
     #[test]
