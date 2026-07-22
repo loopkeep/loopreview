@@ -101,7 +101,9 @@ files from a working-tree review.
 
 | Key | Action |
 | --- | --- |
-| `j` / `k` (or `↓` / `↑`) | Move the line cursor |
+| `j` / `k` (or `↓` / `↑`) | Move the cursor (over file headers and lines) |
+| `l` (or `→`) | Go in: expand a folded file, or move from a header to its first line |
+| `h` (or `←`) | Go out: line → its file header, header → collapse, folded header → sidebar |
 | `Ctrl-D` / `Ctrl-U` | Half-page down / up |
 | `Space` / `PageDown`, `PageUp` | Page down / up |
 | `g` / `G` (or `Home` / `End`) | First / last line |

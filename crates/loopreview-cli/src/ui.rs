@@ -71,6 +71,10 @@ const SIDEBAR_MIN_CONTENT: usize = 44;
 const SEL_BG: Color = Color::Rgb(45, 50, 66);
 /// Background of lines in a range selection (for a multi-line comment).
 const SELECTION_BG: Color = Color::Rgb(38, 48, 74);
+/// A cursor stop's `flat` value meaning "the file header" (not a content line).
+/// Headers are cursor stops so `j`/`k` walks them and folded files stay
+/// navigable; content lines use their real flat index.
+const HEADER: usize = usize::MAX;
 /// How often the event loop wakes to repaint when idle.
 const POLL_MS: u64 = 200;
 /// Quiet period after a filesystem event before a watched source is reloaded,
@@ -1054,12 +1058,24 @@ impl App {
         self.follow_cursor();
     }
 
-    /// The cursor's current line as a relocatable anchor.
-    fn current_anchor(&self) -> Option<CursorAnchor> {
-        if self.clines.is_empty() {
-            return None;
+    /// Whether the cursor is resting on a file header (not a content line).
+    fn cursor_is_header(&self) -> bool {
+        self.clines
+            .get(self.cursor)
+            .is_some_and(|&(_, flat)| flat == HEADER)
+    }
+
+    /// The cursor's content line `(file, flat)`, or `None` when it is on a header.
+    fn cursor_content(&self) -> Option<(usize, usize)> {
+        match self.clines.get(self.cursor).copied() {
+            Some((file, flat)) if flat != HEADER => Some((file, flat)),
+            _ => None,
         }
-        let (file, flat) = self.clines[self.cursor];
+    }
+
+    /// The cursor's current line as a relocatable anchor (`None` on a header).
+    fn current_anchor(&self) -> Option<CursorAnchor> {
+        let (file, flat) = self.cursor_content()?;
         let (hi, li) = self.flats[file][flat];
         let line = &self.diff.files[file].hunks[hi].lines[li];
         let new_side = line.kind != LineKind::Deletion;
@@ -1078,6 +1094,9 @@ impl App {
     /// Find the cursor index of `anchor` in the current diff, if present.
     fn find_anchor(&self, anchor: &CursorAnchor) -> Option<usize> {
         self.clines.iter().position(|&(file, flat)| {
+            if flat == HEADER {
+                return false;
+            }
             let (hi, li) = self.flats[file][flat];
             let line = &self.diff.files[file].hunks[hi].lines[li];
             let new_side = line.kind != LineKind::Deletion;
@@ -1212,6 +1231,8 @@ impl App {
             (KeyCode::Char('r'), false) => self.start_reply(),
             (KeyCode::Char('x'), false) => self.toggle_resolve(),
             (KeyCode::Char('o'), false) => self.toggle_fold(),
+            (KeyCode::Char('l'), false) | (KeyCode::Right, _) => self.nav_in(),
+            (KeyCode::Char('h'), false) | (KeyCode::Left, _) => self.nav_out(),
             (KeyCode::Char('V'), false) => self.start_selection(),
             _ => {}
         }
@@ -1290,15 +1311,16 @@ impl App {
         // have moved past the selection's file while extending).
         let (lo, hi) = self.selection_range().unwrap_or((self.cursor, self.cursor));
         let afile = self.clines[lo].0;
-        let f = &self.diff.files[afile];
-        let path = f.display_path().to_string();
+        let path = self.diff.files[afile].display_path().to_string();
 
         let mut new_nums = Vec::new();
         let mut old_nums = Vec::new();
+        // The last content flat in the range, for the context snippet.
+        let mut last_flat: Option<usize> = None;
         for idx in lo..=hi {
             let (file, flat) = self.clines[idx];
-            if file != afile {
-                continue;
+            if file != afile || flat == HEADER {
+                continue; // skip other files and header stops
             }
             let (h, l) = self.flats[file][flat];
             let line = &self.diff.files[file].hunks[h].lines[l];
@@ -1308,6 +1330,7 @@ impl App {
             if let Some(n) = line.old_lineno {
                 old_nums.push(n);
             }
+            last_flat = Some(flat);
         }
         let (side, start, end) = if !new_nums.is_empty() {
             (
@@ -1322,17 +1345,20 @@ impl App {
                 *old_nums.iter().max().unwrap(),
             )
         } else {
-            return None;
+            return None; // nothing but headers selected
         };
         let commit = if side == Side::New {
             self.diff.provenance.head.clone()
         } else {
             self.diff.provenance.base.clone()
         };
-        // Context snippet from the range's last line (the display anchor).
-        let (hfile, hflat) = self.clines[hi];
-        let (ehi, eli) = self.flats[hfile][hflat];
-        let context = context_snippet(&self.diff.files[hfile].hunks[ehi], eli);
+        // Context snippet from the range's last content line (the display anchor).
+        let context = last_flat
+            .map(|flat| {
+                let (h, l) = self.flats[afile][flat];
+                context_snippet(&self.diff.files[afile].hunks[h], l)
+            })
+            .unwrap_or_default();
         let target = if start == end {
             format!("{path}:{start}")
         } else {
@@ -1351,16 +1377,17 @@ impl App {
 
     /// Begin (or, if already active, cancel) a line-range selection at the cursor.
     fn start_selection(&mut self) {
-        if self.clines.is_empty() {
-            return;
-        }
         if self.selection.is_some() {
             self.clear_selection();
             self.status = Some("selection cleared".to_string());
-        } else {
-            self.selection = Some(self.cursor);
-            self.status = Some("visual line — j/k extend · c comment · Esc cancel".to_string());
+            return;
         }
+        if self.cursor_is_header() {
+            self.status = Some("move to a line to select a range".to_string());
+            return;
+        }
+        self.selection = Some(self.cursor);
+        self.status = Some("visual line — j/k extend · c comment · Esc cancel".to_string());
     }
 
     /// Clear any line-range selection.
@@ -1464,38 +1491,43 @@ impl App {
         self.relayout();
     }
 
-    /// `o` in the Files view, context-dependent: expand the current file if it is
-    /// collapsed; otherwise fold the comment thread at the cursor line; otherwise
-    /// collapse the current file.
+    /// `o` in the Files view, context-dependent: fold the comment thread at the
+    /// cursor line if there is one; otherwise toggle the current file's collapse
+    /// (leaving the cursor on its header).
     fn toggle_fold(&mut self) {
-        let file = self.current_file();
-        let path = self
-            .diff
-            .files
-            .get(file)
-            .map(|f| f.display_path().to_string());
-        if let Some(path) = &path
-            && self.collapsed_files.contains(path)
-        {
-            self.collapsed_files.remove(path);
-            self.status = Some(format!("expanded {}", file_name(path)));
-            self.relayout_to_file(file);
-            return;
-        }
         if let Some(idx) = self.thread_at_cursor() {
             let id = self.review.threads[idx].id.clone();
             self.toggle_collapse(id);
             return;
         }
-        if let Some(path) = path {
-            self.collapsed_files.insert(path.clone());
-            self.status = Some(format!("collapsed {}", file_name(&path)));
-            self.relayout_to_file(file);
-        }
+        self.set_file_collapsed(self.current_file(), None);
     }
 
-    /// Rebuild the layout (folds changed) and place the cursor on `file`.
-    fn relayout_to_file(&mut self, file: usize) {
+    /// Collapse, expand, or (with `None`) toggle `file`'s fold, relaying out and
+    /// leaving the cursor on the file's header. Returns the new collapsed state.
+    fn set_file_collapsed(&mut self, file: usize, collapse: Option<bool>) -> bool {
+        let Some(path) = self
+            .diff
+            .files
+            .get(file)
+            .map(|f| f.display_path().to_string())
+        else {
+            return false;
+        };
+        let now = collapse.unwrap_or(!self.collapsed_files.contains(&path));
+        if now {
+            self.collapsed_files.insert(path.clone());
+            self.status = Some(format!("collapsed {}", file_name(&path)));
+        } else {
+            self.collapsed_files.remove(&path);
+            self.status = Some(format!("expanded {}", file_name(&path)));
+        }
+        self.relayout_to_file_header(file);
+        now
+    }
+
+    /// Rebuild the layout (folds changed) and put the cursor on `file`'s header.
+    fn relayout_to_file_header(&mut self, file: usize) {
         let diff = std::mem::take(&mut self.diff);
         self.apply_layout(diff);
         let cursor = self
@@ -1506,6 +1538,62 @@ impl App {
             .unwrap_or(self.cursor);
         self.cursor = cursor.min(self.clines.len().saturating_sub(1));
         self.follow_cursor();
+    }
+
+    /// The cursor index of `file`'s first content line, if it has one (a folded
+    /// or empty file has none).
+    fn file_first_line(&self, file: usize) -> Option<usize> {
+        let start = self.file_first.get(file).copied().flatten()?;
+        (start + 1..self.clines.len()).find(|&i| {
+            let (f, flat) = self.clines[i];
+            f == file && flat != HEADER
+        })
+    }
+
+    /// `l` in the body: go one level in. A collapsed header expands; an expanded
+    /// header moves the cursor to the file's first line; on a line it is a no-op.
+    fn nav_in(&mut self) {
+        if !self.cursor_is_header() {
+            return;
+        }
+        let file = self.current_file();
+        let collapsed = self
+            .diff
+            .files
+            .get(file)
+            .is_some_and(|f| self.collapsed_files.contains(f.display_path()));
+        if collapsed {
+            self.set_file_collapsed(file, Some(false));
+        } else if let Some(line) = self.file_first_line(file) {
+            self.set_cursor(line);
+        }
+    }
+
+    /// `h` in the body: go one level out. On a line, jump to the file's header;
+    /// an expanded header collapses; a collapsed header moves focus to the
+    /// sidebar (when it is showing).
+    fn nav_out(&mut self) {
+        let file = self.current_file();
+        if !self.cursor_is_header() {
+            if let Some(header) = self.file_first.get(file).copied().flatten() {
+                self.set_cursor(header);
+            }
+            return;
+        }
+        let collapsed = self
+            .diff
+            .files
+            .get(file)
+            .is_some_and(|f| self.collapsed_files.contains(f.display_path()));
+        if collapsed {
+            if self.sidebar_width(self.body_width.get()).is_some() {
+                self.focus = Focus::Sidebar;
+                self.sidebar_cursor = file;
+                self.follow_sidebar();
+            }
+        } else {
+            self.set_file_collapsed(file, Some(true));
+        }
     }
 
     /// Collapse every file when the diff is large (above the configured limits),
@@ -1579,7 +1667,11 @@ impl App {
         self.view = View::Files;
         self.focus = Focus::Body;
         self.sidebar_cursor = file;
-        if let Some(cursor) = self.file_first.get(file).copied().flatten() {
+        // Land on the file's first content line (its header if it has none).
+        let target = self
+            .file_first_line(file)
+            .or_else(|| self.file_first.get(file).copied().flatten());
+        if let Some(cursor) = target {
             self.cursor = cursor.min(self.clines.len().saturating_sub(1));
             self.follow_cursor();
         }
@@ -1636,7 +1728,8 @@ impl App {
                 self.jump_to_file(self.sidebar_cursor)
             }
             KeyCode::Char('o') => self.toggle_fold_at(self.sidebar_cursor),
-            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => self.focus = Focus::Body,
+            KeyCode::Esc => self.focus = Focus::Body,
+            // `h` / Left are a no-op: the sidebar is the outermost level.
             _ => {}
         }
     }
@@ -1848,10 +1941,7 @@ impl App {
 
     /// The index of the thread anchored at the cursor's line, if any.
     fn thread_at_cursor(&self) -> Option<usize> {
-        if self.clines.is_empty() {
-            return None;
-        }
-        let (file, flat) = self.clines[self.cursor];
+        let (file, flat) = self.cursor_content()?;
         let (hi, li) = self.flats[file][flat];
         let line = &self.diff.files[file].hunks[hi].lines[li];
         let path = self.diff.files[file].display_path();
@@ -2049,9 +2139,15 @@ impl App {
                 .thread_at_cursor()
                 .map(|idx| self.review.threads[idx].id.clone()),
         };
+        // On a header the cursor has a file but no line; report the file anyway.
+        let file = cursor.as_ref().map(|a| a.path.clone()).or_else(|| {
+            self.clines
+                .get(self.cursor)
+                .map(|&(f, _)| self.diff.files[f].display_path().to_string())
+        });
         ContextInfo {
             view,
-            file: cursor.as_ref().map(|a| a.path.clone()),
+            file,
             side: cursor
                 .as_ref()
                 .map(|a| if a.new_side { Side::New } else { Side::Old }),
@@ -2402,23 +2498,27 @@ impl App {
     fn unified_click(&self, row_index: usize) -> Option<usize> {
         match self.urows[row_index] {
             URow::Line { file, flat } => self.cline_index.get(&(file, flat)).copied(),
+            URow::FileHeader(fi) => self.cline_index.get(&(fi, HEADER)).copied(),
             _ => None,
         }
     }
 
     fn sbs_click(&self, row_index: usize, column: usize) -> Option<usize> {
-        let SRow::Pair { file, old, new } = self.srows[row_index] else {
-            return None;
-        };
-        let left_w = (self.body_width.get().saturating_sub(1)) / 2;
-        let flat = if column < left_w {
-            old
-        } else if column > left_w {
-            new
-        } else {
-            None
-        };
-        flat.and_then(|f| self.cline_index.get(&(file, f)).copied())
+        match self.srows[row_index] {
+            SRow::FileHeader(fi) => self.cline_index.get(&(fi, HEADER)).copied(),
+            SRow::Pair { file, old, new } => {
+                let left_w = (self.body_width.get().saturating_sub(1)) / 2;
+                let flat = if column < left_w {
+                    old
+                } else if column > left_w {
+                    new
+                } else {
+                    None
+                };
+                flat.and_then(|f| self.cline_index.get(&(file, f)).copied())
+            }
+            _ => None,
+        }
     }
 
     // -- navigation -------------------------------------------------------
@@ -3050,10 +3150,9 @@ impl App {
     }
 
     fn cursor_anchor(&self) -> String {
-        if self.clines.is_empty() {
-            return String::new();
-        }
-        let (file, flat) = self.clines[self.cursor];
+        let Some((file, flat)) = self.cursor_content() else {
+            return String::new(); // on a file header
+        };
         let (hi, li) = self.flats[file][flat];
         let line = &self.diff.files[file].hunks[hi].lines[li];
         match (line.new_lineno, line.old_lineno) {
@@ -3069,11 +3168,14 @@ impl App {
         let start = self.scroll.min(self.urows.len());
         let end = (start + area.height as usize).min(self.urows.len());
         let current = self.current_file();
+        let cursor_header = self.cursor_is_header().then_some(current);
         let cursor_row = self.line_urow.get(self.cursor).copied();
         let lines: Vec<TextLine> = (start..end)
             .map(|i| match &self.urows[i] {
                 URow::Spacer => TextLine::from(""),
-                URow::FileHeader(fi) => self.file_header_line(*fi, *fi == current),
+                URow::FileHeader(fi) => {
+                    self.file_header_line(*fi, *fi == current, cursor_header == Some(*fi))
+                }
                 URow::Note(msg) => note_line(msg),
                 URow::HunkHeader(fi, hi) => self.hunk_header_line(*fi, *hi),
                 URow::Line { file, flat } => self.diff_line(*file, *flat, Some(i) == cursor_row),
@@ -3089,6 +3191,7 @@ impl App {
         let right_w = area.width.saturating_sub(divider + left_w);
         let (cursor_file, cursor_flat) = self.clines.get(self.cursor).copied().unwrap_or((0, 0));
         let current = self.current_file();
+        let cursor_header = self.cursor_is_header().then_some(current);
 
         // Clamp the scroll before computing the capacity: `end - start` would
         // underflow (a huge allocation, a "capacity overflow" panic) if the
@@ -3100,7 +3203,9 @@ impl App {
         for i in start..end {
             let line = match &self.srows[i] {
                 SRow::Spacer => TextLine::from(""),
-                SRow::FileHeader(fi) => self.file_header_line(*fi, *fi == current),
+                SRow::FileHeader(fi) => {
+                    self.file_header_line(*fi, *fi == current, cursor_header == Some(*fi))
+                }
                 SRow::Note(msg) => note_line(msg),
                 SRow::HunkHeader(fi, hi) => self.hunk_header_line(*fi, *hi),
                 SRow::Pair { file, old, new } => {
@@ -3166,7 +3271,7 @@ impl App {
         fit(spans, width, base)
     }
 
-    fn file_header_line(&self, fi: usize, is_current: bool) -> TextLine<'static> {
+    fn file_header_line(&self, fi: usize, is_current: bool, is_cursor: bool) -> TextLine<'static> {
         let file = &self.diff.files[fi];
         let (added, removed) = file.line_stats();
         let path = match (&file.old_path, &file.new_path) {
@@ -3189,29 +3294,35 @@ impl App {
             .get()
             .saturating_sub(2 + suffix.chars().count());
         let path = truncate_path_head(&path, budget.max(1));
-        // A chevron shows the fold state; bold/white marks the current file.
+        // A chevron shows the fold state; bold/white marks the current file; a
+        // background fills the row when the cursor rests on this header.
         let chevron = if collapsed { "▸ " } else { "▾ " };
-        let path_style = if is_current {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
+        let base = if is_cursor {
+            Style::default().bg(CURSOR_BG)
         } else {
             Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::BOLD)
+        };
+        let path_style = if is_current {
+            base.fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            base.fg(Color::Gray).add_modifier(Modifier::BOLD)
         };
         let mut spans = vec![
-            TextSpan::styled(chevron, Style::default().fg(Color::Cyan)),
+            TextSpan::styled(chevron, base.fg(Color::Cyan)),
             TextSpan::styled(path, path_style),
             TextSpan::styled(
                 format!("  [{}]", file.status.label()),
-                Style::default().fg(status_color(file.status)),
+                base.fg(status_color(file.status)),
             ),
-            TextSpan::styled(format!("  +{added}"), Style::default().fg(Color::Green)),
-            TextSpan::styled(format!(" -{removed}"), Style::default().fg(Color::Red)),
+            TextSpan::styled(format!("  +{added}"), base.fg(Color::Green)),
+            TextSpan::styled(format!(" -{removed}"), base.fg(Color::Red)),
         ];
         if !badge.is_empty() {
-            spans.push(TextSpan::styled(badge, Style::default().fg(Color::Magenta)));
+            spans.push(TextSpan::styled(badge, base.fg(Color::Magenta)));
+        }
+        if is_cursor {
+            // Pad to the body width so the cursor background fills the row.
+            spans = fit(spans, self.body_width.get(), base);
         }
         TextLine::from(spans)
     }
@@ -4058,6 +4169,13 @@ impl Layouts {
             let file_threads = thread_at.get(file.display_path());
             let mut flat = Vec::new();
             let mut cof = Vec::new();
+
+            // The file header is always a cursor stop (flat = HEADER), so j/k
+            // walks headers and a collapsed or binary file stays navigable.
+            file_first[fi] = Some(clines.len());
+            line_urow.push(header_row);
+            clines.push((fi, HEADER));
+
             if file.binary {
                 urows.push(URow::Note("binary file — contents not shown".to_string()));
             } else if file.hunks.is_empty() {
@@ -4066,19 +4184,12 @@ impl Layouts {
                     file.status.label()
                 )));
             } else if collapsed {
-                // A collapsed file shows only its header. Build the flat list
-                // (cheap) but emit no content rows — so highlighting is skipped —
-                // and add one representative cline mapped to the header, so the
-                // cursor can rest on the file and expand it with `o`.
+                // A collapsed file shows only its header — no content rows (so
+                // highlighting is skipped) and no line cursor stops.
                 for (hi, hunk) in file.hunks.iter().enumerate() {
                     for li in 0..hunk.lines.len() {
                         flat.push((hi, li));
                     }
-                }
-                if !flat.is_empty() {
-                    file_first[fi] = Some(clines.len());
-                    line_urow.push(header_row);
-                    clines.push((fi, 0));
                 }
             } else {
                 for (hi, hunk) in file.hunks.iter().enumerate() {
@@ -4090,9 +4201,6 @@ impl Layouts {
                         .max(hunk.new_start.saturating_add(hunk.new_lines));
                     for li in 0..hunk.lines.len() {
                         let cursor = clines.len();
-                        if file_first[fi].is_none() {
-                            file_first[fi] = Some(cursor);
-                        }
                         line_urow.push(urows.len());
                         urows.push(URow::Line {
                             file: fi,
@@ -4135,6 +4243,10 @@ impl Layouts {
             }
             let header_srow = srows.len();
             srows.push(SRow::FileHeader(fi));
+            // The header cursor stop maps to the header row on the sbs side too.
+            if let Some(header_cline) = file_first[fi] {
+                line_srow[header_cline] = header_srow;
+            }
             let collapsed = collapsed_files.contains(file.display_path());
             if file.binary {
                 srows.push(SRow::Note("binary file — contents not shown".to_string()));
@@ -4144,9 +4256,7 @@ impl Layouts {
                     file.status.label()
                 )));
             } else if collapsed {
-                if let Some(cursor) = file_first[fi] {
-                    line_srow[cursor] = header_srow;
-                }
+                // Header only (already mapped above).
             } else {
                 let file_threads = thread_at.get(file.display_path());
                 let mut flat_counter = 0usize;
@@ -4533,11 +4643,11 @@ mod tests {
         let mut app = sample_app();
         app.mode = Mode::Unified;
         app.collapsed_files.insert("a.rs".to_string());
-        app.relayout_to_file(0);
+        app.relayout_to_file_header(0);
         assert_eq!(
             app.clines.len(),
             1,
-            "one representative cline when collapsed"
+            "only the header cursor stop when collapsed"
         );
         assert_eq!(
             app.urows
@@ -4590,7 +4700,11 @@ mod tests {
         app.auto_collapse_lines = 1_000_000;
         app.maybe_auto_collapse();
         assert_eq!(app.collapsed_files.len(), 3);
-        assert_eq!(app.clines.len(), 3, "one representative cline per file");
+        assert_eq!(
+            app.clines.len(),
+            3,
+            "one header cursor stop per collapsed file"
+        );
     }
 
     #[test]
@@ -4620,6 +4734,64 @@ mod tests {
             layout.placed[0],
             "a present line stays placed even when its file is collapsed"
         );
+    }
+
+    // -- hierarchical navigation (headers as cursor stops, h/l) -------------
+
+    #[test]
+    fn file_headers_are_cursor_stops() {
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        // clines: [a-header, a-line1, a-line2, b-header, b-line1, b-line2].
+        assert!(app.cursor_is_header(), "starts on the first file's header");
+        app.move_cursor(1);
+        assert!(!app.cursor_is_header(), "j steps into the content");
+
+        // With everything collapsed, j/k walks just the headers.
+        app.collapsed_files.insert("a.rs".to_string());
+        app.collapsed_files.insert("b.rs".to_string());
+        app.relayout();
+        assert_eq!(app.clines.len(), 2, "two headers when all collapsed");
+        app.cursor = 0;
+        assert!(app.cursor_is_header());
+        app.move_cursor(1);
+        assert!(app.cursor_is_header());
+        assert_eq!(app.current_file(), 1);
+    }
+
+    #[test]
+    fn l_and_h_move_in_and_out_of_a_file() {
+        let mut app = multi_file_app(&["a.rs"]);
+        app.collapsed_files.insert("a.rs".to_string());
+        app.relayout();
+        app.cursor = 0;
+        assert!(app.cursor_is_header());
+
+        // l expands a collapsed header (cursor stays on the header).
+        app.nav_in();
+        assert!(!app.collapsed_files.contains("a.rs"));
+        assert!(app.cursor_is_header());
+        // l again enters the file's first content line.
+        app.nav_in();
+        assert!(!app.cursor_is_header());
+        assert_eq!(app.current_file(), 0);
+        // h jumps from a line back to its header.
+        app.nav_out();
+        assert!(app.cursor_is_header());
+        // h collapses an expanded header.
+        app.nav_out();
+        assert!(app.collapsed_files.contains("a.rs"));
+    }
+
+    #[test]
+    fn h_on_a_collapsed_header_focuses_the_sidebar_when_shown() {
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        app.sidebar = true;
+        app.body_width.set(120);
+        app.collapsed_files.insert("a.rs".to_string());
+        app.relayout();
+        app.cursor = 0; // a's collapsed header
+        app.nav_out();
+        assert_eq!(app.focus, Focus::Sidebar);
     }
 
     // -- file explorer (sidebar + finder) -----------------------------------
@@ -4746,7 +4918,8 @@ mod tests {
     fn single_line_compose_target_without_selection() {
         let mut app = sample_app();
         app.mode = Mode::Unified;
-        app.cursor = 1; // a.rs new line 2 (an addition)
+        // clines: [header, new line 1, new line 2] — index 2 is the addition.
+        app.cursor = 2;
         let (anchor, target) = app.compose_target().unwrap();
         match anchor {
             Anchor::Line {
@@ -4759,12 +4932,12 @@ mod tests {
 
     #[test]
     fn selection_produces_a_range_anchor_and_clears_on_compose() {
-        let mut app = sample_app(); // a.rs: new 1 (context), new 2 (addition)
+        let mut app = sample_app(); // clines: [header, new 1, new 2]
         app.mode = Mode::Unified;
-        app.cursor = 0;
+        app.cursor = 1; // new line 1 (a content line, not the header)
         app.start_selection();
         assert!(app.selection.is_some());
-        app.move_cursor(1);
+        app.move_cursor(1); // extend to new line 2
         let (anchor, target) = app.compose_target().unwrap();
         match anchor {
             Anchor::Line {
@@ -4791,7 +4964,7 @@ mod tests {
     #[test]
     fn selection_stays_within_one_file() {
         let mut app = multi_file_app(&["a.rs", "b.rs"]);
-        app.cursor = 0; // file a
+        app.cursor = 1; // a content line in file a (index 0 is its header)
         app.start_selection();
         app.cursor = app.clines.len() - 1; // last line, file b
         let (lo, hi) = app.selection_range().unwrap();
@@ -4810,6 +4983,7 @@ mod tests {
     fn esc_cancels_a_selection_instead_of_quitting() {
         let mut app = sample_app();
         app.mode = Mode::Unified;
+        app.cursor = 1; // a content line (not the header)
         app.start_selection();
         assert!(app.selection.is_some());
         app.on_key(KeyCode::Esc, KeyModifiers::NONE);
