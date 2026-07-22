@@ -1612,7 +1612,8 @@ impl App {
                         "Deleting on GitHub",
                         Box::new(move |progress| {
                             progress("deleting comment…");
-                            pr.delete_published(remote_id, review)?;
+                            pr.delete_published(remote_id, review)
+                                .map_err(friendly_github_write_error)?;
                             Ok(JobOutcome::Deleted {
                                 thread_id,
                                 comment_id,
@@ -2840,7 +2841,8 @@ impl App {
                                 "Editing on GitHub",
                                 Box::new(move |progress| {
                                     progress("updating comment…");
-                                    pr.edit_published(remote_id, review, &body)?;
+                                    pr.edit_published(remote_id, review, &body)
+                                        .map_err(friendly_github_write_error)?;
                                     Ok(JobOutcome::Edited {
                                         thread_id: thread,
                                         comment_id: comment,
@@ -4310,8 +4312,22 @@ impl App {
         } else {
             format!("Withdraw your draft thread on {label}?")
         };
+        // A one-line excerpt of the exact comment, so the delete can't misfire on
+        // the wrong one. `None` (a whole-thread draft) points at the root.
+        let excerpt = self
+            .review
+            .threads
+            .get(target.thread)
+            .and_then(|t| t.comments.get(target.comment.unwrap_or(0)))
+            .map(|c| one_line_excerpt(&c.body, 56))
+            .unwrap_or_default();
         let lines = vec![
             TextLine::from(TextSpan::styled(what, Style::default().fg(Color::White))),
+            TextLine::from(""),
+            TextLine::from(TextSpan::styled(
+                format!("“{excerpt}”"),
+                Style::default().fg(Color::Gray),
+            )),
             TextLine::from(""),
             TextLine::from(TextSpan::styled(
                 "y / Enter confirm · any other key cancel",
@@ -5911,6 +5927,36 @@ fn thread_index_label(anchor: &Anchor) -> String {
     }
 }
 
+/// The first line of `body`, trimmed and clipped to `max` characters with a
+/// trailing ellipsis — a compact preview of a comment (e.g. in the delete
+/// confirmation, so the removal can't misfire on the wrong one).
+fn one_line_excerpt(body: &str, max: usize) -> String {
+    let first = body.lines().next().unwrap_or("").trim();
+    if first.chars().count() > max {
+        let clipped: String = first.chars().take(max.saturating_sub(1)).collect();
+        format!("{clipped}…")
+    } else {
+        first.to_string()
+    }
+}
+
+/// Turn a raw `gh` write failure into an actionable status line. A permission
+/// (403) or not-found (404) error on a comment write almost always means the
+/// comment isn't the viewer's own, or `gh` auth has lapsed.
+fn friendly_github_write_error(reason: String) -> String {
+    let low = reason.to_lowercase();
+    if low.contains("403")
+        || low.contains("forbidden")
+        || low.contains("404")
+        || low.contains("not found")
+    {
+        "GitHub refused the write — check the comment is yours and your `gh` auth is current"
+            .to_string()
+    } else {
+        reason
+    }
+}
+
 /// The disposition badge for a comment: `[local]` (subdued — never sent) or
 /// `[draft]` (attention — queued to submit). A published comment has none.
 fn kind_badge(comment: &Comment) -> Option<(&'static str, Color)> {
@@ -7159,6 +7205,26 @@ mod tests {
         assert!(
             app.selected_delete_target().is_none(),
             "nor is it deletable"
+        );
+    }
+
+    #[test]
+    fn excerpt_and_friendly_error_helpers() {
+        assert_eq!(one_line_excerpt("short", 56), "short");
+        assert_eq!(one_line_excerpt("  first line\nsecond", 56), "first line");
+        let clipped = one_line_excerpt(&"x".repeat(100), 10);
+        assert_eq!(clipped.chars().count(), 10, "9 chars plus the ellipsis");
+        assert!(clipped.ends_with('…'));
+
+        assert!(
+            friendly_github_write_error("HTTP 403: Forbidden".into())
+                .contains("check the comment is yours")
+        );
+        assert!(friendly_github_write_error("gh: Not Found (HTTP 404)".into()).contains("auth"));
+        assert_eq!(
+            friendly_github_write_error("network down".into()),
+            "network down",
+            "an unrelated error passes through unchanged"
         );
     }
 
