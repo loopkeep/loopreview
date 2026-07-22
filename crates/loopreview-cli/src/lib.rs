@@ -6,6 +6,8 @@
 
 mod cli;
 mod highlight;
+mod store;
+mod textarea;
 mod ui;
 
 use std::io::{self, IsTerminal};
@@ -59,7 +61,7 @@ fn try_run() -> Result<()> {
         );
     }
 
-    let (source, live_root) = build_source(action)?;
+    let (source, repo_dir) = build_source(action)?;
     let label = source.describe();
     let diff = source
         .load()
@@ -68,13 +70,38 @@ fn try_run() -> Result<()> {
     // Live sources (working tree, ref) auto-refresh unless disabled; the watch
     // root is the repo directory. A watched session opens even when currently
     // empty so changes appear as they land.
-    let watch_root = if no_watch { None } else { live_root };
+    let watch_root = if no_watch { None } else { repo_dir.clone() };
     if watch_root.is_none() && diff.is_empty() {
         println!("No changes to review.");
         return Ok(());
     }
 
-    ui::run(label, diff, source, watch_root, layout_mode(mode))
+    // Review store + author, for git-backed sources. The store is keyed by the
+    // shared git directory so a repo's worktrees share one review.
+    let store = repo_dir
+        .as_deref()
+        .and_then(git::common_dir)
+        .and_then(|common| store::Store::for_repo(&common));
+    let review = store
+        .as_ref()
+        .map(store::Store::load)
+        .transpose()?
+        .unwrap_or_default();
+    let author = repo_dir
+        .as_deref()
+        .and_then(|dir| git::config(dir, "user.name"))
+        .unwrap_or_else(|| "you".to_string());
+
+    ui::run(ui::Session {
+        label,
+        diff,
+        source,
+        watch_root,
+        mode: layout_mode(mode),
+        review,
+        store,
+        author,
+    })
 }
 
 /// Map the CLI layout choice to the UI's layout mode.

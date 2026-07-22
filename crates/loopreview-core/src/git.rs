@@ -105,6 +105,35 @@ pub fn merge_base(dir: &Path, a: &str, b: &str) -> Option<String> {
     (!sha.is_empty()).then_some(sha)
 }
 
+/// Read a git config value (e.g. `user.name`), or `None` when it is unset.
+pub fn config(dir: &Path, key: &str) -> Option<String> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir).args(["config", "--get", key]);
+    let value = run(cmd).ok()?.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// The shared git directory for the repository containing `dir`.
+///
+/// This is the same for every worktree of a repository, so it is a stable
+/// identity for keying per-repo state (like a review store) that should be
+/// shared across a repo's worktrees.
+pub fn common_dir(dir: &Path) -> Option<PathBuf> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir).args(["rev-parse", "--git-common-dir"]);
+    let raw = run(cmd).ok()?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    let absolute = if path.is_absolute() {
+        path
+    } else {
+        dir.join(path)
+    };
+    Some(absolute.canonicalize().unwrap_or(absolute))
+}
+
 /// Append `-- <pathspec>…` to a diff command when a pathspec is given.
 fn append_pathspec(cmd: &mut Command, pathspec: &[String]) {
     if !pathspec.is_empty() {

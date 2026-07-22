@@ -10,9 +10,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -24,12 +25,17 @@ use notify::{RecursiveMode, Watcher};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span as TextSpan};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
-use loopreview_core::{Diff, DiffSource, LineKind, Segment, word_diff};
+use loopreview_core::{
+    Anchor, Comment, Diff, DiffSource, LineKind, Review, Segment, Side, Thread, ThreadState,
+    word_diff,
+};
 
 use crate::highlight::{Highlighter, Span as HlSpan};
+use crate::store::Store;
+use crate::textarea::TextArea;
 
 /// Subtle row tints for changed lines, and the stronger tint for the exact
 /// words that changed within them (readable on a dark terminal).
@@ -65,18 +71,40 @@ pub enum Mode {
     SideBySide,
 }
 
-/// Enter the alternate screen, run the review UI over `diff`, then restore the
-/// terminal. `label` describes the diff's source (shown in the header). When
-/// `watch_root` is set, that directory is watched and `source` reloaded on
-/// change so the view tracks the working tree in real time.
-pub fn run(
-    label: String,
-    diff: Diff,
-    source: Arc<dyn DiffSource + Send + Sync>,
-    watch_root: Option<PathBuf>,
-    mode: Mode,
-) -> Result<()> {
-    let mut app = App::new(label, diff, Highlighter::new());
+/// Everything the review UI needs for one session.
+pub struct Session {
+    /// Human-readable description of the diff source (shown in the header).
+    pub label: String,
+    /// The diff to review.
+    pub diff: Diff,
+    /// The source, for background reloads when watching.
+    pub source: Arc<dyn DiffSource + Send + Sync>,
+    /// The directory to watch, or `None` to not auto-refresh.
+    pub watch_root: Option<PathBuf>,
+    /// The initial layout.
+    pub mode: Mode,
+    /// The review loaded from the store (may be empty).
+    pub review: Review,
+    /// The store to persist comments to, or `None` when unavailable.
+    pub store: Option<Store>,
+    /// The comment author (from `git config user.name`).
+    pub author: String,
+}
+
+/// Enter the alternate screen, run the review UI, then restore the terminal.
+pub fn run(session: Session) -> Result<()> {
+    let Session {
+        label,
+        diff,
+        source,
+        watch_root,
+        mode,
+        review,
+        store,
+        author,
+    } = session;
+
+    let mut app = App::new(label, diff, review, store, author, Highlighter::new());
     app.mode = mode;
     let updates = watch_root.map(|root| spawn_watcher(root, source));
     app.watching = updates.is_some();
@@ -153,7 +181,12 @@ enum URow {
     FileHeader(usize),
     Note(String),
     HunkHeader(usize, usize),
-    Line { file: usize, flat: usize },
+    Line {
+        file: usize,
+        flat: usize,
+    },
+    /// One rendered line of an inline comment thread (thread index, line index).
+    Comment(usize, usize),
     Spacer,
 }
 
@@ -171,9 +204,19 @@ enum SRow {
     Spacer,
 }
 
+/// An in-progress comment being composed.
+struct Compose {
+    /// The text being edited.
+    area: TextArea,
+    /// The anchor the new thread will attach to.
+    anchor: Anchor,
+    /// A short description of the anchored line, for the input header.
+    target: String,
+}
+
 /// A relocatable cursor position: a file path and a line number on one side.
 /// Used to keep the cursor on the same line across a watch reload.
-struct Anchor {
+struct CursorAnchor {
     path: String,
     new_side: bool,
     line: u32,
@@ -225,12 +268,33 @@ struct App {
     watch_error: Option<String>,
     /// When the last watch reload happened, for the brief "updated" flash.
     reloaded_at: Option<Instant>,
+    /// The review (comment threads) loaded from the store.
+    review: Review,
+    /// The store to persist to, or `None` when unavailable.
+    store: Option<Store>,
+    /// The comment author.
+    author: String,
+    /// The active comment composer, when writing.
+    input: Option<Compose>,
+    /// Rendered inline block per thread, index-aligned to `review.threads`.
+    comment_blocks: Vec<Vec<TextLine<'static>>>,
+    /// A transient status message (feedback or error).
+    status: Option<String>,
     quit: bool,
 }
 
 impl App {
-    fn new(label: String, diff: Diff, highlighter: Highlighter) -> App {
-        let layout = Layouts::build(&diff);
+    fn new(
+        label: String,
+        diff: Diff,
+        review: Review,
+        store: Option<Store>,
+        author: String,
+        highlighter: Highlighter,
+    ) -> App {
+        let comment_blocks = build_comment_blocks(&review);
+        let block_lens: Vec<usize> = comment_blocks.iter().map(Vec::len).collect();
+        let layout = Layouts::build(&diff, &review, &block_lens);
         let num_width = digits(layout.max_lineno).max(3);
         let file_count = diff.files.len();
         let cline_index = layout
@@ -261,6 +325,12 @@ impl App {
             body_width: Cell::new(80),
             watching: false,
             watch_error: None,
+            review,
+            store,
+            author,
+            input: None,
+            comment_blocks,
+            status: None,
             reloaded_at: None,
             quit: false,
         }
@@ -275,7 +345,11 @@ impl App {
     ) -> Result<()> {
         while !self.quit {
             // Drain watch messages: apply the newest diff, or record an error.
-            if let Some(rx) = &updates {
+            // Held back while composing so an incoming change can't reshuffle the
+            // diff under the open comment.
+            if self.input.is_none()
+                && let Some(rx) = &updates
+            {
                 let mut latest = None;
                 while let Ok(msg) = rx.try_recv() {
                     match msg {
@@ -308,11 +382,12 @@ impl App {
         Ok(())
     }
 
-    /// Replace the diff with a freshly-loaded one, rebuilding the layout and
-    /// keeping the cursor on the same line when it still exists.
-    fn reload(&mut self, diff: Diff) {
-        let anchor = self.current_anchor();
-        let layout = Layouts::build(&diff);
+    /// Recompute the layout and inline comment blocks from `diff` and the
+    /// current review, replacing derived state. The caller restores the cursor.
+    fn apply_layout(&mut self, diff: Diff) {
+        self.comment_blocks = build_comment_blocks(&self.review);
+        let block_lens: Vec<usize> = self.comment_blocks.iter().map(Vec::len).collect();
+        let layout = Layouts::build(&diff, &self.review, &block_lens);
         self.num_width = digits(layout.max_lineno).max(3);
         self.cline_index = layout
             .clines
@@ -330,7 +405,13 @@ impl App {
         self.hunk_first = layout.hunk_first;
         self.flats = layout.flats;
         self.diff = diff;
+    }
 
+    /// Replace the diff with a freshly-loaded one, keeping the cursor on the
+    /// same line when it still exists.
+    fn reload(&mut self, diff: Diff) {
+        let anchor = self.current_anchor();
+        self.apply_layout(diff);
         self.cursor = anchor
             .and_then(|a| self.find_anchor(&a))
             .unwrap_or(0)
@@ -339,8 +420,16 @@ impl App {
         self.follow_cursor();
     }
 
+    /// Rebuild after the review changed (diff unchanged), keeping the cursor.
+    fn relayout(&mut self) {
+        let diff = std::mem::take(&mut self.diff);
+        self.apply_layout(diff);
+        self.cursor = self.cursor.min(self.clines.len().saturating_sub(1));
+        self.follow_cursor();
+    }
+
     /// The cursor's current line as a relocatable anchor.
-    fn current_anchor(&self) -> Option<Anchor> {
+    fn current_anchor(&self) -> Option<CursorAnchor> {
         if self.clines.is_empty() {
             return None;
         }
@@ -353,7 +442,7 @@ impl App {
         } else {
             line.old_lineno
         }?;
-        Some(Anchor {
+        Some(CursorAnchor {
             path: self.diff.files[file].display_path().to_string(),
             new_side,
             line: number,
@@ -361,7 +450,7 @@ impl App {
     }
 
     /// Find the cursor index of `anchor` in the current diff, if present.
-    fn find_anchor(&self, anchor: &Anchor) -> Option<usize> {
+    fn find_anchor(&self, anchor: &CursorAnchor) -> Option<usize> {
         self.clines.iter().position(|&(file, flat)| {
             let (hi, li) = self.flats[file][flat];
             let line = &self.diff.files[file].hunks[hi].lines[li];
@@ -378,8 +467,14 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // While composing, keys edit the comment (or submit/cancel).
+        if self.input.is_some() {
+            self.on_key_compose(code, mods);
+            return;
+        }
         let ctrl = mods.contains(KeyModifiers::CONTROL);
         let page = self.body_height.get().max(1) as isize;
+        self.status = None;
         match (code, ctrl) {
             (KeyCode::Esc, _) | (KeyCode::Char('q'), false) | (KeyCode::Char('c'), true) => {
                 self.quit = true;
@@ -399,11 +494,110 @@ impl App {
             (KeyCode::Char('}'), false) | (KeyCode::Char(']'), false) => self.goto_hunk(1),
             (KeyCode::Char('{'), false) | (KeyCode::Char('['), false) => self.goto_hunk(-1),
             (KeyCode::Char('v'), false) | (KeyCode::Tab, _) => self.toggle_mode(),
+            (KeyCode::Char('c'), false) => self.start_compose(),
             _ => {}
         }
     }
 
+    /// Route a key while the comment composer is open.
+    fn on_key_compose(&mut self, code: KeyCode, mods: KeyModifiers) {
+        let ctrl = mods.contains(KeyModifiers::CONTROL);
+        match code {
+            KeyCode::Esc => {
+                self.input = None;
+                self.status = Some("comment cancelled".to_string());
+            }
+            KeyCode::Char('s') if ctrl => self.submit_compose(),
+            _ if ctrl => {} // ignore other control combos
+            _ => {
+                if let Some(compose) = self.input.as_mut() {
+                    compose.area.on_key(code);
+                }
+            }
+        }
+    }
+
+    /// Begin composing a comment on the cursor's line.
+    fn start_compose(&mut self) {
+        if self.store.is_none() {
+            self.status = Some("comments need a git repository".to_string());
+            return;
+        }
+        if self.clines.is_empty() {
+            return;
+        }
+        let (file, flat) = self.clines[self.cursor];
+        let (hi, li) = self.flats[file][flat];
+        let f = &self.diff.files[file];
+        let line = &f.hunks[hi].lines[li];
+        let new_side = line.kind != LineKind::Deletion;
+        let side = if new_side { Side::New } else { Side::Old };
+        let number = if new_side {
+            line.new_lineno
+        } else {
+            line.old_lineno
+        }
+        .unwrap_or(0);
+        let commit = if new_side {
+            self.diff.provenance.head.clone()
+        } else {
+            self.diff.provenance.base.clone()
+        };
+        let context = context_snippet(&f.hunks[hi], li);
+        let path = f.display_path().to_string();
+        let target = format!("{path}:{number}");
+        let anchor = Anchor::Line {
+            file: path,
+            side,
+            start: number,
+            end: number,
+            commit,
+            context,
+        };
+        self.input = Some(Compose {
+            area: TextArea::default(),
+            anchor,
+            target,
+        });
+    }
+
+    /// Finish composing: create the thread, save, and show it inline.
+    fn submit_compose(&mut self) {
+        let Some(compose) = self.input.take() else {
+            return;
+        };
+        if compose.area.is_blank() {
+            self.status = Some("comment is empty".to_string());
+            self.input = Some(compose);
+            return;
+        }
+        let comment = Comment {
+            id: generate_id(),
+            author: self.author.clone(),
+            body: compose.area.text().trim_end().to_string(),
+            created_at: now(),
+            remote_id: None,
+        };
+        self.review.threads.push(Thread {
+            id: generate_id(),
+            anchor: compose.anchor,
+            state: ThreadState::Open,
+            comments: vec![comment],
+        });
+        self.status = match &self.store {
+            Some(store) => match store.save(&self.review) {
+                Ok(()) => Some("comment added".to_string()),
+                Err(e) => Some(format!("comment added but not saved: {e:#}")),
+            },
+            None => Some("comment added (not saved)".to_string()),
+        };
+        self.relayout();
+    }
+
     fn on_mouse(&mut self, mouse: MouseEvent) {
+        if self.input.is_some() {
+            return; // the composer owns input
+        }
         match mouse.kind {
             MouseEventKind::ScrollDown => self.scroll_view(3),
             MouseEventKind::ScrollUp => self.scroll_view(-3),
@@ -643,6 +837,38 @@ impl App {
             self.draw_body_unified(f, chunks[1]);
         }
         self.draw_footer(f, chunks[2]);
+
+        if let Some(compose) = &self.input {
+            self.draw_compose(f, compose);
+        }
+    }
+
+    /// The comment-composer modal, overlaid on the body.
+    fn draw_compose(&self, f: &mut Frame, compose: &Compose) {
+        let area = centered_rect(80, 50, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Comment on {} ", compose.target))
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(inner);
+        f.render_widget(
+            Paragraph::new(compose.area.render(Style::default())),
+            rows[0],
+        );
+        f.render_widget(
+            Paragraph::new(TextLine::from(TextSpan::styled(
+                "Ctrl-S submit · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rows[1],
+        );
     }
 
     fn draw_empty(&self, f: &mut Frame, area: Rect) {
@@ -671,6 +897,12 @@ impl App {
             TextSpan::styled(format!("-{} ", stats.deletions), bar.fg(Color::Red)),
             TextSpan::styled(format!("· {layout_label}"), bar.fg(Color::DarkGray)),
         ];
+        if !self.review.is_empty() {
+            spans.push(TextSpan::styled(
+                format!("  💬 {} open", self.review.open_count()),
+                bar.fg(Color::Rgb(120, 160, 220)),
+            ));
+        }
         spans.push(self.watch_indicator(bar));
         f.render_widget(Paragraph::new(TextLine::from(spans)).style(bar), area);
     }
@@ -705,12 +937,16 @@ impl App {
             self.diff.files.len().max(1),
             self.cursor_anchor()
         );
-        let help = "j/k move · n/p file · [ ] hunk · v split · ^d/^u page · q quit";
-        let line = TextLine::from(vec![
-            TextSpan::styled(position, bar.fg(Color::Cyan)),
-            TextSpan::styled(help, bar.fg(Color::DarkGray)),
-        ]);
-        f.render_widget(Paragraph::new(line).style(bar), area);
+        let mut spans = vec![TextSpan::styled(position, bar.fg(Color::Cyan))];
+        if let Some(status) = &self.status {
+            spans.push(TextSpan::styled(status.clone(), bar.fg(Color::Yellow)));
+        } else {
+            spans.push(TextSpan::styled(
+                "j/k move · n/p file · [ ] hunk · c comment · v split · q quit",
+                bar.fg(Color::DarkGray),
+            ));
+        }
+        f.render_widget(Paragraph::new(TextLine::from(spans)).style(bar), area);
     }
 
     fn cursor_anchor(&self) -> String {
@@ -739,6 +975,7 @@ impl App {
                 URow::Note(msg) => note_line(msg),
                 URow::HunkHeader(fi, hi) => self.hunk_header_line(*fi, *hi),
                 URow::Line { file, flat } => self.diff_line(*file, *flat, Some(i) == cursor_row),
+                URow::Comment(t, k) => self.comment_blocks[*t][*k].clone(),
             })
             .collect();
         f.render_widget(Paragraph::new(lines), area);
@@ -1041,6 +1278,103 @@ fn status_color(status: loopreview_core::ChangeStatus) -> Color {
     }
 }
 
+/// The left gutter bar drawn beside an inline comment thread.
+const COMMENT_BAR: Color = Color::Rgb(90, 130, 200);
+
+/// Render each thread's inline block (index-aligned to `review.threads`): a
+/// header naming the author and state, then the root comment's body lines.
+fn build_comment_blocks(review: &Review) -> Vec<Vec<TextLine<'static>>> {
+    let bar = Style::default().fg(COMMENT_BAR);
+    review
+        .threads
+        .iter()
+        .map(|thread| {
+            let mut lines = Vec::new();
+            let author = thread.root().map(|c| c.author.clone()).unwrap_or_default();
+            let mut header = vec![
+                TextSpan::styled("  ▏ ", bar),
+                TextSpan::styled("💬 ", Style::default().fg(Color::Cyan)),
+                TextSpan::styled(
+                    author,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if thread.is_resolved() {
+                header.push(TextSpan::styled(
+                    "  [resolved]",
+                    Style::default().fg(Color::Green),
+                ));
+            }
+            let replies = thread.replies().len();
+            if replies > 0 {
+                header.push(TextSpan::styled(
+                    format!(
+                        "  ({replies} repl{})",
+                        if replies == 1 { "y" } else { "ies" }
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            lines.push(TextLine::from(header));
+            if let Some(root) = thread.root() {
+                for body in root.body.lines() {
+                    lines.push(TextLine::from(vec![
+                        TextSpan::styled("  ▏ ", bar),
+                        TextSpan::styled(body.to_string(), Style::default().fg(Color::Gray)),
+                    ]));
+                }
+            }
+            lines
+        })
+        .collect()
+}
+
+/// The lines around index `li` in `hunk`, saved as an anchor's context snippet.
+fn context_snippet(hunk: &loopreview_core::Hunk, li: usize) -> Vec<String> {
+    let start = li.saturating_sub(2);
+    let end = (li + 3).min(hunk.lines.len());
+    hunk.lines[start..end]
+        .iter()
+        .map(|l| l.content.clone())
+        .collect()
+}
+
+/// Seconds since the Unix epoch.
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A process-unique id combining the current time with a counter.
+fn generate_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!("{}-{}", now(), COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A rectangle centered within `area`, sized as a percentage of it.
+fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
 /// The precomputed layouts and navigation indices for a diff.
 struct Layouts {
     urows: Vec<URow>,
@@ -1055,7 +1389,24 @@ struct Layouts {
 }
 
 impl Layouts {
-    fn build(diff: &Diff) -> Layouts {
+    fn build(diff: &Diff, review: &Review, block_lens: &[usize]) -> Layouts {
+        // Map each line-anchored thread to its file and (side, line) so it can be
+        // shown inline beneath that line in the unified view.
+        let mut thread_at: HashMap<&str, HashMap<(Side, u32), Vec<usize>>> = HashMap::new();
+        for (idx, thread) in review.threads.iter().enumerate() {
+            if let Anchor::Line {
+                file, side, end, ..
+            } = &thread.anchor
+            {
+                thread_at
+                    .entry(file.as_str())
+                    .or_default()
+                    .entry((*side, *end))
+                    .or_default()
+                    .push(idx);
+            }
+        }
+
         let mut urows = Vec::new();
         let mut clines = Vec::new();
         let mut line_urow = Vec::new();
@@ -1071,6 +1422,7 @@ impl Layouts {
                 urows.push(URow::Spacer);
             }
             urows.push(URow::FileHeader(fi));
+            let file_threads = thread_at.get(file.display_path());
             let mut flat = Vec::new();
             let mut cof = Vec::new();
             if file.binary {
@@ -1100,6 +1452,24 @@ impl Layouts {
                         cof.push(cursor);
                         clines.push((fi, flat.len()));
                         flat.push((hi, li));
+
+                        // Insert any comment threads anchored to this line.
+                        if let Some(file_threads) = file_threads {
+                            let line = &hunk.lines[li];
+                            for (side, number) in
+                                [(Side::New, line.new_lineno), (Side::Old, line.old_lineno)]
+                            {
+                                if let Some(n) = number
+                                    && let Some(indices) = file_threads.get(&(side, n))
+                                {
+                                    for &t in indices {
+                                        for k in 0..block_lens[t] {
+                                            urows.push(URow::Comment(t, k));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
