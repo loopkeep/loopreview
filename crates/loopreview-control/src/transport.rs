@@ -8,7 +8,7 @@
 //! framing (one JSON object per line) is the same on both sides via
 //! [`Connection`].
 
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 
 use interprocess::local_socket::traits::{ListenerExt, Stream as _};
 #[cfg(not(windows))]
@@ -81,6 +81,11 @@ pub fn connect(socket: &str) -> Result<Connection<Stream>> {
     Ok(Connection::new(stream))
 }
 
+/// The largest control message accepted, in bytes. A peer that sends a longer
+/// line (or a line with no terminator) is dropped rather than allowed to grow the
+/// read buffer without bound.
+const MAX_LINE_BYTES: u64 = 1 << 20; // 1 MiB
+
 /// A framed JSON-Lines connection over a byte stream.
 ///
 /// Reads buffer through a [`BufReader`]; writes go straight to the underlying
@@ -99,14 +104,23 @@ impl<S: io::Read + io::Write> Connection<S> {
     }
 
     /// Read one message (one line of JSON). Returns [`ControlError::Closed`] when
-    /// the peer hangs up first.
+    /// the peer hangs up first, and [`ControlError::LineTooLong`] when a single
+    /// message exceeds [`MAX_LINE_BYTES`] (so a hostile peer cannot exhaust
+    /// memory with an unterminated line).
     pub fn read<T: DeserializeOwned>(&mut self) -> Result<T> {
-        let mut line = String::new();
-        let read = self.reader.read_line(&mut line)?;
+        let mut buf = Vec::new();
+        let read = (&mut self.reader)
+            .take(MAX_LINE_BYTES)
+            .read_until(b'\n', &mut buf)?;
         if read == 0 {
             return Err(ControlError::Closed);
         }
-        Ok(serde_json::from_str(line.trim_end())?)
+        // The cap was reached without a line terminator: the message is too long.
+        if read as u64 == MAX_LINE_BYTES && buf.last() != Some(&b'\n') {
+            return Err(ControlError::LineTooLong);
+        }
+        // `from_slice` validates UTF-8 and tolerates the trailing newline.
+        Ok(serde_json::from_slice(&buf)?)
     }
 
     /// Write one message as a single line, then flush.
@@ -123,4 +137,63 @@ impl<S: io::Read + io::Write> Connection<S> {
 /// Iterate accepted connections, ignoring individual accept errors.
 pub fn incoming(listener: &Listener) -> impl Iterator<Item = Stream> + '_ {
     listener.incoming().filter_map(std::result::Result::ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Request;
+
+    /// A Read+Write double: reads from a fixed buffer, discards writes.
+    struct Fake {
+        data: io::Cursor<Vec<u8>>,
+    }
+
+    impl io::Read for Fake {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.data.read(buf)
+        }
+    }
+
+    impl io::Write for Fake {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn conn(bytes: Vec<u8>) -> Connection<Fake> {
+        Connection::new(Fake {
+            data: io::Cursor::new(bytes),
+        })
+    }
+
+    #[test]
+    fn reads_a_normal_message() {
+        let mut c = conn(b"{\"op\":\"get\"}\n".to_vec());
+        assert_eq!(c.read::<Request>().unwrap(), Request::Get);
+    }
+
+    #[test]
+    fn empty_stream_reports_closed() {
+        let mut c = conn(Vec::new());
+        assert!(matches!(
+            c.read::<Request>().unwrap_err(),
+            ControlError::Closed
+        ));
+    }
+
+    #[test]
+    fn an_over_length_line_is_rejected() {
+        // A line past the cap with no terminator must not grow the buffer without
+        // bound; it is reported as too long so the connection can be dropped.
+        let big = vec![b'a'; MAX_LINE_BYTES as usize + 16];
+        let mut c = conn(big);
+        assert!(matches!(
+            c.read::<Request>().unwrap_err(),
+            ControlError::LineTooLong
+        ));
+    }
 }

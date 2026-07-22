@@ -21,6 +21,11 @@ pub enum ControlError {
     #[error("the session closed the connection")]
     Closed,
 
+    /// A single message exceeded the maximum line length (a malformed or hostile
+    /// peer); the connection is dropped.
+    #[error("control message too large")]
+    LineTooLong,
+
     /// The session speaks a different protocol version.
     #[error("session speaks protocol {theirs}, this client speaks {ours}")]
     Version {
