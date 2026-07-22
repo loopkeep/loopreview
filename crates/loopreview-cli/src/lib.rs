@@ -55,48 +55,52 @@ fn try_run() -> Result<()> {
         );
     }
 
-    let (source, live) = build_source(action)?;
+    let (source, live_root) = build_source(action)?;
     let label = source.describe();
     let diff = source
         .load()
         .with_context(|| format!("loading diff ({label})"))?;
 
-    // Live sources (working tree, ref) auto-refresh unless disabled. A watched
-    // session opens even when currently empty so changes appear as they land.
-    let watch = live && !no_watch;
-    if !watch && diff.is_empty() {
+    // Live sources (working tree, ref) auto-refresh unless disabled; the watch
+    // root is the repo directory. A watched session opens even when currently
+    // empty so changes appear as they land.
+    let watch_root = if no_watch { None } else { live_root };
+    if watch_root.is_none() && diff.is_empty() {
         println!("No changes to review.");
         return Ok(());
     }
 
-    ui::run(label, diff, source, watch)
+    ui::run(label, diff, source, watch_root)
 }
 
-/// Choose the diff source from the resolved action and the environment, and
-/// report whether it is a live source (one worth watching).
-fn build_source(action: Action) -> Result<(SharedSource, bool)> {
+/// Choose the diff source from the resolved action and the environment. Returns
+/// the directory to watch for a live source, or `None` for a static one.
+fn build_source(action: Action) -> Result<(SharedSource, Option<PathBuf>)> {
     match action {
         // Bare `lr`: a piped patch when stdin is redirected, else the worktree.
         Action::Dispatch => {
             if io::stdin().is_terminal() {
-                Ok((Arc::new(WorktreeSource::new(repo_root()?)), true))
+                let root = repo_root()?;
+                Ok((Arc::new(WorktreeSource::new(root.clone())), Some(root)))
             } else {
-                Ok((Arc::new(StdinPatchSource::new()), false))
+                Ok((Arc::new(StdinPatchSource::new()), None))
             }
         }
         Action::Worktree { staged, pathspec } => {
             reject_piped_stdin_for_diff()?;
-            let source = WorktreeSource::new(repo_root()?)
+            let root = repo_root()?;
+            let source = WorktreeSource::new(root.clone())
                 .staged(staged)
                 .pathspec(pathspec);
-            Ok((Arc::new(source), true))
+            Ok((Arc::new(source), Some(root)))
         }
         Action::Ref { target, pathspec } => {
             reject_piped_stdin_for_diff()?;
-            let source = RefSource::new(repo_root()?, target).pathspec(pathspec);
-            Ok((Arc::new(source), true))
+            let root = repo_root()?;
+            let source = RefSource::new(root.clone(), target).pathspec(pathspec);
+            Ok((Arc::new(source), Some(root)))
         }
-        Action::PatchFile(path) => Ok((Arc::new(FilePatchSource::new(path)), false)),
+        Action::PatchFile(path) => Ok((Arc::new(FilePatchSource::new(path)), None)),
         Action::PatchStdin => {
             if io::stdin().is_terminal() {
                 bail!(
@@ -104,7 +108,7 @@ fn build_source(action: Action) -> Result<(SharedSource, bool)> {
                      (`git diff | lr patch`)."
                 );
             }
-            Ok((Arc::new(StdinPatchSource::new()), false))
+            Ok((Arc::new(StdinPatchSource::new()), None))
         }
         // Handled in try_run before the terminal is touched.
         Action::NotYet(_) => unreachable!("reserved verbs are reported earlier"),

@@ -8,10 +8,11 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -19,6 +20,7 @@ use crossterm::event::{
     MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
+use notify::{RecursiveMode, Watcher};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span as TextSpan};
@@ -46,8 +48,11 @@ const BAR_BG: Color = Color::Rgb(30, 33, 40);
 const SCROLLOFF: usize = 3;
 /// How often the event loop wakes to repaint when idle.
 const POLL_MS: u64 = 200;
-/// How often a watched source is reloaded to pick up changes.
-const WATCH_POLL_MS: u64 = 500;
+/// Quiet period after a filesystem event before a watched source is reloaded,
+/// so a burst of writes coalesces into one refresh.
+const WATCH_DEBOUNCE_MS: u64 = 250;
+/// How long the "updated" flash stays in the header after a watch reload.
+const RELOAD_FLASH_MS: u64 = 900;
 /// At or above this body width, `auto` layout chooses side-by-side.
 const AUTO_SBS_MIN_WIDTH: usize = 160;
 
@@ -62,15 +67,17 @@ enum Mode {
 
 /// Enter the alternate screen, run the review UI over `diff`, then restore the
 /// terminal. `label` describes the diff's source (shown in the header). When
-/// `watch`, `source` is reloaded in the background so the view tracks changes.
+/// `watch_root` is set, that directory is watched and `source` reloaded on
+/// change so the view tracks the working tree in real time.
 pub fn run(
     label: String,
     diff: Diff,
     source: Arc<dyn DiffSource + Send + Sync>,
-    watch: bool,
+    watch_root: Option<PathBuf>,
 ) -> Result<()> {
     let mut app = App::new(label, diff, Highlighter::new());
-    let updates = watch.then(|| spawn_watcher(source));
+    let updates = watch_root.map(|root| spawn_watcher(root, source));
+    app.watching = updates.is_some();
 
     let mut terminal = ratatui::init();
     // Mouse capture is best-effort: the UI is fully usable without it.
@@ -81,18 +88,58 @@ pub fn run(
     result
 }
 
-/// Spawn a thread that reloads `source` on an interval and streams fresh diffs.
-/// It stops when the receiver is dropped (the UI exits). Load errors are
-/// ignored so a transient failure keeps the last good view.
-fn spawn_watcher(source: Arc<dyn DiffSource + Send + Sync>) -> Receiver<Diff> {
+/// A message from the watch thread.
+enum WatchMsg {
+    /// A freshly-loaded diff after a change settled.
+    Reloaded(Diff),
+    /// Watching could not start or stopped; carries the reason to show.
+    Error(String),
+}
+
+/// Watch `root` for changes and reload `source` after each burst settles,
+/// streaming fresh diffs. Event-driven (not polling), so a save reflects
+/// immediately and an idle session costs nothing. The thread and its watcher
+/// stop when the receiver is dropped (the UI exits); a load error is dropped so
+/// the last good view stays put, while a fatal watch-setup error is reported.
+fn spawn_watcher(root: PathBuf, source: Arc<dyn DiffSource + Send + Sync>) -> Receiver<WatchMsg> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
+        let (event_tx, event_rx) = mpsc::channel();
+        let mut watcher = match notify::recommended_watcher(move |res| {
+            let _ = event_tx.send(res);
+        }) {
+            Ok(watcher) => watcher,
+            Err(e) => {
+                let _ = tx.send(WatchMsg::Error(format!("auto-refresh unavailable: {e}")));
+                return;
+            }
+        };
+        if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
+            let _ = tx.send(WatchMsg::Error(format!(
+                "cannot watch {}: {e}",
+                root.display()
+            )));
+            return;
+        }
+
         loop {
-            thread::sleep(Duration::from_millis(WATCH_POLL_MS));
+            // Block for the first change, then coalesce the burst that follows.
+            if event_rx.recv().is_err() {
+                return;
+            }
+            loop {
+                match event_rx.recv_timeout(Duration::from_millis(WATCH_DEBOUNCE_MS)) {
+                    Ok(_) => continue,
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+            // A load error is transient (mid-write, etc.); keep the last good
+            // view and wait for the next change.
             if let Ok(diff) = source.load()
-                && tx.send(diff).is_err()
+                && tx.send(WatchMsg::Reloaded(diff)).is_err()
             {
-                break;
+                return; // UI gone
             }
         }
     });
@@ -170,6 +217,12 @@ struct App {
     scroll: usize,
     body_height: Cell<usize>,
     body_width: Cell<usize>,
+    /// True while a watcher is active (shown as a header indicator).
+    watching: bool,
+    /// A watch-setup error to surface, when auto-refresh could not start.
+    watch_error: Option<String>,
+    /// When the last watch reload happened, for the brief "updated" flash.
+    reloaded_at: Option<Instant>,
     quit: bool,
 }
 
@@ -204,6 +257,9 @@ impl App {
             scroll: 0,
             body_height: Cell::new(20),
             body_width: Cell::new(80),
+            watching: false,
+            watch_error: None,
+            reloaded_at: None,
             quit: false,
         }
     }
@@ -213,19 +269,26 @@ impl App {
     fn event_loop(
         &mut self,
         terminal: &mut DefaultTerminal,
-        updates: Option<Receiver<Diff>>,
+        updates: Option<Receiver<WatchMsg>>,
     ) -> Result<()> {
         while !self.quit {
-            // Apply the newest watched diff, if it differs from what we show.
+            // Drain watch messages: apply the newest diff, or record an error.
             if let Some(rx) = &updates {
                 let mut latest = None;
-                while let Ok(diff) = rx.try_recv() {
-                    latest = Some(diff);
+                while let Ok(msg) = rx.try_recv() {
+                    match msg {
+                        WatchMsg::Reloaded(diff) => latest = Some(diff),
+                        WatchMsg::Error(reason) => {
+                            self.watching = false;
+                            self.watch_error = Some(reason);
+                        }
+                    }
                 }
                 if let Some(diff) = latest
                     && diff != self.diff
                 {
                     self.reload(diff);
+                    self.reloaded_at = Some(Instant::now());
                 }
             }
 
@@ -592,7 +655,7 @@ impl App {
         let stats = self.diff.stats();
         let bar = Style::default().bg(BAR_BG);
         let layout_label = if self.sbs() { "split" } else { "unified" };
-        let line = TextLine::from(vec![
+        let mut spans = vec![
             TextSpan::styled(
                 " loopreview ",
                 bar.fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -605,8 +668,31 @@ impl App {
             TextSpan::styled(format!("+{} ", stats.insertions), bar.fg(Color::Green)),
             TextSpan::styled(format!("-{} ", stats.deletions), bar.fg(Color::Red)),
             TextSpan::styled(format!("· {layout_label}"), bar.fg(Color::DarkGray)),
-        ]);
-        f.render_widget(Paragraph::new(line).style(bar), area);
+        ];
+        spans.push(self.watch_indicator(bar));
+        f.render_widget(Paragraph::new(TextLine::from(spans)).style(bar), area);
+    }
+
+    /// The header's auto-refresh indicator: a live dot, a brief "updated" flash
+    /// on reload, or the reason auto-refresh is off.
+    fn watch_indicator(&self, bar: Style) -> TextSpan<'static> {
+        if let Some(reason) = &self.watch_error {
+            return TextSpan::styled(format!("  ⚠ {reason}"), bar.fg(Color::Yellow));
+        }
+        if !self.watching {
+            return TextSpan::styled("", bar);
+        }
+        let fresh = self
+            .reloaded_at
+            .is_some_and(|at| at.elapsed() < Duration::from_millis(RELOAD_FLASH_MS));
+        if fresh {
+            TextSpan::styled(
+                "  ⟳ updated",
+                bar.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            TextSpan::styled("  ● watching", bar.fg(Color::Green))
+        }
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
