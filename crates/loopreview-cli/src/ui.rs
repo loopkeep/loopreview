@@ -38,8 +38,8 @@ use loopreview_control::protocol::{
 };
 
 use loopreview_core::{
-    Anchor, Comment, Diff, DiffSource, Line, LineKind, Review, Segment, Side, Thread, ThreadState,
-    word_diff,
+    Anchor, Comment, CommentKind, Diff, DiffSource, Line, LineKind, Review, Segment, Side, Thread,
+    ThreadState, word_diff,
 };
 
 use crate::control::{self, UiRequest};
@@ -1470,8 +1470,9 @@ impl App {
         }
     }
 
-    /// The draft thread the selection points at (Conversation: the selected
-    /// thread; Files: the thread at the cursor line), if its root is a draft.
+    /// The thread the selection points at (Conversation: the selected thread;
+    /// Files: the thread at the cursor line), if it is unpublished — a local note
+    /// or a draft the reviewer can withdraw. A published thread cannot be removed.
     fn selected_draft_thread(&self) -> Option<usize> {
         let idx = if self.view == View::Conversation {
             self.selected_thread()?
@@ -1480,7 +1481,7 @@ impl App {
         };
         self.review.threads[idx]
             .root()
-            .is_some_and(|c| c.is_draft())
+            .is_some_and(|c| !c.is_published())
             .then_some(idx)
     }
 
@@ -2421,13 +2422,17 @@ impl App {
         let body = compose.area.text();
         self.status = match compose.kind {
             ComposeKind::New(anchor) => {
-                self.add_thread(anchor, &author, &body);
+                let kind = self.human_new_kind();
+                self.add_thread(anchor, &author, &body, kind);
                 self.persist("comment added")
             }
-            ComposeKind::Reply(thread_id) => match self.add_reply(&thread_id, &author, &body) {
-                Some(_) => self.persist("reply added"),
-                None => Some("the thread is gone".to_string()),
-            },
+            ComposeKind::Reply(thread_id) => {
+                let kind = self.reply_kind(&thread_id);
+                match self.add_reply(&thread_id, &author, &body, kind) {
+                    Some(_) => self.persist("reply added"),
+                    None => Some("the thread is gone".to_string()),
+                }
+            }
         };
         self.relayout();
     }
@@ -2472,7 +2477,13 @@ impl App {
     /// Append a new thread with a single root comment, returning `(thread_id,
     /// comment_id)`. Emits a [`EventKind::Comment`]; the caller persists and
     /// relays out.
-    fn add_thread(&mut self, anchor: Anchor, author: &str, body: &str) -> (String, String) {
+    fn add_thread(
+        &mut self,
+        anchor: Anchor,
+        author: &str,
+        body: &str,
+        kind: CommentKind,
+    ) -> (String, String) {
         let comment_id = generate_id();
         let thread_id = generate_id();
         self.review.threads.push(Thread {
@@ -2485,7 +2496,7 @@ impl App {
                 body: body.trim_end().to_string(),
                 created_at: now(),
                 remote_id: None,
-                kind: loopreview_core::CommentKind::Draft,
+                kind,
             }],
         });
         self.emit(EventKind::Comment, Some(thread_id.clone()));
@@ -2494,7 +2505,13 @@ impl App {
 
     /// Append a reply to `thread_id`, returning the new comment id (or `None`
     /// when the thread is gone). Emits a [`EventKind::Reply`].
-    fn add_reply(&mut self, thread_id: &str, author: &str, body: &str) -> Option<String> {
+    fn add_reply(
+        &mut self,
+        thread_id: &str,
+        author: &str,
+        body: &str,
+        kind: CommentKind,
+    ) -> Option<String> {
         let comment_id = generate_id();
         let thread = self.review.thread_mut(thread_id)?;
         thread.comments.push(Comment {
@@ -2503,10 +2520,39 @@ impl App {
             body: body.trim_end().to_string(),
             created_at: now(),
             remote_id: None,
-            kind: loopreview_core::CommentKind::Draft,
+            kind,
         });
         self.emit(EventKind::Reply, Some(thread_id.to_string()));
         Some(comment_id)
+    }
+
+    /// The kind for a new human-authored comment: a note in a local review (never
+    /// sent), a draft in a pull request (queued for submit).
+    fn human_new_kind(&self) -> CommentKind {
+        if self.pr.is_some() {
+            CommentKind::Draft
+        } else {
+            CommentKind::Local
+        }
+    }
+
+    /// The kind a reply inherits: local reviews are all local; on a PR, a reply
+    /// continues its thread — local under a local note, draft under a draft or
+    /// published thread.
+    fn reply_kind(&self, thread_id: &str) -> CommentKind {
+        if self.pr.is_none() {
+            return CommentKind::Local;
+        }
+        let root_local = self
+            .review
+            .thread(thread_id)
+            .and_then(|t| t.root())
+            .is_some_and(|c| c.is_local());
+        if root_local {
+            CommentKind::Local
+        } else {
+            CommentKind::Draft
+        }
     }
 
     // -- control plane (server side; runs on the UI thread) -----------------
@@ -2787,16 +2833,27 @@ impl App {
             commit,
             context,
         };
-        let (thread, comment) = self.add_thread(anchor, &add.author, &add.body);
-        let draft = self.pr.is_some();
+        let kind = self.agent_kind(add.draft);
+        let (thread, comment) = self.add_thread(anchor, &add.author, &add.body, kind);
         let done = self.persist("comment added").unwrap_or_default();
         self.relayout();
         self.status = Some(format!("agent: {done} ({}:{})", add.file, add.line));
         Ok(protocol::CommentResult {
             thread,
             comment,
-            draft,
+            draft: kind == CommentKind::Draft,
         })
+    }
+
+    /// The kind for an agent-authored comment: a local note by default (agents
+    /// converse, they don't queue GitHub sends), a draft only on a PR with the
+    /// explicit `--draft` flag — so an agent's note is never sent by accident.
+    fn agent_kind(&self, draft: bool) -> CommentKind {
+        if self.pr.is_some() && draft {
+            CommentKind::Draft
+        } else {
+            CommentKind::Local
+        }
     }
 
     /// Reply to a thread (a control-plane `comment reply`).
@@ -2807,17 +2864,19 @@ impl App {
         if self.store.is_none() && self.pr.is_none() {
             return Err("comments need a git repository or a pull request".to_string());
         }
+        // An agent's reply is a local note unless it passes --draft (agents don't
+        // queue GitHub sends implicitly, even under a draft thread).
+        let kind = self.agent_kind(reply.draft);
         let comment = self
-            .add_reply(&reply.thread, &reply.author, &reply.body)
+            .add_reply(&reply.thread, &reply.author, &reply.body, kind)
             .ok_or_else(|| format!("no thread {}", reply.thread))?;
-        let draft = self.pr.is_some();
         let done = self.persist("reply added").unwrap_or_default();
         self.relayout();
         self.status = Some(format!("agent: {done}"));
         Ok(protocol::CommentResult {
             thread: reply.thread,
             comment,
-            draft,
+            draft: kind == CommentKind::Draft,
         })
     }
 
@@ -5902,6 +5961,7 @@ mod tests {
             line: 2,
             body: "look here".into(),
             author: "agent".into(),
+            draft: false,
         }));
         match response {
             Response::Ok(Reply::Comment(result)) => {
@@ -5926,6 +5986,7 @@ mod tests {
             line: 2,
             body: "note".into(),
             author: "agent".into(),
+            draft: false,
         }));
         let thread_id = match add {
             Response::Ok(Reply::Comment(r)) => r.thread,
@@ -5977,6 +6038,7 @@ mod tests {
             line: 2,
             body: "note".into(),
             author: "me".into(),
+            draft: false,
         }));
         app.view = View::Conversation;
         app.conv_cursor = 0;
@@ -5994,7 +6056,12 @@ mod tests {
         app.pr = Some(Arc::new(crate::prsync::PrHandle::for_test(1, "t")));
         app.pr_key = Some("owner/repo#1".into());
         // A draft thread, saved into the PR draft store.
-        let (tid, _) = app.add_thread(Anchor::line("a.rs", Side::New, 2), "me", "note");
+        let (tid, _) = app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "me",
+            "note",
+            CommentKind::Draft,
+        );
         app.save_pr_drafts().unwrap();
         let key = "owner/repo#1";
         assert!(!app.pr_drafts().is_empty());
@@ -6036,7 +6103,12 @@ mod tests {
         let mut app = sample_app();
         app.pr = Some(Arc::new(crate::prsync::PrHandle::for_test(1, "t")));
         app.pr_key = Some("owner/repo#1".into());
-        let (tid, _) = app.add_thread(Anchor::line("a.rs", Side::New, 2), "me", "root");
+        let (tid, _) = app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "me",
+            "root",
+            CommentKind::Draft,
+        );
         // The root publishes, but one reply failed to post.
         app.apply_submitted(crate::prsync::Submitted {
             published: vec![(tid, "PRRC_1".into())],
@@ -6050,6 +6122,72 @@ mod tests {
         );
     }
 
+    fn pr_app() -> App {
+        let mut app = sample_app();
+        app.pr = Some(Arc::new(crate::prsync::PrHandle::for_test(1, "t")));
+        app.pr_key = Some("owner/repo#1".into());
+        app
+    }
+
+    fn add(app: &mut App, line: u32, draft: bool) {
+        app.handle_control(Request::CommentAdd(protocol::CommentAdd {
+            file: "a.rs".into(),
+            side: Side::New,
+            line,
+            body: "n".into(),
+            author: "agent".into(),
+            draft,
+        }));
+    }
+
+    #[test]
+    fn agent_comments_default_to_local_unless_draft() {
+        // A working-tree review: an agent comment is a local note.
+        let mut local = sample_app();
+        add(&mut local, 2, false);
+        assert!(local.review.threads[0].root().unwrap().is_local());
+
+        // On a PR: still local by default (never sent by accident)...
+        let mut pr = pr_app();
+        add(&mut pr, 2, false);
+        assert!(
+            pr.review.threads[0].root().unwrap().is_local(),
+            "agent default is local even on a PR"
+        );
+        // ...unless it passes --draft, which queues it for submit.
+        add(&mut pr, 1, true);
+        assert!(
+            pr.review.threads[1].root().unwrap().is_draft(),
+            "--draft queues the comment"
+        );
+    }
+
+    #[test]
+    fn human_new_is_draft_on_a_pr_and_replies_inherit() {
+        // A human's new comment: a note locally, a draft on a PR.
+        assert!(matches!(sample_app().human_new_kind(), CommentKind::Local));
+        let mut pr = pr_app();
+        assert!(matches!(pr.human_new_kind(), CommentKind::Draft));
+        // A reply inherits its thread: local under a local note, draft otherwise.
+        let mk = |id: &str, kind: CommentKind| Thread {
+            id: id.into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: format!("{id}c"),
+                author: "a".into(),
+                body: "b".into(),
+                created_at: 0,
+                remote_id: None,
+                kind,
+            }],
+        };
+        pr.review.threads.push(mk("loc", CommentKind::Local));
+        pr.review.threads.push(mk("drf", CommentKind::Draft));
+        assert!(matches!(pr.reply_kind("loc"), CommentKind::Local));
+        assert!(matches!(pr.reply_kind("drf"), CommentKind::Draft));
+    }
+
     #[test]
     fn control_comment_add_rejects_a_line_not_in_the_diff() {
         let mut app = sample_app();
@@ -6059,6 +6197,7 @@ mod tests {
             line: 99,
             body: "x".into(),
             author: "agent".into(),
+            draft: false,
         }));
         assert!(matches!(response, Response::Error(_)));
         assert!(app.review.threads.is_empty());
@@ -6147,6 +6286,7 @@ mod tests {
             line: 1,
             body: "note".into(),
             author: "agent".into(),
+            draft: false,
         }));
         match app.handle_control(Request::Review {
             include_patch: true,

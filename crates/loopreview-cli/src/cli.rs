@@ -245,9 +245,14 @@ pub enum CommentAction {
         /// The comment body (markdown).
         #[arg(long)]
         body: String,
-        /// The comment author (required; agent comments are attributed).
+        /// The comment author. Name yourself with a stable identifier (a model
+        /// or role name); omitted, it defaults to `agent`.
         #[arg(long)]
-        author: String,
+        author: Option<String>,
+        /// Queue as a draft to submit (pull requests only). Without it an agent
+        /// comment is a local note that is never sent to GitHub.
+        #[arg(long)]
+        draft: bool,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
@@ -262,9 +267,12 @@ pub enum CommentAction {
         /// The reply body (markdown).
         #[arg(long)]
         body: String,
-        /// The reply author.
+        /// The reply author (defaults to `agent`).
         #[arg(long)]
-        author: String,
+        author: Option<String>,
+        /// Queue this reply as a draft to submit (pull requests only).
+        #[arg(long)]
+        draft: bool,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
@@ -580,7 +588,7 @@ mod tests {
                 } => {
                     assert_eq!(file, "a.rs");
                     assert_eq!(line, 10);
-                    assert_eq!(author, "agent");
+                    assert_eq!(author.as_deref(), Some("agent"));
                     assert_eq!(side, LineSide::New);
                 }
                 other => panic!("expected comment add, got {other:?}"),

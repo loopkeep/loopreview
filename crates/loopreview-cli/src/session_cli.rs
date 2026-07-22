@@ -190,6 +190,7 @@ fn comment(action: CommentAction) -> Result<()> {
             line,
             body,
             author,
+            draft,
             json,
         } => {
             let request = Request::CommentAdd(protocol::CommentAdd {
@@ -197,7 +198,8 @@ fn comment(action: CommentAction) -> Result<()> {
                 side: core_side(side),
                 line,
                 body,
-                author,
+                author: author.unwrap_or_else(|| "agent".to_string()),
+                draft,
             });
             let Reply::Comment(result) = call(&target, request)? else {
                 bail!("unexpected reply");
@@ -214,12 +216,14 @@ fn comment(action: CommentAction) -> Result<()> {
             thread,
             body,
             author,
+            draft,
             json,
         } => {
             let request = Request::CommentReply(protocol::CommentReply {
                 thread,
                 body,
-                author,
+                author: author.unwrap_or_else(|| "agent".to_string()),
+                draft,
             });
             let Reply::Comment(result) = call(&target, request)? else {
                 bail!("unexpected reply");

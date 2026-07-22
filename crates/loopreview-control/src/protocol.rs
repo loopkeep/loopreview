@@ -81,8 +81,13 @@ pub struct CommentAdd {
     pub line: u32,
     /// The comment body (markdown).
     pub body: String,
-    /// The comment author (required; agent comments are attributed).
+    /// The comment author (agent comments are attributed; the CLI defaults an
+    /// omitted author to `agent`).
     pub author: String,
+    /// Queue this as a draft to submit (pull requests only). Agent comments are
+    /// local notes by default and are never sent to GitHub without this.
+    #[serde(default)]
+    pub draft: bool,
 }
 
 /// Reply to an existing thread by id.
@@ -94,6 +99,9 @@ pub struct CommentReply {
     pub body: String,
     /// The reply author.
     pub author: String,
+    /// Queue this reply as a draft to submit (pull requests only).
+    #[serde(default)]
+    pub draft: bool,
 }
 
 /// Resolve or reopen a thread.
@@ -462,11 +470,13 @@ mod tests {
                 line: 3,
                 body: "look here".into(),
                 author: "agent".into(),
+                draft: true,
             }),
             Request::CommentReply(CommentReply {
                 thread: "t1".into(),
                 body: "and here".into(),
                 author: "agent".into(),
+                draft: false,
             }),
             Request::CommentResolve(CommentResolve {
                 thread: "t1".into(),
