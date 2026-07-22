@@ -220,6 +220,8 @@ enum SRow {
         old: Option<usize>,
         new: Option<usize>,
     },
+    /// One rendered line of an inline comment thread (thread index, line index).
+    Comment(usize, usize),
     Spacer,
 }
 
@@ -1421,6 +1423,7 @@ impl App {
                     spans.extend(self.sbs_cell(*file, *new, true, right_cursor, right_w as usize));
                     TextLine::from(spans)
                 }
+                SRow::Comment(t, k) => self.comment_blocks[*t][*k].clone(),
             };
             lines.push(line);
         }
@@ -2064,44 +2067,59 @@ impl Layouts {
                     file.status.label()
                 )));
             } else {
+                let file_threads = thread_at.get(file.display_path());
                 let mut flat_counter = 0usize;
                 for (hi, hunk) in file.hunks.iter().enumerate() {
                     srows.push(SRow::HunkHeader(fi, hi));
+                    // Collect the old|new pairs for this hunk, then emit them with
+                    // any inline comments beneath each.
                     let mut dels = Vec::new();
                     let mut adds = Vec::new();
+                    let mut pairs: Vec<(Option<usize>, Option<usize>)> = Vec::new();
                     for line in &hunk.lines {
                         let flat = flat_counter;
                         flat_counter += 1;
                         match line.kind {
                             LineKind::Context => {
-                                flush_block(
-                                    fi,
-                                    &mut dels,
-                                    &mut adds,
-                                    &mut srows,
-                                    &mut line_srow,
-                                    &cursor_of,
-                                );
-                                let row = srows.len();
-                                srows.push(SRow::Pair {
-                                    file: fi,
-                                    old: Some(flat),
-                                    new: Some(flat),
-                                });
-                                line_srow[cursor_of[fi][flat]] = row;
+                                flush_block(&mut dels, &mut adds, &mut pairs);
+                                pairs.push((Some(flat), Some(flat)));
                             }
                             LineKind::Deletion => dels.push(flat),
                             LineKind::Addition => adds.push(flat),
                         }
                     }
-                    flush_block(
-                        fi,
-                        &mut dels,
-                        &mut adds,
-                        &mut srows,
-                        &mut line_srow,
-                        &cursor_of,
-                    );
+                    flush_block(&mut dels, &mut adds, &mut pairs);
+
+                    for (old, new) in pairs {
+                        let row = srows.len();
+                        srows.push(SRow::Pair { file: fi, old, new });
+                        if let Some(of) = old {
+                            line_srow[cursor_of[fi][of]] = row;
+                        }
+                        if let Some(nf) = new {
+                            line_srow[cursor_of[fi][nf]] = row;
+                        }
+                        if let Some(threads) = file_threads {
+                            for (side, flat_opt) in [(Side::New, new), (Side::Old, old)] {
+                                let Some(f) = flat_opt else { continue };
+                                let (chi, cli) = flats[fi][f];
+                                let cline = &file.hunks[chi].lines[cli];
+                                let number = match side {
+                                    Side::New => cline.new_lineno,
+                                    Side::Old => cline.old_lineno,
+                                };
+                                if let Some(n) = number
+                                    && let Some(indices) = threads.get(&(side, n))
+                                {
+                                    for &t in indices {
+                                        for k in 0..block_lens[t] {
+                                            srows.push(SRow::Comment(t, k));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2121,28 +2139,16 @@ impl Layouts {
     }
 }
 
-/// Emit side-by-side rows for a change block, pairing deletions with additions
-/// positionally and recording each line's row.
+/// Pair a change block's deletions with additions positionally into old|new
+/// pairs (a surplus on either side pairs with `None`).
 fn flush_block(
-    file: usize,
     dels: &mut Vec<usize>,
     adds: &mut Vec<usize>,
-    srows: &mut Vec<SRow>,
-    line_srow: &mut [usize],
-    cursor_of: &[Vec<usize>],
+    pairs: &mut Vec<(Option<usize>, Option<usize>)>,
 ) {
     let n = dels.len().max(adds.len());
     for k in 0..n {
-        let old = dels.get(k).copied();
-        let new = adds.get(k).copied();
-        let row = srows.len();
-        srows.push(SRow::Pair { file, old, new });
-        if let Some(of) = old {
-            line_srow[cursor_of[file][of]] = row;
-        }
-        if let Some(nf) = new {
-            line_srow[cursor_of[file][nf]] = row;
-        }
+        pairs.push((dels.get(k).copied(), adds.get(k).copied()));
     }
     dels.clear();
     adds.clear();
