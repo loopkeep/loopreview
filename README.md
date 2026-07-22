@@ -21,6 +21,16 @@ unified/side-by-side, and `q` to quit. The mouse wheel scrolls and a click moves
 the cursor. Working-tree and ref views refresh automatically as files change
 (pass `--no-watch` to disable).
 
+## Reviewing
+
+Press `c` on any line to leave a comment (markdown, multi-line); `r` replies to a
+thread on the cursor's line and `x` resolves it. Comments show inline under their
+line and persist to a per-repository store under your config directory, shared
+across the repo's worktrees. Once a review has threads, `Tab` opens a
+Conversation view listing every thread — root comment, replies, and relative
+times — where `r`/`x` also work and `X` closes (deletes) the review. Comments are
+authored as your `git config user.name`.
+
 ## Development
 
 The workspace has two crates: `loopreview-core` (the diff model and source
