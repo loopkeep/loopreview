@@ -78,10 +78,11 @@ lr update           # download and install the latest release
 lr update --check   # only report whether a newer release exists
 ```
 
-`lr update` replaces the running binary (and its `lr` alias) with the latest
-matching your platform, verifying the download's checksum first; on Windows the
-previous executable is swept on the next launch. A build from source or a
-package manager updates through that channel instead.
+`lr update` replaces both installed binaries (`loopreview` and its `lr` alias)
+with the latest build for your platform, verifying the download's sha256 checksum
+first; on Windows the previous executable is swept on the next launch. Installed
+from source or a package manager, update through that channel instead — after a
+`cargo install`, re-run it (`cargo install --path .`).
 
 ## Quickstart
 
@@ -142,10 +143,12 @@ files from a working-tree review.
 
 The sidebar and the diff are framed side by side; the pane holding focus has an
 accent-colored frame, and the inactive pane's cursor dims — so it is always
-clear where your keys will land. Files are grouped under dim directory headers
-(root files first, headerless), each row led by a colored change-status glyph
-(`A`/`D`/`M`/`R`/`C`). Headers are labels only — the cursor and clicks land on
-files. Pin a fixed width with the `sidebar_width` config key.
+clear where your keys will land. Each file row carries a change-status letter
+(`A`/`D`/`M`/`R`/`C` — added, deleted, modified, renamed, copied), its name, and
+its `+`/`−` line counts (plus a badge when it has comments); files are grouped
+under dim directory header rows (root files first, without a header). The header
+rows are labels only — the cursor and clicks land on files. Pin a fixed width
+with the `sidebar_width` config key.
 
 | Key | Action |
 | --- | --- |
@@ -251,10 +254,20 @@ A full `SKILL.md` — the workflow and etiquette an agent needs to drive a revie
 is published to [`loopkeep/skills`](https://github.com/loopkeep/skills). Install
 it into an agent with `npx skills add loopkeep/skills -s loopreview-session`.
 
-The same `lr session` control plane is what higher-level tooling uses to run a
-review beside your agents — including a plugin for **herdr**, a terminal
-multiplexer for coding agents, which opens and steers a loopreview session in
-its own pane.
+The same `lr session` control plane is what higher-level tooling builds on. One
+example is
+[`herdr-plugin-loopreview`](https://github.com/loopkeep/herdr-plugin-loopreview),
+a plugin for [herdr](https://herdr.dev) (a terminal multiplexer for coding
+agents): a single popup lists the repository's git worktrees and open GitHub pull
+requests, and picking one opens its diff with `lr` (or `lr pr <ref>`) in a pane
+the plugin reuses — swapping that one pane between targets instead of spawning
+more — and it cleans up throwaway agent worktrees safely. Install it with herdr:
+
+```sh
+herdr plugin install loopkeep/herdr-plugin-loopreview
+```
+
+It leans only on tools you already have — `lr`, `gh`, `git`, and `herdr`.
 
 ## Configuration
 
@@ -303,8 +316,10 @@ loopreview keeps a deliberately small footprint at runtime:
 - **`git`** — the only requirement for reviewing diffs (worktree, ref, or a
   piped/saved patch). No library binding; loopreview shells out to `git`.
 - **`gh`** — the GitHub CLI, needed only for the pull-request features
-  (`lr pr`, submit, resolve, and editing your own published comments). It must
-  be installed and authenticated; loopreview never handles a token itself.
+  (`lr pr`, submitting a review, resolving a published thread, and editing your
+  own published comments). Install it and run `gh auth login`; loopreview never
+  handles a token itself. Local reviews need none of this — every local-review
+  feature works with `git` alone.
 
 The binary itself is self-contained — syntax highlighting, the control-plane
 socket, and the self-updater are all built in. Notable libraries: `ratatui` and
