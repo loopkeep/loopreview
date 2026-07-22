@@ -112,6 +112,7 @@ fn try_run() -> Result<()> {
         store,
         author,
         split_min_width: config::Config::load().split_min_width,
+        repo_dir,
         loader: None,
     })
 }
@@ -127,6 +128,7 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
     // after the pull (the same merge the refresh action uses).
     let common = git::common_dir(&dir);
     let store = common.as_deref().and_then(store::Store::for_repo);
+    let session_dir = Some(dir.clone());
     let draft_common = common;
     let loader: ui::Loader = Box::new(move |progress| {
         let (handle, label, diff, threads) = prsync::fetch(dir, pr_query, progress)?;
@@ -160,6 +162,7 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
         store,
         author,
         split_min_width: config::Config::load().split_min_width,
+        repo_dir: session_dir,
         loader: Some(loader),
     })
 }

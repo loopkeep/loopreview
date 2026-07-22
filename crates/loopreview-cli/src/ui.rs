@@ -8,7 +8,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -102,6 +102,9 @@ pub struct Session {
     pub author: String,
     /// Minimum body width for `auto` layout to choose side-by-side.
     pub split_min_width: usize,
+    /// The repository directory, for reconstructing outdated comment lines from
+    /// history (`git show <commit>:<path>`). `None` for patch sources.
+    pub repo_dir: Option<PathBuf>,
     /// A background loader (used by `lr pr`): when present, the UI opens on a
     /// spinner and this runs off-thread to produce the diff and threads.
     pub loader: Option<Loader>,
@@ -180,10 +183,19 @@ pub fn run(session: Session) -> Result<()> {
         store,
         author,
         split_min_width,
+        repo_dir,
         loader,
     } = session;
 
-    let mut app = App::new(label, diff, review, store, author, Highlighter::new());
+    let mut app = App::new(
+        label,
+        diff,
+        review,
+        store,
+        author,
+        Highlighter::new(),
+        repo_dir,
+    );
     app.mode = mode;
     app.split_min_width = split_min_width;
     if let Some(loader) = loader {
@@ -430,6 +442,8 @@ struct App {
     pr: Option<Arc<PrHandle>>,
     /// The store key for the current PR's drafts (`owner/repo#number`).
     pr_key: Option<String>,
+    /// The repo directory, for reconstructing outdated lines from history.
+    repo_dir: Option<PathBuf>,
     /// Repaint tick, for the spinner animation.
     tick: usize,
     /// A transient status message (feedback or error).
@@ -445,6 +459,7 @@ impl App {
         store: Option<Store>,
         author: String,
         highlighter: Highlighter,
+        repo_dir: Option<PathBuf>,
     ) -> App {
         let collapsed = HashSet::new();
         let comment_blocks = build_comment_blocks(&review, &highlighter, &collapsed);
@@ -457,6 +472,7 @@ impl App {
             &highlighter,
             &outdated,
             &collapsed,
+            repo_dir.as_deref(),
         );
         let num_width = digits(layout.max_lineno).max(3);
         let file_count = diff.files.len();
@@ -506,6 +522,7 @@ impl App {
             job: None,
             pr: None,
             pr_key: None,
+            repo_dir,
             tick: 0,
             status: None,
             reloaded_at: None,
@@ -834,6 +851,7 @@ impl App {
             &self.highlighter,
             &outdated,
             &self.collapsed,
+            self.repo_dir.as_deref(),
         );
         self.conv_cursor = self
             .conv_cursor
@@ -2438,12 +2456,14 @@ fn build_comment_blocks(
 /// Render each thread as a Conversation block (index-aligned to
 /// `review.threads`): where it is anchored and its state, then the root comment
 /// and nested replies, each with an author and a relative timestamp.
+#[allow(clippy::too_many_arguments)]
 fn build_conversation(
     review: &Review,
     width: usize,
     highlighter: &Highlighter,
     outdated: &[bool],
     collapsed: &HashSet<String>,
+    repo_dir: Option<&Path>,
 ) -> Vec<Vec<TextLine<'static>>> {
     let now = now();
     review
@@ -2482,14 +2502,21 @@ fn build_conversation(
                 return lines;
             }
 
-            // For an outdated thread, show the context saved at creation so the
-            // reviewer can still see the line it was left on.
-            if is_outdated && let Anchor::Line { context, .. } = &thread.anchor {
-                for snippet in context {
-                    lines.push(TextLine::from(TextSpan::styled(
-                        format!("  │ {snippet}"),
-                        Style::default().fg(Color::Rgb(90, 90, 100)),
-                    )));
+            // For an outdated thread, show the line it was left on: reconstructed
+            // from history (`git show <commit>:<path>`), or the saved snippet.
+            if is_outdated {
+                match reconstruct_outdated(repo_dir, &thread.anchor) {
+                    Some(reconstructed) => lines.extend(reconstructed),
+                    None => {
+                        if let Anchor::Line { context, .. } = &thread.anchor {
+                            for snippet in context {
+                                lines.push(TextLine::from(TextSpan::styled(
+                                    format!("  │ {snippet}"),
+                                    Style::default().fg(Color::Rgb(90, 90, 100)),
+                                )));
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2537,6 +2564,50 @@ fn comment_meta_line(author: &str, created_at: u64, now: u64, reply: bool) -> Te
             Style::default().fg(Color::DarkGray),
         ),
     ])
+}
+
+/// Reconstruct the lines around an outdated thread's anchor from history:
+/// `git show <commit>:<path>`, a few lines either side of the anchored line.
+/// Returns `None` when there is no commit/repo or the file can't be read.
+fn reconstruct_outdated(
+    repo_dir: Option<&Path>,
+    anchor: &Anchor,
+) -> Option<Vec<TextLine<'static>>> {
+    let Anchor::Line {
+        file,
+        commit: Some(commit),
+        start,
+        ..
+    } = anchor
+    else {
+        return None;
+    };
+    let content = loopreview_core::git::show_file(repo_dir?, commit, file)?;
+    let all: Vec<&str> = content.lines().collect();
+    if all.is_empty() {
+        return None;
+    }
+    let center = (*start as usize).saturating_sub(1).min(all.len() - 1);
+    let from = center.saturating_sub(3);
+    let to = (center + 4).min(all.len());
+    let mut out = Vec::with_capacity(to - from);
+    for (offset, text) in all[from..to].iter().enumerate() {
+        let number = from + offset + 1;
+        let is_anchor = number as u32 == *start;
+        let text_style = if is_anchor {
+            Style::default().fg(Color::White).bg(Color::Rgb(52, 46, 28))
+        } else {
+            Style::default().fg(Color::Rgb(120, 120, 130))
+        };
+        out.push(TextLine::from(vec![
+            TextSpan::styled(
+                format!("  {} {number:>4} ", if is_anchor { "▸" } else { " " }),
+                Style::default().fg(Color::DarkGray),
+            ),
+            TextSpan::styled(text.to_string(), text_style),
+        ]));
+    }
+    Some(out)
 }
 
 /// Which threads are outdated: line-anchored, but their line is not in the

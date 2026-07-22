@@ -123,6 +123,15 @@ pub fn merge_base(dir: &Path, a: &str, b: &str) -> Option<String> {
     (!sha.is_empty()).then_some(sha)
 }
 
+/// The contents of `path` at commit `commit` (`git show <commit>:<path>`), or
+/// `None` when it cannot be read (e.g. the file did not exist there).
+pub fn show_file(dir: &Path, commit: &str, path: &str) -> Option<String> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
+        .args(["show", &format!("{commit}:{path}")]);
+    run(cmd).ok()
+}
+
 /// Read a git config value (e.g. `user.name`), or `None` when it is unset.
 pub fn config(dir: &Path, key: &str) -> Option<String> {
     let mut cmd = Command::new("git");
