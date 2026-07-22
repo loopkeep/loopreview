@@ -103,7 +103,7 @@ files from a working-tree review.
 | --- | --- |
 | `j` / `k` (or `↓` / `↑`) | Move the cursor (over file headers and lines) |
 | `l` (or `→`) | Go in: expand a folded file, or move from a header to its first line |
-| `h` (or `←`) | Go out: line → its file header, header → collapse, folded header → sidebar |
+| `h` (or `←`) | Go out: a line jumps to its file header; a header moves focus to the sidebar (fold with `o`) |
 | `Ctrl-D` / `Ctrl-U` | Half-page down / up |
 | `Space` / `PageDown`, `PageUp` | Page down / up |
 | `g` / `G` (or `Home` / `End`) | First / last line |
@@ -116,17 +116,17 @@ files from a working-tree review.
 | `r` | Reply to the thread on the cursor line |
 | `x` | Resolve / reopen that thread |
 | `o` | Fold: expand the current file if collapsed, else fold the thread at the cursor, else collapse the current file |
-| Wheel | Scroll |
-| Click | Move the cursor; a file header folds/unfolds it; a sidebar row opens that file; a tab switches views; the footer's layout indicator (`[unified]`/`[split]`) toggles the layout |
+| Wheel | Scroll the diff (or the sidebar, when the pointer is over it) |
+| Click | Move the cursor; a file header folds/unfolds it; a sidebar row toggles that file (opens it, or collapses an open one); a tab switches views; the footer's layout indicator (`[unified]`/`[split]`) toggles the layout |
 | Drag | Select a line range (then `c` to comment) |
 
 **Sidebar** (focused after `b`)
 
 | Key | Action |
 | --- | --- |
-| `j` / `k` | Select a file |
-| `Enter` (or `l` / `→`) | Open the file (expanding it if collapsed) |
-| `o` | Fold / unfold the selected file |
+| `j` / `k` | Select a file (the list scrolls to follow; wheel also scrolls it) |
+| `Enter` (or `l` / `→`) | Toggle the file: open a collapsed one (jumping the diff to it), or collapse an open one |
+| `o` | Fold / unfold the selected file in place |
 | `Esc` (or `h` / `←`) | Return focus to the diff |
 
 **File finder** (`Ctrl-P`): type to fuzzy-filter; `↑` / `↓` (or `Ctrl-P` / `Ctrl-N`)

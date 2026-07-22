@@ -1667,9 +1667,11 @@ impl App {
         }
     }
 
-    /// `h` in the body: go one level out. On a line, jump to the file's header;
-    /// an expanded header collapses; a collapsed header moves focus to the
-    /// sidebar (when it is showing).
+    /// `h` in the body: go one level out. On a line, jump to the file's own
+    /// header. On a header (folded or expanded alike), move focus to the sidebar
+    /// when it is showing — a no-op otherwise. Folding lives on `o`, a header
+    /// click, and the sidebar's toggle, not on `h`, so the cascade can't strand
+    /// the reviewer away from the sidebar.
     fn nav_out(&mut self) {
         let file = self.current_file();
         if !self.cursor_is_header() {
@@ -1678,19 +1680,8 @@ impl App {
             }
             return;
         }
-        let collapsed = self
-            .diff
-            .files
-            .get(file)
-            .is_some_and(|f| self.collapsed_files.contains(f.display_path()));
-        if collapsed {
-            if self.sidebar_width(self.body_width.get()).is_some() {
-                self.focus = Focus::Sidebar;
-                self.sidebar_cursor = file;
-                self.follow_sidebar();
-            }
-        } else {
-            self.set_file_collapsed(file, Some(true));
+        if self.sidebar_width(self.body_width.get()).is_some() {
+            self.focus_sidebar();
         }
     }
 
@@ -1804,12 +1795,26 @@ impl App {
     fn follow_sidebar(&mut self) {
         let files = self.diff.files.len();
         self.sidebar_cursor = self.sidebar_cursor.min(files.saturating_sub(1));
+        self.reveal_in_sidebar(self.sidebar_cursor);
+    }
+
+    /// Scroll the sidebar's viewport so file index `row` is within it.
+    fn reveal_in_sidebar(&mut self, row: usize) {
         let height = self.body_height.get().max(1);
-        if self.sidebar_cursor < self.sidebar_scroll {
-            self.sidebar_scroll = self.sidebar_cursor;
-        } else if self.sidebar_cursor >= self.sidebar_scroll + height {
-            self.sidebar_scroll = self.sidebar_cursor + 1 - height;
+        if row < self.sidebar_scroll {
+            self.sidebar_scroll = row;
+        } else if row >= self.sidebar_scroll + height {
+            self.sidebar_scroll = row + 1 - height;
         }
+    }
+
+    /// Scroll the sidebar list under the wheel (independent of the selection),
+    /// clamped so the last file stays reachable.
+    fn scroll_sidebar(&mut self, delta: isize) {
+        let files = self.diff.files.len();
+        let height = self.body_height.get().max(1);
+        let max = files.saturating_sub(height) as isize;
+        self.sidebar_scroll = (self.sidebar_scroll as isize + delta).clamp(0, max) as usize;
     }
 
     /// Route a key while the sidebar has focus.
@@ -1834,10 +1839,33 @@ impl App {
                 self.sidebar_cursor = files.saturating_sub(1);
                 self.follow_sidebar();
             }
-            // `l` / Enter open the file; `h` is a no-op (the outermost level).
-            Action::NavIn => self.jump_to_file(self.sidebar_cursor),
+            // `l` / Enter toggle the file (expand + jump, or collapse in place);
+            // `o` is a pure fold toggle; `h` is a no-op (the outermost level).
+            Action::NavIn => self.sidebar_activate(self.sidebar_cursor),
             Action::Fold => self.toggle_fold_at(self.sidebar_cursor),
             _ => {}
+        }
+    }
+
+    /// Activate a file from the sidebar (`l` / Enter / click): a collapsed file
+    /// expands and the body jumps to it (focus follows into the body); an
+    /// already-open file collapses in place, focus staying in the sidebar.
+    fn sidebar_activate(&mut self, file: usize) {
+        if file >= self.diff.files.len() {
+            return;
+        }
+        self.sidebar_cursor = file;
+        let collapsed = self
+            .diff
+            .files
+            .get(file)
+            .is_some_and(|f| self.collapsed_files.contains(f.display_path()));
+        if collapsed {
+            self.jump_to_file(file);
+        } else {
+            self.set_file_collapsed(file, Some(true));
+            self.focus = Focus::Sidebar;
+            self.follow_sidebar();
         }
     }
 
@@ -2548,11 +2576,21 @@ impl App {
             MouseEventKind::ScrollUp if shift => self.hscroll_by(-HSCROLL_STEP),
             MouseEventKind::ScrollRight => self.hscroll_by(HSCROLL_STEP),
             MouseEventKind::ScrollLeft => self.hscroll_by(-HSCROLL_STEP),
-            MouseEventKind::ScrollDown => self.scroll_view(3),
-            MouseEventKind::ScrollUp => self.scroll_view(-3),
+            MouseEventKind::ScrollDown => self.scroll_wheel(mouse.column, mouse.row, 3),
+            MouseEventKind::ScrollUp => self.scroll_wheel(mouse.column, mouse.row, -3),
             MouseEventKind::Down(MouseButton::Left) => self.mouse_down(mouse.column, mouse.row),
             MouseEventKind::Drag(MouseButton::Left) => self.mouse_drag(mouse.column, mouse.row),
             _ => {}
+        }
+    }
+
+    /// A vertical wheel notch scrolls the sidebar list when the pointer is over
+    /// it, otherwise the diff body (hit-tested against the last draw).
+    fn scroll_wheel(&mut self, col: u16, row: u16, delta: isize) {
+        if let Region::Sidebar(_) = hit_region(col, row, self.hit.get()) {
+            self.scroll_sidebar(delta);
+        } else {
+            self.scroll_view(delta);
         }
     }
 
@@ -2634,13 +2672,7 @@ impl App {
                     self.view = View::Conversation;
                 }
             }
-            Region::Sidebar(row) => {
-                let idx = self.sidebar_scroll + row;
-                if idx < self.diff.files.len() {
-                    self.sidebar_cursor = idx;
-                    self.jump_to_file(idx);
-                }
-            }
+            Region::Sidebar(row) => self.sidebar_activate(self.sidebar_scroll + row),
             Region::Content { col, row } => {
                 if let Some(cursor) = self.cline_at_body(col, row) {
                     if self.clines[cursor].1 == HEADER {
@@ -2839,6 +2871,10 @@ impl App {
             self.scroll = (target + margin + 1).saturating_sub(height);
         }
         self.scroll = self.scroll.min(self.rows_len().saturating_sub(height));
+        // Browsing the body scrolls the sidebar to keep the current file in view.
+        if self.focus == Focus::Body {
+            self.reveal_in_sidebar(self.current_file());
+        }
     }
 
     // -- render data ------------------------------------------------------
@@ -5216,6 +5252,7 @@ mod tests {
     #[test]
     fn l_and_h_move_in_and_out_of_a_file() {
         let mut app = multi_file_app(&["a.rs"]);
+        app.sidebar_override = Some(false); // isolate nav from the sidebar
         app.collapsed_files.insert("a.rs".to_string());
         app.relayout();
         app.cursor = 0;
@@ -5232,19 +5269,34 @@ mod tests {
         // h jumps from a line back to its header.
         app.nav_out();
         assert!(app.cursor_is_header());
-        // h collapses an expanded header.
+        // h on a header no longer folds (no sidebar to focus here) — it is `o`
+        // that collapses the file.
         app.nav_out();
-        assert!(app.collapsed_files.contains("a.rs"));
+        assert!(!app.collapsed_files.contains("a.rs"), "h does not collapse");
+        app.toggle_fold();
+        assert!(app.collapsed_files.contains("a.rs"), "o collapses");
     }
 
     #[test]
-    fn h_on_a_collapsed_header_focuses_the_sidebar_when_shown() {
+    fn h_on_a_header_focuses_the_sidebar_when_shown() {
         let mut app = multi_file_app(&["a.rs", "b.rs"]);
         app.sidebar_override = Some(true);
         app.body_width.set(120);
+        app.relayout();
+        // An expanded header: h focuses the sidebar (not fold).
+        app.cursor = 0;
+        assert!(app.cursor_is_header());
+        app.nav_out();
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert!(
+            !app.collapsed_files.contains("a.rs"),
+            "h did not fold the file"
+        );
+        // A collapsed header behaves the same way.
+        app.focus = Focus::Body;
         app.collapsed_files.insert("a.rs".to_string());
         app.relayout();
-        app.cursor = 0; // a's collapsed header
+        app.cursor = 0;
         app.nav_out();
         assert_eq!(app.focus, Focus::Sidebar);
     }
@@ -5366,15 +5418,30 @@ mod tests {
     #[test]
     fn sidebar_toggle_selects_and_jumps() {
         let mut app = multi_file_app(&["a.rs", "b.rs", "c.rs"]);
+        for p in ["a.rs", "b.rs", "c.rs"] {
+            app.collapsed_files.insert(p.to_string());
+        }
+        app.relayout();
         // The sidebar is auto-visible at the test's default width; `b` focuses it.
         app.toggle_sidebar();
         assert_eq!(app.focus, Focus::Sidebar);
         app.sidebar_action(Action::MoveDown);
         app.sidebar_action(Action::MoveDown);
         assert_eq!(app.sidebar_cursor, 2);
+        // l on a collapsed file expands it and jumps the body into it.
         app.sidebar_action(Action::NavIn);
         assert_eq!(app.current_file(), 2);
         assert_eq!(app.focus, Focus::Body);
+        assert!(!app.collapsed_files.contains("c.rs"));
+        // Activating the now-open file again collapses it, focus staying put.
+        app.focus_sidebar();
+        app.sidebar_action(Action::NavIn);
+        assert!(app.collapsed_files.contains("c.rs"));
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar,
+            "collapsing from the sidebar keeps focus there"
+        );
     }
 
     #[test]
@@ -5623,16 +5690,28 @@ mod tests {
     }
 
     #[test]
-    fn mouse_click_in_the_sidebar_opens_the_file() {
+    fn mouse_click_in_the_sidebar_toggles_the_file() {
         let mut app = multi_file_app(&["a.rs", "b.rs", "c.rs"]);
         app.mode = Mode::Unified;
         app.sidebar_override = Some(true);
         app.body_width.set(120);
+        app.collapsed_files.insert("c.rs".to_string());
+        app.relayout();
         app.hit.set(hit(1, 22, None, 0));
-        // Sidebar body row 2 (screen row 3) is the third file.
+        // Sidebar body row 2 (screen row 3) is the third file, collapsed:
+        // clicking it expands and opens the file in the body.
         app.mouse_down(3, 3);
-        assert_eq!(app.current_file(), 2, "a sidebar-row click opens that file");
+        assert_eq!(
+            app.current_file(),
+            2,
+            "a click on a collapsed file opens it"
+        );
         assert_eq!(app.focus, Focus::Body);
+        assert!(!app.collapsed_files.contains("c.rs"));
+        // Clicking the now-open file collapses it, focus moving to the sidebar.
+        app.mouse_down(3, 3);
+        assert!(app.collapsed_files.contains("c.rs"));
+        assert_eq!(app.focus, Focus::Sidebar);
     }
 
     #[test]
@@ -5721,6 +5800,68 @@ mod tests {
         narrow.draw(|f| app.draw(f)).unwrap();
         assert!(app.sidebar_width(50).is_none(), "sidebar hides when narrow");
         assert!(app.sidebar_width(120).is_some(), "sidebar shows when wide");
+    }
+
+    /// Build an app with `n` short files named `fNN.rs`.
+    fn many_file_app(n: usize) -> App {
+        let paths: Vec<String> = (0..n).map(|i| format!("f{i:02}.rs")).collect();
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        multi_file_app(&refs)
+    }
+
+    #[test]
+    fn body_navigation_scrolls_the_sidebar_to_the_current_file() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = many_file_app(40);
+        app.sidebar_override = Some(true);
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap(); // captures body width/height
+        // Jump the body cursor deep into the list; the sidebar must follow.
+        let target = app.file_first[30].expect("file 30 has a header");
+        app.set_cursor(target);
+        assert_eq!(app.current_file(), 30);
+        let h = app.body_height.get();
+        assert!(
+            app.sidebar_scroll <= 30 && 30 < app.sidebar_scroll + h,
+            "the current file is within the sidebar window (scroll={}, height={h})",
+            app.sidebar_scroll,
+        );
+        // A redraw shows that file's sidebar row without panicking.
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let mut shown = String::new();
+        for y in 0..12u16 {
+            for x in 0..24u16 {
+                shown.push_str(buf[(x, y)].symbol());
+            }
+            shown.push('\n');
+        }
+        assert!(
+            shown.contains("f30.rs"),
+            "the current file appears in the sidebar list"
+        );
+    }
+
+    #[test]
+    fn wheel_scrolls_the_sidebar_or_the_body_by_region() {
+        let mut app = many_file_app(40);
+        app.sidebar_override = Some(true);
+        app.body_width.set(120);
+        app.body_height.set(10);
+        app.hit.set(hit(1, 22, None, 0)); // sidebar 22 wide, body below row 1
+        // A wheel notch over the sidebar (col 3) scrolls the sidebar list.
+        app.scroll_wheel(3, 5, 3);
+        assert!(app.sidebar_scroll > 0, "wheel over the sidebar scrolls it");
+        let sidebar_at = app.sidebar_scroll;
+        let body_at = app.scroll;
+        // A wheel notch over the body (col 40) scrolls the body, not the sidebar.
+        app.scroll_wheel(40, 5, 3);
+        assert_eq!(
+            app.sidebar_scroll, sidebar_at,
+            "a body wheel leaves the sidebar where it was"
+        );
+        assert!(app.scroll > body_at, "wheel over the body scrolls the body");
     }
 
     // -- multi-line range selection -----------------------------------------
