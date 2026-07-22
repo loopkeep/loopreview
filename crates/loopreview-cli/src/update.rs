@@ -594,7 +594,10 @@ fn install_one(new: &Path, target: &Path) -> Result<()> {
     let _ = fs::remove_file(&old);
     fs::rename(target, &old).map_err(|e| write_error(dir, target, e))?;
     fs::copy(new, target).map_err(|e| {
-        // Roll back so the user is not left without a binary.
+        // Roll back so the user is not left without a binary. A failed copy can
+        // still leave a partial `target`; remove it first, or the rollback rename
+        // fails on Windows (rename will not overwrite an existing destination).
+        let _ = fs::remove_file(target);
         let _ = fs::rename(&old, target);
         write_error(dir, target, e)
     })?;
