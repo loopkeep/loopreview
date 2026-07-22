@@ -204,13 +204,21 @@ enum SRow {
     Spacer,
 }
 
+/// What a composed comment will become on submit.
+enum ComposeKind {
+    /// A new thread at this anchor.
+    New(Anchor),
+    /// A reply to an existing thread (by id).
+    Reply(String),
+}
+
 /// An in-progress comment being composed.
 struct Compose {
     /// The text being edited.
     area: TextArea,
-    /// The anchor the new thread will attach to.
-    anchor: Anchor,
-    /// A short description of the anchored line, for the input header.
+    /// Whether this starts a new thread or replies to one.
+    kind: ComposeKind,
+    /// A short description shown in the input header.
     target: String,
 }
 
@@ -495,6 +503,8 @@ impl App {
             (KeyCode::Char('{'), false) | (KeyCode::Char('['), false) => self.goto_hunk(-1),
             (KeyCode::Char('v'), false) | (KeyCode::Tab, _) => self.toggle_mode(),
             (KeyCode::Char('c'), false) => self.start_compose(),
+            (KeyCode::Char('r'), false) => self.start_reply(),
+            (KeyCode::Char('x'), false) => self.toggle_resolve(),
             _ => {}
         }
     }
@@ -556,12 +566,66 @@ impl App {
         };
         self.input = Some(Compose {
             area: TextArea::default(),
-            anchor,
+            kind: ComposeKind::New(anchor),
             target,
         });
     }
 
-    /// Finish composing: create the thread, save, and show it inline.
+    /// Begin replying to the thread anchored at the cursor's line.
+    fn start_reply(&mut self) {
+        let Some(idx) = self.thread_at_cursor() else {
+            self.status = Some("no comment on this line to reply to".to_string());
+            return;
+        };
+        let thread = &self.review.threads[idx];
+        let who = thread.root().map(|c| c.author.as_str()).unwrap_or("thread");
+        self.input = Some(Compose {
+            area: TextArea::default(),
+            kind: ComposeKind::Reply(thread.id.clone()),
+            target: format!("reply to {who}"),
+        });
+    }
+
+    /// Toggle the resolved state of the thread anchored at the cursor's line.
+    fn toggle_resolve(&mut self) {
+        let Some(idx) = self.thread_at_cursor() else {
+            self.status = Some("no comment on this line to resolve".to_string());
+            return;
+        };
+        let thread = &mut self.review.threads[idx];
+        thread.state = if thread.is_resolved() {
+            ThreadState::Open
+        } else {
+            ThreadState::Resolved
+        };
+        let resolved = thread.is_resolved();
+        self.status = self.persist(if resolved { "resolved" } else { "reopened" });
+        self.relayout();
+    }
+
+    /// The index of the thread anchored at the cursor's line, if any.
+    fn thread_at_cursor(&self) -> Option<usize> {
+        if self.clines.is_empty() {
+            return None;
+        }
+        let (file, flat) = self.clines[self.cursor];
+        let (hi, li) = self.flats[file][flat];
+        let line = &self.diff.files[file].hunks[hi].lines[li];
+        let path = self.diff.files[file].display_path();
+        for (side, number) in [(Side::New, line.new_lineno), (Side::Old, line.old_lineno)] {
+            if let Some(n) = number
+                && let Some(idx) = self.review.threads.iter().position(|t| {
+                    matches!(&t.anchor, Anchor::Line { file, side: s, end, .. }
+                        if file == path && *s == side && *end == n)
+                })
+            {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Finish composing: create the thread or append the reply, then save.
     fn submit_compose(&mut self) {
         let Some(compose) = self.input.take() else {
             return;
@@ -578,20 +642,36 @@ impl App {
             created_at: now(),
             remote_id: None,
         };
-        self.review.threads.push(Thread {
-            id: generate_id(),
-            anchor: compose.anchor,
-            state: ThreadState::Open,
-            comments: vec![comment],
-        });
-        self.status = match &self.store {
-            Some(store) => match store.save(&self.review) {
-                Ok(()) => Some("comment added".to_string()),
-                Err(e) => Some(format!("comment added but not saved: {e:#}")),
+        self.status = match compose.kind {
+            ComposeKind::New(anchor) => {
+                self.review.threads.push(Thread {
+                    id: generate_id(),
+                    anchor,
+                    state: ThreadState::Open,
+                    comments: vec![comment],
+                });
+                self.persist("comment added")
+            }
+            ComposeKind::Reply(thread_id) => match self.review.thread_mut(&thread_id) {
+                Some(thread) => {
+                    thread.comments.push(comment);
+                    self.persist("reply added")
+                }
+                None => Some("the thread is gone".to_string()),
             },
-            None => Some("comment added (not saved)".to_string()),
         };
         self.relayout();
+    }
+
+    /// Save the review, returning a status message describing the outcome.
+    fn persist(&self, done: &str) -> Option<String> {
+        match &self.store {
+            Some(store) => match store.save(&self.review) {
+                Ok(()) => Some(done.to_string()),
+                Err(e) => Some(format!("{done}, but save failed: {e:#}")),
+            },
+            None => Some(format!("{done} (not saved)")),
+        }
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
@@ -942,7 +1022,7 @@ impl App {
             spans.push(TextSpan::styled(status.clone(), bar.fg(Color::Yellow)));
         } else {
             spans.push(TextSpan::styled(
-                "j/k move · n/p file · [ ] hunk · c comment · v split · q quit",
+                "j/k move · n/p file · c comment · r reply · x resolve · v split · q quit",
                 bar.fg(Color::DarkGray),
             ));
         }
