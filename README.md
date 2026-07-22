@@ -109,6 +109,7 @@ files from a working-tree review.
 | `g` / `G` (or `Home` / `End`) | First / last line |
 | `n` / `p` | Next / previous file |
 | `]` `}` / `[` `{` | Next / previous hunk |
+| `<` / `>` | Scroll the diff content left / right (also Shift+wheel or a trackpad swipe; the gutter stays fixed) |
 | `v` | Toggle unified / side-by-side |
 | `c` | Comment on the cursor line (or the selected range) |
 | `V` | Start / cancel a line-range selection (`j` / `k` to extend, then `c`) |
@@ -224,8 +225,8 @@ written like `j`, `V` (or `shift+v`), `ctrl+p`, `enter`, `esc`, `tab`, `space`,
 an invalid binding is reported at startup with the offending line. Action names:
 `cursor_down`, `cursor_up`, `half_page_down`, `half_page_up`, `top`, `bottom`,
 `next_file`, `prev_file`, `next_hunk`, `prev_hunk`, `nav_in`, `nav_out`,
-`layout_toggle`, `comment`, `reply`, `resolve`, `fold`, `select`, `close_review`,
-`sidebar`, `file_finder`, `refresh`, `submit`.
+`scroll_left`, `scroll_right`, `layout_toggle`, `comment`, `reply`, `resolve`,
+`fold`, `select`, `close_review`, `sidebar`, `file_finder`, `refresh`, `submit`.
 
 ```toml
 split_min_width = 160

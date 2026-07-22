@@ -29,6 +29,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span as TextSpan};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
+use unicode_width::UnicodeWidthChar;
 
 use loopreview_control::events::EventLog;
 use loopreview_control::protocol::{
@@ -63,6 +64,8 @@ const BAR_BG: Color = Color::Rgb(30, 33, 40);
 
 /// Rows of context kept above/below the cursor when scrolling.
 const SCROLLOFF: usize = 3;
+/// Columns moved per horizontal-scroll step.
+const HSCROLL_STEP: isize = 8;
 /// Sidebar width bounds (the minimum diff width kept beside it is configurable).
 const SIDEBAR_MIN: usize = 22;
 const SIDEBAR_MAX: usize = 44;
@@ -616,6 +619,9 @@ struct App {
     drag_anchor: Option<usize>,
     /// Screen geometry from the last draw, for mouse hit-testing.
     hit: Cell<HitLayout>,
+    /// Horizontal scroll offset, in display columns, of the diff content (the
+    /// line-number gutter stays fixed). Reset on a layout switch or file jump.
+    hscroll: usize,
     /// The resolved key bindings (defaults plus config overrides).
     keymap: crate::keys::Keymap,
     /// Selected thread index in the Conversation view.
@@ -726,6 +732,7 @@ impl App {
             selection: None,
             drag_anchor: None,
             hit: Cell::new(HitLayout::default()),
+            hscroll: 0,
             keymap: crate::keys::Keymap::defaults(),
             conv_cursor: 0,
             conv_scroll: 0,
@@ -1311,6 +1318,8 @@ impl App {
             Action::Fold => self.toggle_fold(),
             Action::NavIn => self.nav_in(),
             Action::NavOut => self.nav_out(),
+            Action::ScrollLeft => self.hscroll_by(-HSCROLL_STEP),
+            Action::ScrollRight => self.hscroll_by(HSCROLL_STEP),
             Action::Select => self.start_selection(),
             _ => {}
         }
@@ -1643,6 +1652,7 @@ impl App {
         if collapsed {
             self.set_file_collapsed(file, Some(false));
         } else if let Some(line) = self.file_first_line(file) {
+            self.hscroll = 0; // entering a file resets horizontal scroll
             self.set_cursor(line);
         }
     }
@@ -1745,6 +1755,7 @@ impl App {
         self.view = View::Files;
         self.focus = Focus::Body;
         self.sidebar_cursor = file;
+        self.hscroll = 0; // a file jump resets horizontal scroll
         // Land on the file's first content line (its header if it has none).
         let target = self
             .file_first_line(file)
@@ -2520,7 +2531,13 @@ impl App {
         {
             return; // a modal or a background action owns input
         }
+        let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
         match mouse.kind {
+            // Shift + wheel scrolls horizontally (as does a trackpad's sideways swipe).
+            MouseEventKind::ScrollDown if shift => self.hscroll_by(HSCROLL_STEP),
+            MouseEventKind::ScrollUp if shift => self.hscroll_by(-HSCROLL_STEP),
+            MouseEventKind::ScrollRight => self.hscroll_by(HSCROLL_STEP),
+            MouseEventKind::ScrollLeft => self.hscroll_by(-HSCROLL_STEP),
             MouseEventKind::ScrollDown => self.scroll_view(3),
             MouseEventKind::ScrollUp => self.scroll_view(-3),
             MouseEventKind::Down(MouseButton::Left) => self.mouse_down(mouse.column, mouse.row),
@@ -2534,6 +2551,35 @@ impl App {
         let height = self.body_height.get().max(1);
         let max_scroll = self.rows_len().saturating_sub(height) as isize;
         self.scroll = (self.scroll as isize + delta).clamp(0, max_scroll) as usize;
+    }
+
+    /// Scroll the diff content horizontally, clamped to the current file's widest
+    /// line (the line-number gutter does not move).
+    fn hscroll_by(&mut self, delta: isize) {
+        let max = self.max_content_width().saturating_sub(1) as isize;
+        self.hscroll = (self.hscroll as isize + delta).clamp(0, max) as usize;
+    }
+
+    /// The widest line content, in display columns, of the current file.
+    fn max_content_width(&self) -> usize {
+        let file = self.current_file();
+        self.diff
+            .files
+            .get(file)
+            .map(|f| {
+                f.hunks
+                    .iter()
+                    .flat_map(|h| h.lines.iter())
+                    .map(|l| {
+                        l.content
+                            .chars()
+                            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                            .sum::<usize>()
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
     }
 
     /// Route a left-button press by the region it lands in: a tab switches the
@@ -2655,6 +2701,7 @@ impl App {
         } else {
             Mode::SideBySide
         };
+        self.hscroll = 0; // a layout switch resets horizontal scroll
         self.follow_cursor();
     }
 
@@ -2705,6 +2752,7 @@ impl App {
         if self.clines.is_empty() {
             return;
         }
+        self.hscroll = 0; // a file jump resets horizontal scroll
         let current = self.current_file();
         if dir > 0 {
             if let Some(index) =
@@ -3287,6 +3335,13 @@ impl App {
             ),
             TextSpan::styled(position, bar.fg(Color::Cyan)),
         ];
+        // Horizontal-scroll indicator (only when scrolled and viewing the diff).
+        if self.hscroll > 0 && self.view == View::Files {
+            spans.push(TextSpan::styled(
+                format!("→{} ", self.hscroll),
+                bar.fg(Color::Rgb(120, 160, 220)),
+            ));
+        }
         if let Some(status) = &self.status {
             spans.push(TextSpan::styled(status.clone(), bar.fg(Color::Yellow)));
         } else {
@@ -3415,6 +3470,9 @@ impl App {
         } else {
             line.old_lineno
         };
+        // A fixed gutter (marker + line number + sign), then the content scrolled
+        // horizontally within the remaining width.
+        let gutter_width = self.num_width + 4;
         let mut spans = vec![
             TextSpan::styled(
                 marker.to_string(),
@@ -3426,8 +3484,10 @@ impl App {
             ),
             TextSpan::styled(format!("{sign} "), base.fg(sign_color)),
         ];
-        spans.extend(self.content_spans(file, flat, base, emph_bg));
-        fit(spans, width, base)
+        let content = self.content_spans(file, flat, base, emph_bg);
+        let content_width = width.saturating_sub(gutter_width);
+        spans.extend(clip_spans(&content, self.hscroll, content_width, base));
+        spans
     }
 
     fn file_header_line(&self, fi: usize, is_current: bool, is_cursor: bool) -> TextLine<'static> {
@@ -3684,6 +3744,9 @@ impl App {
         let marker = if is_cursor { "▎" } else { " " };
         let old = optional_number(line.old_lineno, self.num_width);
         let new = optional_number(line.new_lineno, self.num_width);
+        // A fixed gutter (marker + old/new numbers + sign), then the content
+        // scrolled horizontally within the remaining width.
+        let gutter_width = 1 + (2 * self.num_width + 2) + 2;
         let mut spans = vec![
             TextSpan::styled(
                 marker.to_string(),
@@ -3692,7 +3755,9 @@ impl App {
             TextSpan::styled(format!("{old} {new} "), base.fg(Color::DarkGray)),
             TextSpan::styled(format!("{sign} "), base.fg(sign_color)),
         ];
-        spans.extend(self.content_spans(file, flat, base, emph_bg));
+        let content = self.content_spans(file, flat, base, emph_bg);
+        let content_width = self.body_width.get().saturating_sub(gutter_width);
+        spans.extend(clip_spans(&content, self.hscroll, content_width, base));
         TextLine::from(spans)
     }
 
@@ -3837,6 +3902,58 @@ fn truncate_path_head(path: &str, max: usize) -> String {
     }
     let tail: String = path.chars().skip(count - (max - 1)).collect();
     format!("…{tail}")
+}
+
+/// Take the `width` display columns of `spans` starting at column `start`,
+/// padding the end with `fill`. A wide (CJK) character straddling either edge is
+/// replaced by spaces for its visible half, so nothing is cut in the middle.
+/// Widths are measured with `unicode-width`. With `start = 0` this is a
+/// width-aware `fit`; a positive `start` is the horizontal-scroll offset.
+fn clip_spans(
+    spans: &[TextSpan<'static>],
+    start: usize,
+    width: usize,
+    fill: Style,
+) -> Vec<TextSpan<'static>> {
+    let end = start + width;
+    let mut out: Vec<TextSpan<'static>> = Vec::new();
+    let mut col = 0usize;
+    let mut emitted = 0usize;
+    'spans: for span in spans {
+        let mut buf = String::new();
+        for ch in span.content.chars() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let (cs, ce) = (col, col + w);
+            col = ce;
+            if ce <= start {
+                continue; // entirely before the window
+            }
+            if cs >= end {
+                if !buf.is_empty() {
+                    out.push(TextSpan::styled(std::mem::take(&mut buf), span.style));
+                }
+                break 'spans; // entirely past the window
+            }
+            if cs < start || ce > end {
+                // Straddles an edge: pad its visible half with spaces.
+                let visible = ce.min(end) - cs.max(start);
+                for _ in 0..visible {
+                    buf.push(' ');
+                }
+                emitted += visible;
+            } else {
+                buf.push(ch);
+                emitted += w;
+            }
+        }
+        if !buf.is_empty() {
+            out.push(TextSpan::styled(buf, span.style));
+        }
+    }
+    if emitted < width {
+        out.push(TextSpan::styled(" ".repeat(width - emitted), fill));
+    }
+    out
 }
 
 fn fit(spans: Vec<TextSpan<'static>>, width: usize, fill: Style) -> Vec<TextSpan<'static>> {
@@ -4567,6 +4684,56 @@ mod tests {
         assert_eq!(spans[0].content, "foo ");
         assert_eq!(spans[1].content, "qux");
         assert_eq!(spans[1].style.bg, Some(Color::Rgb(1, 2, 3)));
+    }
+
+    #[test]
+    fn clip_spans_offsets_and_pads() {
+        let s = |t: &str| TextSpan::raw(t.to_string());
+        let text = |v: &[TextSpan]| -> String { v.iter().map(|x| x.content.to_string()).collect() };
+        // Offset 2, width 3 of "abcdef" → "cde".
+        assert_eq!(
+            text(&clip_spans(&[s("abcdef")], 2, 3, Style::default())),
+            "cde"
+        );
+        // Past the content pads with spaces.
+        assert_eq!(
+            text(&clip_spans(&[s("abcdef")], 4, 4, Style::default())),
+            "ef  "
+        );
+        // Offset 0 behaves like a width-aware fit.
+        assert_eq!(
+            text(&clip_spans(&[s("ab")], 0, 4, Style::default())),
+            "ab  "
+        );
+    }
+
+    #[test]
+    fn clip_spans_never_cuts_a_wide_char() {
+        // "a漢b": a at col 0, 漢 (width 2) at cols 1–2, b at col 3.
+        let spans = vec![TextSpan::raw("a漢b".to_string())];
+        // Starting at col 2 lands in the middle of 漢: its visible half is padded.
+        let out = clip_spans(&spans, 2, 3, Style::default());
+        let text: String = out.iter().map(|x| x.content.to_string()).collect();
+        assert_eq!(
+            text, " b ",
+            "the split wide char is a space, not half a glyph"
+        );
+    }
+
+    #[test]
+    fn horizontal_scroll_clamps_and_resets_on_jump() {
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        app.mode = Mode::Unified;
+        app.cursor = 1; // a content line in file a
+        app.hscroll_by(100);
+        assert!(app.hscroll > 0);
+        assert!(app.hscroll <= app.max_content_width());
+        // A layout switch and a file jump both reset it.
+        app.toggle_mode();
+        assert_eq!(app.hscroll, 0);
+        app.hscroll = 3;
+        app.goto_file(1);
+        assert_eq!(app.hscroll, 0);
     }
 
     #[test]
