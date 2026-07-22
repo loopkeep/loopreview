@@ -62,11 +62,9 @@ const BAR_BG: Color = Color::Rgb(30, 33, 40);
 
 /// Rows of context kept above/below the cursor when scrolling.
 const SCROLLOFF: usize = 3;
-/// Sidebar width bounds, and the minimum diff width kept beside it (below which
-/// the sidebar auto-hides).
+/// Sidebar width bounds (the minimum diff width kept beside it is configurable).
 const SIDEBAR_MIN: usize = 22;
 const SIDEBAR_MAX: usize = 44;
-const SIDEBAR_MIN_CONTENT: usize = 44;
 /// Background of a selected sidebar / finder row.
 const SEL_BG: Color = Color::Rgb(45, 50, 66);
 /// Background of lines in a range selection (for a multi-line comment).
@@ -147,6 +145,10 @@ pub struct Session {
     pub auto_collapse_files: usize,
     /// A diff with more changed lines than this opens with every file collapsed.
     pub auto_collapse_lines: usize,
+    /// When the file-explorer sidebar is shown by default.
+    pub sidebar_mode: crate::config::SidebarMode,
+    /// Minimum diff width kept beside the sidebar.
+    pub sidebar_min_content: usize,
     /// The repository directory, for reconstructing outdated comment lines from
     /// history (`git show <commit>:<path>`). `None` for patch sources.
     pub repo_dir: Option<PathBuf>,
@@ -232,6 +234,8 @@ pub fn run(session: Session) -> Result<()> {
         split_min_width,
         auto_collapse_files,
         auto_collapse_lines,
+        sidebar_mode,
+        sidebar_min_content,
         repo_dir,
         loader,
         notice,
@@ -250,6 +254,8 @@ pub fn run(session: Session) -> Result<()> {
     app.split_min_width = split_min_width;
     app.auto_collapse_files = auto_collapse_files;
     app.auto_collapse_lines = auto_collapse_lines;
+    app.sidebar_mode = sidebar_mode;
+    app.sidebar_min_content = sidebar_min_content;
     app.status = notice;
     // For a directly-loaded diff (not a background PR load), apply auto-collapse
     // now; the PR path does it in install_loaded once the diff arrives.
@@ -520,8 +526,12 @@ struct App {
     auto_collapse_lines: usize,
     /// The current top-level view.
     view: View,
-    /// Whether the file-explorer sidebar is shown (subject to width).
-    sidebar: bool,
+    /// When the sidebar is shown by default.
+    sidebar_mode: crate::config::SidebarMode,
+    /// A temporary `b` override of the sidebar's visibility; cleared on resize.
+    sidebar_override: Option<bool>,
+    /// Minimum diff width kept beside the sidebar (below which it auto-hides).
+    sidebar_min_content: usize,
     /// Which pane has the keyboard focus.
     focus: Focus,
     /// Selected file index in the sidebar.
@@ -632,7 +642,9 @@ impl App {
             auto_collapse_files: 50,
             auto_collapse_lines: 20_000,
             view: View::Files,
-            sidebar: false,
+            sidebar_mode: crate::config::SidebarMode::Auto,
+            sidebar_override: None,
+            sidebar_min_content: 44,
             focus: Focus::Body,
             sidebar_cursor: 0,
             sidebar_scroll: 0,
@@ -1198,8 +1210,8 @@ impl App {
             _ => {}
         }
 
-        // The sidebar takes keys while focused; otherwise the active view does.
-        if self.focus == Focus::Sidebar && self.sidebar {
+        // The sidebar takes keys while focused and visible; else the active view.
+        if self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some() {
             self.on_key_sidebar(code, mods);
         } else if self.view == View::Conversation {
             self.on_key_conversation(code, mods);
@@ -1677,17 +1689,28 @@ impl App {
         }
     }
 
-    /// Toggle the sidebar. Showing it moves focus there, synced to the current
-    /// file; hiding it returns focus to the body.
+    /// `b`: hidden → show and focus; visible & body-focused → focus it; visible &
+    /// focused → hide. The override is temporary — a resize re-evaluates the mode.
     fn toggle_sidebar(&mut self) {
-        self.sidebar = !self.sidebar;
-        if self.sidebar {
-            self.focus = Focus::Sidebar;
-            self.sidebar_cursor = self.current_file();
-            self.follow_sidebar();
-        } else {
+        let visible = self.sidebar_width(self.body_width.get()).is_some();
+        if visible && self.focus == Focus::Sidebar {
+            self.sidebar_override = Some(false);
             self.focus = Focus::Body;
+        } else if visible {
+            self.focus_sidebar();
+        } else {
+            self.sidebar_override = Some(true);
+            if self.sidebar_width(self.body_width.get()).is_some() {
+                self.focus_sidebar();
+            }
         }
+    }
+
+    /// Move focus into the sidebar, synced to the current file.
+    fn focus_sidebar(&mut self) {
+        self.focus = Focus::Sidebar;
+        self.sidebar_cursor = self.current_file();
+        self.follow_sidebar();
     }
 
     /// Keep the sidebar selection visible.
@@ -2413,6 +2436,12 @@ impl App {
     /// every position from a stale scroll to the end and panic.
     fn on_resize(&mut self, cols: u16) {
         self.body_width.set(cols as usize);
+        // A resize re-evaluates the sidebar mode (drops any `b` override); if the
+        // sidebar auto-hides, focus falls back to the body.
+        self.sidebar_override = None;
+        if self.focus == Focus::Sidebar && self.sidebar_width(cols as usize).is_none() {
+            self.focus = Focus::Body;
+        }
         if !self.clines.is_empty() {
             self.cursor = self.cursor.min(self.clines.len() - 1);
         }
@@ -3339,7 +3368,7 @@ impl App {
     /// The sidebar width for a body `total` columns wide, or `None` when the
     /// sidebar is hidden or the terminal is too narrow to keep a usable diff.
     fn sidebar_width(&self, total: usize) -> Option<usize> {
-        if !self.sidebar {
+        if !self.sidebar_wanted() {
             return None;
         }
         let widest = self
@@ -3354,7 +3383,16 @@ impl App {
             .max()
             .unwrap_or(SIDEBAR_MIN);
         let desired = widest.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
-        (total >= desired + 1 + SIDEBAR_MIN_CONTENT).then_some(desired)
+        (total >= desired + 1 + self.sidebar_min_content).then_some(desired)
+    }
+
+    /// Whether the sidebar should be shown before the width check: a `b` override
+    /// if set, otherwise the configured mode (`auto`/`open` want it, `closed`
+    /// does not).
+    fn sidebar_wanted(&self) -> bool {
+        use crate::config::SidebarMode;
+        self.sidebar_override
+            .unwrap_or(self.sidebar_mode != SidebarMode::Closed)
     }
 
     /// One file row for the sidebar or finder: a fold chevron, the tail-truncated
@@ -4785,7 +4823,7 @@ mod tests {
     #[test]
     fn h_on_a_collapsed_header_focuses_the_sidebar_when_shown() {
         let mut app = multi_file_app(&["a.rs", "b.rs"]);
-        app.sidebar = true;
+        app.sidebar_override = Some(true);
         app.body_width.set(120);
         app.collapsed_files.insert("a.rs".to_string());
         app.relayout();
@@ -4876,10 +4914,28 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_mode_and_override_control_visibility() {
+        use crate::config::SidebarMode;
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        // Auto (the default) shows when the terminal is wide, hides when narrow.
+        assert!(app.sidebar_width(120).is_some());
+        assert!(app.sidebar_width(50).is_none());
+        // Closed hides it by default.
+        app.sidebar_mode = SidebarMode::Closed;
+        assert!(app.sidebar_width(120).is_none());
+        // A `b` override forces it on...
+        app.sidebar_override = Some(true);
+        assert!(app.sidebar_width(120).is_some());
+        // ...and a resize clears the override (back to the Closed default).
+        app.on_resize(120);
+        assert!(app.sidebar_width(120).is_none());
+    }
+
+    #[test]
     fn sidebar_toggle_selects_and_jumps() {
         let mut app = multi_file_app(&["a.rs", "b.rs", "c.rs"]);
+        // The sidebar is auto-visible at the test's default width; `b` focuses it.
         app.toggle_sidebar();
-        assert!(app.sidebar);
         assert_eq!(app.focus, Focus::Sidebar);
         app.on_key_sidebar(KeyCode::Char('j'), KeyModifiers::NONE);
         app.on_key_sidebar(KeyCode::Char('j'), KeyModifiers::NONE);
@@ -4897,7 +4953,7 @@ mod tests {
             "src/aaaa.rs",
             "verylong/path/to/some/deeply/nested/module/file.rs",
         ]);
-        app.sidebar = true;
+        app.sidebar_override = Some(true);
         app.focus = Focus::Sidebar;
         let mut wide = Terminal::new(TestBackend::new(120, 30)).unwrap();
         wide.draw(|f| app.draw(f)).unwrap();

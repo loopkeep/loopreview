@@ -8,6 +8,18 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+/// When the file-explorer sidebar is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SidebarMode {
+    /// Shown when the terminal is wide enough (the default).
+    Auto,
+    /// Preferred shown (still hidden if the terminal is too narrow to fit it).
+    Open,
+    /// Hidden until toggled with `b`.
+    Closed,
+}
+
 /// Loaded user preferences.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -18,6 +30,11 @@ pub struct Config {
     pub auto_collapse_files: usize,
     /// A diff with more changed lines than this opens with every file collapsed.
     pub auto_collapse_lines: usize,
+    /// Whether the file-explorer sidebar is shown by default.
+    pub sidebar: SidebarMode,
+    /// Minimum diff width (columns) kept beside the sidebar; below this the
+    /// sidebar auto-hides so the diff stays usable.
+    pub sidebar_min_content: usize,
 }
 
 impl Default for Config {
@@ -26,6 +43,8 @@ impl Default for Config {
             split_min_width: 160,
             auto_collapse_files: 50,
             auto_collapse_lines: 20_000,
+            sidebar: SidebarMode::Auto,
+            sidebar_min_content: 44,
         }
     }
 }
