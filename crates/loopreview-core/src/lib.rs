@@ -9,9 +9,9 @@
 //!   carries a comment-addressable [`LineAnchor`](model::LineAnchor);
 //! * a [`patch`] parser from unified-diff text into that model;
 //! * the [`DiffSource`] trait and its built-in implementations
-//!   ([`WorktreeSource`], [`RefSource`], [`StdinPatchSource`]), which is how the
-//!   rest of loopreview obtains a [`Diff`](model::Diff) without caring where it
-//!   came from.
+//!   ([`WorktreeSource`], [`RefSource`], [`StdinPatchSource`], [`FilePatchSource`]),
+//!   which is how the rest of loopreview obtains a [`Diff`](model::Diff) without
+//!   caring where it came from.
 
 pub mod error;
 pub mod git;
