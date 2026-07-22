@@ -3633,20 +3633,6 @@ impl App {
         let collapsed = self.collapsed_files.contains(file.display_path());
         // A comment badge counts threads on this file (shown even when collapsed).
         let comments = self.file_comment_count(file.display_path());
-        let badge = if comments > 0 {
-            format!("  {comments} comment{}", plural(comments))
-        } else {
-            String::new()
-        };
-        // When the row is too narrow, drop the head of the path (not the tail),
-        // so the filename is always visible (DESIGN §4). A 1-col cursor marker
-        // and the 2-col chevron precede the path.
-        let suffix = format!("  [{}]  +{added} -{removed}{badge}", file.status.label());
-        let budget = self
-            .body_width
-            .get()
-            .saturating_sub(1 + 2 + suffix.chars().count());
-        let path = truncate_path_head(&path, budget.max(1));
         // A chevron shows the fold state; bold/white marks the current file. When
         // the cursor rests here, a bright bar and a fill brighter than a content
         // line's cursor make the header stand out (it anchors the whole file).
@@ -3673,27 +3659,37 @@ impl App {
         } else {
             base.fg(Color::Gray).add_modifier(Modifier::BOLD)
         };
-        let mut spans = vec![
+        let left = vec![
             TextSpan::styled(
                 marker.to_string(),
                 base.fg(marker_fg).add_modifier(Modifier::BOLD),
             ),
             TextSpan::styled(chevron, base.fg(Color::Cyan)),
-            TextSpan::styled(path, path_style),
+        ];
+        // Right-fixed cluster: the status badge, the line stats, then a comment
+        // badge — always shown in full, flush to the right edge.
+        let mut right = vec![
             TextSpan::styled(
-                format!("  [{}]", file.status.label()),
+                format!("[{}]", file.status.label()),
                 base.fg(status_color(file.status)),
             ),
             TextSpan::styled(format!("  +{added}"), base.fg(Color::Green)),
             TextSpan::styled(format!(" -{removed}"), base.fg(Color::Red)),
         ];
-        if !badge.is_empty() {
-            spans.push(TextSpan::styled(badge, base.fg(Color::Magenta)));
+        if comments > 0 {
+            right.push(TextSpan::styled(
+                format!("  {comments} comment{}", plural(comments)),
+                base.fg(Color::Magenta),
+            ));
         }
-        if is_cursor {
-            // Pad to the body width so the cursor background fills the row.
-            spans = fit(spans, self.body_width.get(), base);
-        }
+        let spans = right_aligned_row(
+            left,
+            &path,
+            |shown| vec![TextSpan::styled(shown.to_string(), path_style)],
+            right,
+            self.body_width.get(),
+            base,
+        );
         TextLine::from(spans)
     }
 
@@ -3749,35 +3745,26 @@ impl App {
         matched: &[u32],
     ) -> Vec<TextSpan<'static>> {
         let chevron = if entry.collapsed { "▸ " } else { "  " };
-        let stats_w = format!(" +{} -{}", entry.added, entry.removed)
-            .chars()
-            .count();
-        let badge = if entry.comments > 0 {
-            format!(" ●{}", entry.comments)
-        } else {
-            String::new()
-        };
-        let path_budget = width.saturating_sub(2 + stats_w + badge.chars().count());
-        let shown = truncate_path_head(&entry.path, path_budget.max(1));
-        let mut spans = vec![TextSpan::styled(chevron, base.fg(Color::Cyan))];
-        spans.extend(path_highlight_spans(
-            &shown,
-            &entry.path,
-            matched,
-            base.fg(Color::Gray),
-        ));
-        spans.push(TextSpan::styled(
-            format!(" +{}", entry.added),
-            base.fg(Color::Green),
-        ));
-        spans.push(TextSpan::styled(
-            format!(" -{}", entry.removed),
-            base.fg(Color::Red),
-        ));
-        if !badge.is_empty() {
-            spans.push(TextSpan::styled(badge, base.fg(Color::Magenta)));
+        let left = vec![TextSpan::styled(chevron, base.fg(Color::Cyan))];
+        // Right-fixed cluster: the line stats, then a comment badge.
+        let mut right = vec![
+            TextSpan::styled(format!("+{}", entry.added), base.fg(Color::Green)),
+            TextSpan::styled(format!(" -{}", entry.removed), base.fg(Color::Red)),
+        ];
+        if entry.comments > 0 {
+            right.push(TextSpan::styled(
+                format!(" ●{}", entry.comments),
+                base.fg(Color::Magenta),
+            ));
         }
-        fit(spans, width, base)
+        right_aligned_row(
+            left,
+            &entry.path,
+            |shown| path_highlight_spans(shown, &entry.path, matched, base.fg(Color::Gray)),
+            right,
+            width,
+            base,
+        )
     }
 
     /// Draw the file-explorer sidebar.
@@ -4079,19 +4066,77 @@ fn path_highlight_spans(
     spans
 }
 
-/// Truncate `path` to `max` columns by dropping its head (with a leading `…`),
-/// so the filename at the tail is always kept. Widths are counted in `char`s, to
-/// match [`fit`] and the rest of the renderer.
+/// Truncate `path` to at most `max` display columns by dropping its head (with a
+/// leading `…`), so the filename at the tail is always kept. Widths use
+/// unicode-width, so a CJK name (2 columns per glyph) does not misalign.
 fn truncate_path_head(path: &str, max: usize) -> String {
-    let count = path.chars().count();
-    if count <= max {
+    if str_width(path) <= max {
         return path.to_string();
     }
     if max <= 1 {
         return "…".to_string();
     }
-    let tail: String = path.chars().skip(count - (max - 1)).collect();
+    // Keep as much of the tail as fits in `max - 1` columns (1 for the ellipsis),
+    // never splitting a wide glyph.
+    let budget = max - 1;
+    let mut kept: Vec<char> = Vec::new();
+    let mut w = 0;
+    for ch in path.chars().rev() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > budget {
+            break;
+        }
+        w += cw;
+        kept.push(ch);
+    }
+    kept.reverse();
+    let tail: String = kept.into_iter().collect();
     format!("…{tail}")
+}
+
+/// Display width of a string in terminal columns (unicode-width).
+fn str_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum()
+}
+
+/// Display width of styled spans, in terminal columns.
+fn span_width(spans: &[TextSpan<'static>]) -> usize {
+    spans.iter().map(|s| str_width(&s.content)).sum()
+}
+
+/// Lay out a file row as `left` (marker/chevron) + a head-truncated filename + a
+/// flexible gap + a right-fixed `right` cluster (stats and badges), to exactly
+/// `width` display columns. The right cluster is the priority: it is shown in
+/// full whenever it fits, the filename is minimized first (at least one column
+/// of gap is always kept), and only when the cluster alone overflows the row is
+/// it clipped. `build_path` styles the shown (possibly truncated) filename.
+fn right_aligned_row(
+    left: Vec<TextSpan<'static>>,
+    path: &str,
+    build_path: impl FnOnce(&str) -> Vec<TextSpan<'static>>,
+    right: Vec<TextSpan<'static>>,
+    width: usize,
+    fill: Style,
+) -> Vec<TextSpan<'static>> {
+    let lw = span_width(&left);
+    let rw = span_width(&right);
+    // Reserve the cluster and a one-column gap first; the rest is the filename.
+    let path_budget = width.saturating_sub(lw + rw + 1);
+    let mut out = left;
+    if path_budget > 0 {
+        out.extend(build_path(&truncate_path_head(path, path_budget)));
+    }
+    let used = span_width(&out);
+    if used + rw <= width {
+        out.push(TextSpan::styled(" ".repeat(width - used - rw), fill));
+        out.extend(right);
+    } else {
+        // Too narrow even for the cluster: it wins, clipped to what remains.
+        out.extend(clip_spans(&right, 0, width.saturating_sub(used), fill));
+    }
+    out
 }
 
 /// Take the `width` display columns of `spans` starting at column `start`,
@@ -4142,31 +4187,6 @@ fn clip_spans(
     }
     if emitted < width {
         out.push(TextSpan::styled(" ".repeat(width - emitted), fill));
-    }
-    out
-}
-
-fn fit(spans: Vec<TextSpan<'static>>, width: usize, fill: Style) -> Vec<TextSpan<'static>> {
-    let mut out = Vec::new();
-    let mut used = 0usize;
-    for span in spans {
-        if used >= width {
-            break;
-        }
-        let remaining = width - used;
-        let chars: Vec<char> = span.content.chars().collect();
-        if chars.len() <= remaining {
-            used += chars.len();
-            out.push(span);
-        } else {
-            let clipped: String = chars[..remaining].iter().collect();
-            used += remaining;
-            out.push(TextSpan::styled(clipped, span.style));
-            break;
-        }
-    }
-    if used < width {
-        out.push(TextSpan::styled(" ".repeat(width - used), fill));
     }
     out
 }
@@ -4992,14 +5012,70 @@ mod tests {
     }
 
     #[test]
-    fn fit_pads_and_truncates_to_width() {
-        let short = fit(vec![TextSpan::raw("ab")], 5, Style::default());
-        let text: String = short.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "ab   ");
+    fn right_aligned_row_pins_the_cluster_to_the_edge() {
+        let sp = |t: &str| TextSpan::raw(t.to_string());
+        let text = |v: &[TextSpan]| -> String { v.iter().map(|s| s.content.to_string()).collect() };
+        let plain = Style::default();
 
-        let long = fit(vec![TextSpan::raw("abcdef")], 3, Style::default());
-        let text: String = long.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "abc");
+        // Normal: the filename fits; the cluster is flush right past a flex gap.
+        let row = right_aligned_row(
+            vec![sp("  ")],
+            "src/main.rs",
+            |shown| vec![TextSpan::raw(shown.to_string())],
+            vec![sp("+10 -2")],
+            20,
+            plain,
+        );
+        let s = text(&row);
+        assert_eq!(str_width(&s), 20, "row is exactly the width: {s:?}");
+        assert!(
+            s.starts_with("  src/main.rs"),
+            "filename on the left: {s:?}"
+        );
+        assert!(s.ends_with("+10 -2"), "cluster flush right: {s:?}");
+
+        // Narrow: the cluster wins, the filename is head-truncated to a sliver.
+        let row = right_aligned_row(
+            vec![sp("  ")],
+            "src/very/long/path/name.rs",
+            |shown| vec![TextSpan::raw(shown.to_string())],
+            vec![sp("+10 -2")],
+            14,
+            plain,
+        );
+        let s = text(&row);
+        assert_eq!(str_width(&s), 14, "narrow row is exactly the width: {s:?}");
+        assert!(s.ends_with("+10 -2"), "the cluster stays whole: {s:?}");
+        assert!(s.contains('…'), "the filename is head-truncated: {s:?}");
+
+        // CJK: width-aware — a 2-column-per-glyph name never misaligns the edge.
+        let row = right_aligned_row(
+            vec![sp("  ")],
+            "日本語のファイル.rs",
+            |shown| vec![TextSpan::raw(shown.to_string())],
+            vec![sp("+1 -0")],
+            20,
+            plain,
+        );
+        let s = text(&row);
+        assert_eq!(str_width(&s), 20, "CJK row is exactly the width: {s:?}");
+        assert!(
+            s.ends_with("+1 -0"),
+            "cluster flush right with a CJK name: {s:?}"
+        );
+    }
+
+    #[test]
+    fn truncate_path_head_is_width_aware_for_cjk() {
+        // A 2-column-per-glyph name clipped to 7 columns: "…" + a tail that fits.
+        let out = truncate_path_head("あいうえお.rs", 7);
+        assert!(out.starts_with('…'), "leads with an ellipsis: {out:?}");
+        assert!(
+            str_width(&out) <= 7,
+            "fits the column budget: {out:?} = {} cols",
+            str_width(&out)
+        );
+        assert!(out.ends_with(".rs"), "keeps the filename tail: {out:?}");
     }
 
     // -- control plane (handle_control against a real App) -----------------
