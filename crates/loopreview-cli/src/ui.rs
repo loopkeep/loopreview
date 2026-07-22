@@ -8710,6 +8710,33 @@ mod tests {
     }
 
     #[test]
+    fn conversation_sidebar_wheel_reaches_all_threads() {
+        // One file, seven threads: the thread index must scroll to the last
+        // thread, not be clamped by the file count (the old bug used files.len()
+        // as the wheel bound, so the thread index couldn't reach past it).
+        let mut app = sample_app();
+        for i in 0..7 {
+            app.add_thread(
+                Anchor::line("a.rs", Side::New, 2),
+                "me",
+                &format!("c{i}"),
+                CommentKind::Local,
+            );
+        }
+        app.relayout();
+        app.view = View::Conversation;
+        app.body_height.set(3);
+        for _ in 0..20 {
+            app.scroll_sidebar(1);
+        }
+        // 7 threads, viewport 3 → the last reachable scroll is 7 - 3 = 4.
+        assert_eq!(
+            app.sidebar_scroll, 4,
+            "the thread index scrolls to reveal the last thread"
+        );
+    }
+
+    #[test]
     fn sidebar_row_mappings_are_bidirectional() {
         let entries = vec![
             sidebar_entry(0, "src/a.rs"),
