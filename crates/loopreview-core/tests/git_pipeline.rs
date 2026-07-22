@@ -44,6 +44,8 @@ fn init_repo(name: &str) -> PathBuf {
     git(&dir, &["config", "user.email", "test@example.com"]);
     git(&dir, &["config", "user.name", "Test"]);
     git(&dir, &["config", "commit.gpgsign", "false"]);
+    // Keep line endings verbatim so diffs are deterministic on Windows too.
+    git(&dir, &["config", "core.autocrlf", "false"]);
 
     std::fs::write(dir.join("file.txt"), "one\ntwo\nthree\n").expect("write file");
     git(&dir, &["add", "file.txt"]);

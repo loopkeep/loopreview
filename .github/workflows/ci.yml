@@ -52,3 +52,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build (release)
         run: cargo build --release
+
+  # Windows is a full-support target; run tests and a release build to catch
+  # path/line-ending and platform-specific breakage (fmt/clippy run on Linux).
+  windows:
+    name: test / build (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test
+      - name: Build (release)
+        run: cargo build --release
