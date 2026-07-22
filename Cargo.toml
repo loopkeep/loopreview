@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/loopreview-core", "crates/loopreview-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
+codegen-units = 1

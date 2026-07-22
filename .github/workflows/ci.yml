@@ -1,0 +1,54 @@
+name: CI
+
+# Quality gate for the Rust workspace. Only runs when something that can affect
+# the build changes, so docs/manifest-only edits do not spend CI minutes.
+on:
+  push:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
+
+# Cancel superseded runs when new commits land on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: fmt / clippy / test / build (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rustfmt and clippy
+        run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+      - name: Build (release)
+        run: cargo build --release
+
+  # macOS is a release target, so keep a lightweight build-only check to catch
+  # platform-specific breakage. fmt/clippy/test already run once on Linux above.
+  macos-build:
+    name: build (macos)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (release)
+        run: cargo build --release

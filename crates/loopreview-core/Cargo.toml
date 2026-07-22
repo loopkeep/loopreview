@@ -1,0 +1,11 @@
+[package]
+name = "loopreview-core"
+description = "Pure diff model and source abstraction for loopreview, a review-first diff TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+similar = "3.1.1"
+thiserror = "2.0.19"

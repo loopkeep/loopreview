@@ -1,0 +1,29 @@
+[package]
+name = "loopreview-cli"
+description = "Terminal UI for loopreview, a review-first diff TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Two binaries — `loopreview` and its short alias `lr` — that both delegate to
+# the crate's `run()`. Keeping the logic in the library avoids a duplicate build
+# target on one `main.rs`.
+[[bin]]
+name = "loopreview"
+path = "src/bin/loopreview.rs"
+
+[[bin]]
+name = "lr"
+path = "src/bin/lr.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.4", features = ["derive"] }
+# `use-dev-tty` routes key input through /dev/tty so `git diff | lr` still reads
+# keystrokes when stdin is the piped patch rather than the keyboard.
+crossterm = { version = "0.29.0", features = ["use-dev-tty", "libc"] }
+loopreview-core = { path = "../loopreview-core" }
+ratatui = "0.30.2"
+syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
