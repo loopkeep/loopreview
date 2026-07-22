@@ -60,7 +60,8 @@ const WATCH_DEBOUNCE_MS: u64 = 250;
 /// How long the "updated" flash stays in the header after a watch reload.
 const RELOAD_FLASH_MS: u64 = 900;
 /// At or above this body width, `auto` layout chooses side-by-side.
-const AUTO_SBS_MIN_WIDTH: usize = 160;
+/// Fallback wrap width for Conversation rendering before the body size is known.
+const CONV_DEFAULT_WIDTH: usize = 80;
 
 /// The diff layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +70,15 @@ pub enum Mode {
     Auto,
     Unified,
     SideBySide,
+}
+
+/// Which top-level view is showing (tabs appear once a review has threads).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    /// The diff, with comments inline.
+    Files,
+    /// The comment threads, chronological with replies.
+    Conversation,
 }
 
 /// Everything the review UI needs for one session.
@@ -89,6 +99,8 @@ pub struct Session {
     pub store: Option<Store>,
     /// The comment author (from `git config user.name`).
     pub author: String,
+    /// Minimum body width for `auto` layout to choose side-by-side.
+    pub split_min_width: usize,
 }
 
 /// Enter the alternate screen, run the review UI, then restore the terminal.
@@ -102,10 +114,12 @@ pub fn run(session: Session) -> Result<()> {
         review,
         store,
         author,
+        split_min_width,
     } = session;
 
     let mut app = App::new(label, diff, review, store, author, Highlighter::new());
     app.mode = mode;
+    app.split_min_width = split_min_width;
     let updates = watch_root.map(|root| spawn_watcher(root, source));
     app.watching = updates.is_some();
 
@@ -293,6 +307,16 @@ struct App {
     input: Option<Compose>,
     /// Rendered inline block per thread, index-aligned to `review.threads`.
     comment_blocks: Vec<Vec<TextLine<'static>>>,
+    /// Rendered Conversation block per thread (root, replies), same order.
+    conv_blocks: Vec<Vec<TextLine<'static>>>,
+    /// The current top-level view.
+    view: View,
+    /// Selected thread index in the Conversation view.
+    conv_cursor: usize,
+    /// Scroll offset (in lines) of the Conversation view.
+    conv_scroll: usize,
+    /// Minimum body width for `auto` layout to choose side-by-side.
+    split_min_width: usize,
     /// A transient status message (feedback or error).
     status: Option<String>,
     quit: bool,
@@ -308,6 +332,7 @@ impl App {
         highlighter: Highlighter,
     ) -> App {
         let comment_blocks = build_comment_blocks(&review, &highlighter);
+        let conv_blocks = build_conversation(&review, CONV_DEFAULT_WIDTH, &highlighter);
         let block_lens: Vec<usize> = comment_blocks.iter().map(Vec::len).collect();
         let layout = Layouts::build(&diff, &review, &block_lens);
         let num_width = digits(layout.max_lineno).max(3);
@@ -345,6 +370,11 @@ impl App {
             author,
             input: None,
             comment_blocks,
+            conv_blocks,
+            view: View::Files,
+            conv_cursor: 0,
+            conv_scroll: 0,
+            split_min_width: 160,
             status: None,
             reloaded_at: None,
             quit: false,
@@ -402,6 +432,11 @@ impl App {
     /// current review, replacing derived state. The caller restores the cursor.
     fn apply_layout(&mut self, diff: Diff) {
         self.comment_blocks = build_comment_blocks(&self.review, &self.highlighter);
+        let conv_width = self.body_width.get().clamp(40, 120);
+        self.conv_blocks = build_conversation(&self.review, conv_width, &self.highlighter);
+        self.conv_cursor = self
+            .conv_cursor
+            .min(self.review.threads.len().saturating_sub(1));
         let block_lens: Vec<usize> = self.comment_blocks.iter().map(Vec::len).collect();
         let layout = Layouts::build(&diff, &self.review, &block_lens);
         self.num_width = digits(layout.max_lineno).max(3);
@@ -482,19 +517,46 @@ impl App {
         })
     }
 
+    /// Whether the review has any threads (and so the tab bar is shown).
+    fn has_review(&self) -> bool {
+        !self.review.threads.is_empty()
+    }
+
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         // While composing, keys edit the comment (or submit/cancel).
         if self.input.is_some() {
             self.on_key_compose(code, mods);
             return;
         }
-        let ctrl = mods.contains(KeyModifiers::CONTROL);
-        let page = self.body_height.get().max(1) as isize;
         self.status = None;
-        match (code, ctrl) {
+
+        // Tab switches views once a review exists; Esc/q/^c always quit.
+        match (code, mods.contains(KeyModifiers::CONTROL)) {
             (KeyCode::Esc, _) | (KeyCode::Char('q'), false) | (KeyCode::Char('c'), true) => {
                 self.quit = true;
+                return;
             }
+            (KeyCode::Tab, _) if self.has_review() => {
+                self.view = match self.view {
+                    View::Files => View::Conversation,
+                    View::Conversation => View::Files,
+                };
+                return;
+            }
+            _ => {}
+        }
+
+        if self.view == View::Conversation {
+            self.on_key_conversation(code, mods);
+        } else {
+            self.on_key_files(code, mods);
+        }
+    }
+
+    fn on_key_files(&mut self, code: KeyCode, mods: KeyModifiers) {
+        let ctrl = mods.contains(KeyModifiers::CONTROL);
+        let page = self.body_height.get().max(1) as isize;
+        match (code, ctrl) {
             (KeyCode::Char('j'), false) | (KeyCode::Down, _) => self.move_cursor(1),
             (KeyCode::Char('k'), false) | (KeyCode::Up, _) => self.move_cursor(-1),
             (KeyCode::Char('d'), true) => self.move_cursor(page / 2),
@@ -509,7 +571,7 @@ impl App {
             (KeyCode::Char('p'), false) => self.goto_file(-1),
             (KeyCode::Char('}'), false) | (KeyCode::Char(']'), false) => self.goto_hunk(1),
             (KeyCode::Char('{'), false) | (KeyCode::Char('['), false) => self.goto_hunk(-1),
-            (KeyCode::Char('v'), false) | (KeyCode::Tab, _) => self.toggle_mode(),
+            (KeyCode::Char('v'), false) => self.toggle_mode(),
             (KeyCode::Char('c'), false) => self.start_compose(),
             (KeyCode::Char('r'), false) => self.start_reply(),
             (KeyCode::Char('x'), false) => self.toggle_resolve(),
@@ -603,12 +665,16 @@ impl App {
         });
     }
 
-    /// Begin replying to the thread anchored at the cursor's line.
+    /// Begin replying to the thread anchored at the cursor's line (Files view).
     fn start_reply(&mut self) {
-        let Some(idx) = self.thread_at_cursor() else {
-            self.status = Some("no comment on this line to reply to".to_string());
-            return;
-        };
+        match self.thread_at_cursor() {
+            Some(idx) => self.open_reply(idx),
+            None => self.status = Some("no comment on this line to reply to".to_string()),
+        }
+    }
+
+    /// Open a reply composer targeting thread `idx`.
+    fn open_reply(&mut self, idx: usize) {
         let thread = &self.review.threads[idx];
         let who = thread.root().map(|c| c.author.as_str()).unwrap_or("thread");
         self.input = Some(Compose {
@@ -621,10 +687,14 @@ impl App {
 
     /// Toggle the resolved state of the thread anchored at the cursor's line.
     fn toggle_resolve(&mut self) {
-        let Some(idx) = self.thread_at_cursor() else {
-            self.status = Some("no comment on this line to resolve".to_string());
-            return;
-        };
+        match self.thread_at_cursor() {
+            Some(idx) => self.resolve_thread(idx),
+            None => self.status = Some("no comment on this line to resolve".to_string()),
+        }
+    }
+
+    /// Toggle the resolved state of thread `idx` and persist.
+    fn resolve_thread(&mut self, idx: usize) {
         let thread = &mut self.review.threads[idx];
         thread.state = if thread.is_resolved() {
             ThreadState::Open
@@ -634,6 +704,84 @@ impl App {
         let resolved = thread.is_resolved();
         self.status = self.persist(if resolved { "resolved" } else { "reopened" });
         self.relayout();
+    }
+
+    /// Route a key in the Conversation view.
+    fn on_key_conversation(&mut self, code: KeyCode, mods: KeyModifiers) {
+        let ctrl = mods.contains(KeyModifiers::CONTROL);
+        let page = self.body_height.get().max(1);
+        match (code, ctrl) {
+            (KeyCode::Char('j'), false) | (KeyCode::Down, _) => self.move_conv(1),
+            (KeyCode::Char('k'), false) | (KeyCode::Up, _) => self.move_conv(-1),
+            (KeyCode::Char('g'), false) | (KeyCode::Home, _) => self.set_conv(0),
+            (KeyCode::Char('G'), false) | (KeyCode::End, _) => {
+                self.set_conv(self.review.threads.len().saturating_sub(1))
+            }
+            (KeyCode::Char('d'), true) | (KeyCode::PageDown, _) => {
+                self.conv_scroll = (self.conv_scroll + page / 2).min(self.conv_max_scroll())
+            }
+            (KeyCode::Char('u'), true) | (KeyCode::PageUp, _) => {
+                self.conv_scroll = self.conv_scroll.saturating_sub(page / 2)
+            }
+            (KeyCode::Char('r'), false) if self.has_review() => self.open_reply(self.conv_cursor),
+            (KeyCode::Char('x'), false) if self.has_review() => {
+                self.resolve_thread(self.conv_cursor)
+            }
+            _ => {}
+        }
+    }
+
+    fn move_conv(&mut self, delta: isize) {
+        if self.review.threads.is_empty() {
+            return;
+        }
+        let last = (self.review.threads.len() - 1) as isize;
+        let next = (self.conv_cursor as isize + delta).clamp(0, last);
+        self.set_conv(next as usize);
+    }
+
+    fn set_conv(&mut self, index: usize) {
+        if self.review.threads.is_empty() {
+            return;
+        }
+        self.conv_cursor = index.min(self.review.threads.len() - 1);
+        self.follow_conv();
+    }
+
+    /// The first line index of each Conversation thread block (blocks are
+    /// separated by one spacer line).
+    fn conv_offsets(&self) -> Vec<usize> {
+        let mut offsets = Vec::with_capacity(self.conv_blocks.len());
+        let mut line = 0;
+        for block in &self.conv_blocks {
+            offsets.push(line);
+            line += block.len() + 1;
+        }
+        offsets
+    }
+
+    fn conv_total_lines(&self) -> usize {
+        self.conv_blocks.iter().map(|b| b.len() + 1).sum()
+    }
+
+    fn conv_max_scroll(&self) -> usize {
+        let height = self.body_height.get().max(1);
+        self.conv_total_lines().saturating_sub(height)
+    }
+
+    /// Keep the selected thread visible in the Conversation view.
+    fn follow_conv(&mut self) {
+        let offsets = self.conv_offsets();
+        let Some(&target) = offsets.get(self.conv_cursor) else {
+            return;
+        };
+        let height = self.body_height.get().max(1);
+        if target < self.conv_scroll {
+            self.conv_scroll = target;
+        } else if target >= self.conv_scroll + height {
+            self.conv_scroll = target.saturating_sub(height / 2);
+        }
+        self.conv_scroll = self.conv_scroll.min(self.conv_max_scroll());
     }
 
     /// The index of the thread anchored at the cursor's line, if any.
@@ -776,7 +924,7 @@ impl App {
 
     fn sbs(&self) -> bool {
         match self.mode {
-            Mode::Auto => self.body_width.get() >= AUTO_SBS_MIN_WIDTH,
+            Mode::Auto => self.body_width.get() >= self.split_min_width,
             Mode::Unified => false,
             Mode::SideBySide => true,
         }
@@ -930,30 +1078,108 @@ impl App {
     // -- rendering --------------------------------------------------------
 
     fn draw(&self, f: &mut Frame) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
+        // A tab bar appears once the review has threads.
+        let tabs = self.has_review();
+        let constraints = if tabs {
+            vec![
+                Constraint::Length(1),
                 Constraint::Length(1),
                 Constraint::Min(1),
                 Constraint::Length(1),
-            ])
-            .split(f.area());
-        self.body_height.set(chunks[1].height as usize);
-        self.body_width.set(chunks[1].width as usize);
-
-        self.draw_header(f, chunks[0]);
-        if self.clines.is_empty() && self.diff.files.is_empty() {
-            self.draw_empty(f, chunks[1]);
-        } else if self.sbs() {
-            self.draw_body_sbs(f, chunks[1]);
+            ]
         } else {
-            self.draw_body_unified(f, chunks[1]);
+            vec![
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ]
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(f.area());
+        let (header, body, footer) = if tabs {
+            (chunks[0], chunks[2], chunks[3])
+        } else {
+            (chunks[0], chunks[1], chunks[2])
+        };
+        self.body_height.set(body.height as usize);
+        self.body_width.set(body.width as usize);
+
+        self.draw_header(f, header);
+        if tabs {
+            self.draw_tabs(f, chunks[1]);
         }
-        self.draw_footer(f, chunks[2]);
+        if self.view == View::Conversation {
+            self.draw_conversation(f, body);
+        } else if self.clines.is_empty() && self.diff.files.is_empty() {
+            self.draw_empty(f, body);
+        } else if self.sbs() {
+            self.draw_body_sbs(f, body);
+        } else {
+            self.draw_body_unified(f, body);
+        }
+        self.draw_footer(f, footer);
 
         if let Some(compose) = &self.input {
             self.draw_compose(f, compose);
         }
+    }
+
+    fn draw_tabs(&self, f: &mut Frame, area: Rect) {
+        let active = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let idle = Style::default().fg(Color::Gray);
+        let files = format!(" Files ({}) ", self.diff.files.len());
+        let conv = format!(" Conversation ({}) ", self.review.threads.len());
+        let line = TextLine::from(vec![
+            TextSpan::styled(
+                files,
+                if self.view == View::Files {
+                    active
+                } else {
+                    idle
+                },
+            ),
+            TextSpan::raw(" "),
+            TextSpan::styled(
+                conv,
+                if self.view == View::Conversation {
+                    active
+                } else {
+                    idle
+                },
+            ),
+            TextSpan::styled("   tab to switch", Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+    }
+
+    fn draw_conversation(&self, f: &mut Frame, area: Rect) {
+        let select_bg = Color::Rgb(40, 46, 60);
+        let mut lines: Vec<TextLine> = Vec::new();
+        for (ti, block) in self.conv_blocks.iter().enumerate() {
+            let selected = ti == self.conv_cursor;
+            for line in block {
+                if selected {
+                    let spans: Vec<TextSpan> = line
+                        .spans
+                        .iter()
+                        .map(|s| TextSpan::styled(s.content.clone(), s.style.bg(select_bg)))
+                        .collect();
+                    lines.push(TextLine::from(spans));
+                } else {
+                    lines.push(line.clone());
+                }
+            }
+            lines.push(TextLine::from(""));
+        }
+        let height = area.height as usize;
+        let start = self.conv_scroll.min(lines.len().saturating_sub(1));
+        let end = (start + height).min(lines.len());
+        f.render_widget(Paragraph::new(lines[start..end].to_vec()), area);
     }
 
     /// The comment-composer modal, overlaid on the body.
@@ -1053,20 +1279,30 @@ impl App {
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let bar = Style::default().bg(BAR_BG);
-        let position = format!(
-            " [{}/{}]{} ",
-            self.current_file() + 1,
-            self.diff.files.len().max(1),
-            self.cursor_anchor()
-        );
+        let position = if self.view == View::Conversation {
+            format!(
+                " [{}/{}] ",
+                self.conv_cursor + 1,
+                self.review.threads.len().max(1)
+            )
+        } else {
+            format!(
+                " [{}/{}]{} ",
+                self.current_file() + 1,
+                self.diff.files.len().max(1),
+                self.cursor_anchor()
+            )
+        };
         let mut spans = vec![TextSpan::styled(position, bar.fg(Color::Cyan))];
         if let Some(status) = &self.status {
             spans.push(TextSpan::styled(status.clone(), bar.fg(Color::Yellow)));
         } else {
-            spans.push(TextSpan::styled(
-                "j/k move · n/p file · c comment · r reply · x resolve · v split · q quit",
-                bar.fg(Color::DarkGray),
-            ));
+            let help = if self.view == View::Conversation {
+                "j/k thread · r reply · x resolve · tab files · q quit"
+            } else {
+                "j/k move · n/p file · c comment · r reply · x resolve · v split · q quit"
+            };
+            spans.push(TextSpan::styled(help, bar.fg(Color::DarkGray)));
         }
         f.render_widget(Paragraph::new(TextLine::from(spans)).style(bar), area);
     }
@@ -1456,6 +1692,120 @@ fn build_comment_blocks(review: &Review, highlighter: &Highlighter) -> Vec<Vec<T
         .collect()
 }
 
+/// Render each thread as a Conversation block (index-aligned to
+/// `review.threads`): where it is anchored and its state, then the root comment
+/// and nested replies, each with an author and a relative timestamp.
+fn build_conversation(
+    review: &Review,
+    width: usize,
+    highlighter: &Highlighter,
+) -> Vec<Vec<TextLine<'static>>> {
+    let now = now();
+    review
+        .threads
+        .iter()
+        .map(|thread| {
+            let mut lines = Vec::new();
+            let mut header = vec![TextSpan::styled(
+                anchor_label(&thread.anchor),
+                Style::default().fg(Color::DarkGray),
+            )];
+            if thread.is_resolved() {
+                header.push(TextSpan::styled(
+                    "  [resolved]",
+                    Style::default().fg(Color::Green),
+                ));
+            }
+            lines.push(TextLine::from(header));
+
+            if let Some(root) = thread.root() {
+                lines.push(comment_meta_line(&root.author, root.created_at, now, false));
+                lines.extend(crate::markdown::render(
+                    &root.body,
+                    Some(width),
+                    highlighter,
+                ));
+            }
+            for reply in thread.replies() {
+                lines.push(comment_meta_line(
+                    &reply.author,
+                    reply.created_at,
+                    now,
+                    true,
+                ));
+                for line in
+                    crate::markdown::render(&reply.body, Some(width.saturating_sub(2)), highlighter)
+                {
+                    let mut spans = vec![TextSpan::raw("  ")];
+                    spans.extend(line.spans);
+                    lines.push(TextLine::from(spans));
+                }
+            }
+            lines
+        })
+        .collect()
+}
+
+/// The author/timestamp line for a comment; replies are marked and indented.
+fn comment_meta_line(author: &str, created_at: u64, now: u64, reply: bool) -> TextLine<'static> {
+    let prefix = if reply { "  ↳ " } else { "" };
+    TextLine::from(vec![
+        TextSpan::styled(prefix, Style::default().fg(Color::DarkGray)),
+        TextSpan::styled(
+            author.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        TextSpan::styled(
+            format!("  · {}", relative_time(created_at, now)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+/// A human label for where a thread is anchored.
+fn anchor_label(anchor: &Anchor) -> String {
+    match anchor {
+        Anchor::Line {
+            file,
+            side,
+            start,
+            end,
+            ..
+        } => {
+            let range = if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            };
+            let side = match side {
+                Side::Old => "old",
+                Side::New => "new",
+            };
+            format!("{file}:{range} ({side})")
+        }
+        Anchor::File { file } => file.clone(),
+        Anchor::Review => "changeset".to_string(),
+    }
+}
+
+/// A coarse "N ago" relative time from `then` to `now` (both epoch seconds).
+fn relative_time(then: u64, now: u64) -> String {
+    let d = now.saturating_sub(then);
+    if d < 45 {
+        "just now".to_string()
+    } else if d < 3600 {
+        format!("{}m ago", (d / 60).max(1))
+    } else if d < 86_400 {
+        format!("{}h ago", d / 3600)
+    } else if d < 30 * 86_400 {
+        format!("{}d ago", d / 86_400)
+    } else {
+        format!("{}mo ago", d / (30 * 86_400))
+    }
+}
+
 /// The lines around index `li` in `hunk`, saved as an anchor's context snippet.
 fn context_snippet(hunk: &loopreview_core::Hunk, li: usize) -> Vec<String> {
     let start = li.saturating_sub(2);
@@ -1704,6 +2054,14 @@ fn flush_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_times() {
+        assert_eq!(relative_time(100, 130), "just now");
+        assert_eq!(relative_time(0, 120), "2m ago");
+        assert_eq!(relative_time(0, 7200), "2h ago");
+        assert_eq!(relative_time(0, 3 * 86_400), "3d ago");
+    }
 
     #[test]
     fn digit_counts() {

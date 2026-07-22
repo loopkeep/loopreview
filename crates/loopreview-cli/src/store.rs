@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use loopreview_core::Review;
 
+use crate::config::config_dir;
+
 /// The on-disk schema version, bumped when the format changes.
 const SCHEMA_VERSION: u32 = 1;
 
@@ -84,21 +86,6 @@ fn repo_key(repo: &str) -> String {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
-}
-
-/// The user's config directory: `$XDG_CONFIG_HOME` or `~/.config` on Unix,
-/// `%APPDATA%` on Windows.
-fn config_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    }
-    #[cfg(not(windows))]
-    {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-    }
 }
 
 #[cfg(test)]

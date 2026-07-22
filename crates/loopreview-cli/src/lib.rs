@@ -5,6 +5,7 @@
 //! ([`highlight`]), and the ratatui review UI ([`ui`]).
 
 mod cli;
+mod config;
 mod highlight;
 mod markdown;
 mod store;
@@ -103,6 +104,7 @@ fn try_run() -> Result<()> {
         review,
         store,
         author,
+        split_min_width: config::Config::load().split_min_width,
     })
 }
 
