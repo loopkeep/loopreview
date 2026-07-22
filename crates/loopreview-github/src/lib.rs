@@ -38,15 +38,25 @@ pub use pr::{PrQuery, PrRef, ResolvedPr, parse_pr_query};
 pub use push::{ReviewCommentInput, ReviewEvent};
 pub use source::PrSource;
 
-/// The outcome of submitting a review: the drafts that were published, updated
-/// with the remote ids GitHub assigned.
+/// The outcome of submitting a review: the drafts that were published, each with
+/// the remote id GitHub assigned when it could be reconciled.
+///
+/// The review is created by a single atomic POST, so a returned [`review_id`]
+/// means every inline draft is on GitHub. Reading the created comments back to
+/// learn their ids is a *separate* request that can fail; when it does, the
+/// affected drafts are reported with `None` — "sent, id not yet known" — so the
+/// caller marks them published (never re-posting) and recovers the real ids on
+/// the next pull, rather than the whole submit failing and duplicating on retry.
+///
+/// [`review_id`]: SubmitOutcome::review_id
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmitOutcome {
     /// GitHub's id for the created review.
     pub review_id: u64,
     /// `(local thread id, remote comment id)` for each inline draft that was
-    /// published, so the caller can stamp `remote_id` onto its stored model.
-    pub published: Vec<(String, String)>,
+    /// submitted. `Some(id)` when the created comment was reconciled; `None` when
+    /// the review posted but its comment id could not be read back yet.
+    pub published: Vec<(String, Option<String>)>,
 }
 
 /// The outcome of posting one draft reply: which local comment was published,
@@ -293,13 +303,17 @@ impl GithubClient {
         )?;
         let review_id = parse_created_id(&out, "created review")?;
 
-        // Reconcile the created comment ids back onto the drafts. A pending
-        // review or one with no inline comments has nothing to read back.
+        // Reconcile the created comment ids back onto the drafts. Only a review
+        // with no inline comments has nothing to read back (a pending review still
+        // carries its comments, so it is reconciled too). The review is already
+        // created, so a failed read-back is not fatal: the affected drafts are
+        // reported id-pending (their ids arrive on the next pull) rather than
+        // failing the whole submit and re-posting a duplicate review on retry.
         let published = if inputs.is_empty() {
             Vec::new()
         } else {
-            let created = self.fetch_review_comments(pr, review_id)?;
-            push::match_created_comments(&planned, &created)
+            let created = self.fetch_review_comments(pr, review_id).ok();
+            push::reconcile_published(&planned, created.as_deref())
         };
 
         Ok(SubmitOutcome {

@@ -6981,6 +6981,47 @@ mod tests {
     }
 
     #[test]
+    fn an_unreconciled_submit_clears_the_draft_and_shows_no_badge() {
+        // The review posted but its comment id could not be read back: prsync
+        // stamps the pending sentinel. The root must stop being a draft (no repost,
+        // no [draft] badge) and leave the store, its real id arriving on next pull.
+        let mut app = sample_app();
+        app.pr = Some(Arc::new(crate::prsync::PrHandle::for_test(1, "t")));
+        app.pr_key = Some("owner/repo#1".into());
+        let (tid, _) = app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "me",
+            "note",
+            CommentKind::Draft,
+        );
+        app.save_pr_drafts().unwrap();
+        let key = "owner/repo#1";
+
+        app.apply_submitted(crate::prsync::Submitted {
+            published: vec![(tid, crate::prsync::PENDING_REMOTE_ID.into())],
+            replies: Vec::new(),
+            failed_replies: 0,
+        });
+
+        let root = app.review.threads[0].root().unwrap();
+        assert!(!root.is_draft(), "a submitted root is no longer a draft");
+        assert!(kind_badge(root).is_none(), "no [draft] badge remains");
+        assert!(
+            app.pr_drafts().is_empty(),
+            "a repeat submit finds nothing to re-post"
+        );
+        assert!(
+            app.store
+                .as_ref()
+                .unwrap()
+                .load_pr_drafts(key)
+                .unwrap()
+                .is_empty(),
+            "the store's draft entry is cleared"
+        );
+    }
+
+    #[test]
     fn a_failed_reply_is_reported_and_left_draft() {
         let mut app = sample_app();
         app.pr = Some(Arc::new(crate::prsync::PrHandle::for_test(1, "t")));

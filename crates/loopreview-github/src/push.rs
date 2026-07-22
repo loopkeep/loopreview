@@ -316,6 +316,35 @@ pub(crate) fn match_created_comments(
     out
 }
 
+/// Reconcile a submitted review's created comments back onto the drafts that
+/// produced them, tolerating a failed read-back.
+///
+/// `created` is `Some` when the review's comments were read back after the POST,
+/// and `None` when that read-back failed. Every planned draft yields one entry:
+/// `(thread_id, Some(remote_id))` when its created comment matched, and
+/// `(thread_id, None)` when it did not (read-back failed, or a match miss). A
+/// `None` entry means "the review posted, but this comment's id is not yet
+/// known" — the caller marks the draft sent (never re-posting it) and recovers
+/// the real id on the next pull. Because a review POST is atomic, a returned
+/// review id means every planned comment was created, so an unmatched plan is
+/// pending, never dropped.
+pub(crate) fn reconcile_published(
+    planned: &[PlannedComment],
+    created: Option<&[CreatedComment]>,
+) -> Vec<(String, Option<String>)> {
+    let matched: std::collections::HashMap<String, String> = created
+        .map(|created| {
+            match_created_comments(planned, created)
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default();
+    planned
+        .iter()
+        .map(|p| (p.thread_id.clone(), matched.get(&p.thread_id).cloned()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,6 +654,104 @@ mod tests {
                 ("t2".to_string(), "8001".to_string()),
                 ("t1".to_string(), "8002".to_string()),
             ]
+        );
+    }
+
+    fn planned(thread_id: &str, line: u64, side: &str) -> PlannedComment {
+        PlannedComment {
+            thread_id: thread_id.to_string(),
+            input: ReviewCommentInput {
+                path: "src/a.rs".to_string(),
+                line,
+                side: side.to_string(),
+                start_line: None,
+                start_side: None,
+                body: "b".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn reconcile_pairs_ids_when_readback_succeeds() {
+        let plan = vec![planned("t1", 10, "RIGHT"), planned("t2", 5, "LEFT")];
+        let created = vec![
+            CreatedComment {
+                id: 8001,
+                path: "src/a.rs".to_string(),
+                side: Some("RIGHT".to_string()),
+                line: Some(10),
+                original_line: None,
+            },
+            CreatedComment {
+                id: 8002,
+                path: "src/a.rs".to_string(),
+                side: Some("LEFT".to_string()),
+                line: Some(5),
+                original_line: None,
+            },
+        ];
+        let reconciled = reconcile_published(&plan, Some(&created));
+        assert_eq!(
+            reconciled,
+            vec![
+                ("t1".to_string(), Some("8001".to_string())),
+                ("t2".to_string(), Some("8002".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn reconcile_marks_drafts_pending_when_readback_fails() {
+        // The review posted (its comments exist), but reading them back failed.
+        // Every planned draft is reported id-pending, not dropped — the caller
+        // marks them sent so a retry never re-posts a duplicate review.
+        let plan = vec![planned("t1", 10, "RIGHT"), planned("t2", 5, "LEFT")];
+        let reconciled = reconcile_published(&plan, None);
+        assert_eq!(
+            reconciled,
+            vec![("t1".to_string(), None), ("t2".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn reconcile_marks_only_unmatched_plans_pending() {
+        // A read-back that misses one comment still reports it pending (the review
+        // POST is atomic, so it is on GitHub) while pairing the one that matched.
+        let plan = vec![planned("t1", 10, "RIGHT"), planned("t2", 5, "LEFT")];
+        let created = vec![CreatedComment {
+            id: 8001,
+            path: "src/a.rs".to_string(),
+            side: Some("RIGHT".to_string()),
+            line: Some(10),
+            original_line: None,
+        }];
+        let reconciled = reconcile_published(&plan, Some(&created));
+        assert_eq!(
+            reconciled,
+            vec![
+                ("t1".to_string(), Some("8001".to_string())),
+                ("t2".to_string(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_submitted_unreconciled_root_is_never_replanned() {
+        // The caller stamps a non-numeric placeholder remote id on a draft whose
+        // created-comment id was not read back. That marks it published: it is
+        // never re-planned as a new inline comment (no duplicate on the next
+        // submit) and never taken as a reply target (its id is unknown).
+        let mut thread = line_thread("t", Side::New, 4, draft_comment("root", "new root"));
+        thread.comments[0].remote_id = Some("pending-unreconciled".to_string());
+        thread.comments.push(draft_comment("reply", "under it"));
+
+        assert!(
+            plan_inline_comments(std::slice::from_ref(&thread)).is_empty(),
+            "an unreconciled root is not re-submitted"
+        );
+        assert!(
+            plan_replies(std::slice::from_ref(&thread)).is_empty(),
+            "a reply cannot attach to an unreconciled root (id unknown)"
         );
     }
 

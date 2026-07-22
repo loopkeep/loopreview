@@ -142,14 +142,19 @@ impl PrHandle {
         // replies, so a draft reply under a newly-published root is recognized as
         // a reply to an existing thread — not left behind (the roots publish in
         // the review POST above; without this its children would be orphaned).
+        // Only reconciled roots (a known remote id) are stamped here; a root whose
+        // id was not read back yet cannot take an in_reply_to reply, so its replies
+        // stay drafts until the next pull recovers the id.
         let mut threads = threads.to_vec();
         for (thread_id, remote_id) in &outcome.published {
-            if let Some(root) = threads
-                .iter_mut()
-                .find(|t| t.id == *thread_id)
-                .and_then(|t| t.comments.first_mut())
-            {
-                root.remote_id = Some(remote_id.clone());
+            if let (Some(remote_id), Some(root)) = (
+                remote_id.as_deref(),
+                threads
+                    .iter_mut()
+                    .find(|t| t.id == *thread_id)
+                    .and_then(|t| t.comments.first_mut()),
+            ) {
+                root.remote_id = Some(remote_id.to_string());
             }
         }
         let (replies, failed_replies) = self
@@ -167,13 +172,34 @@ impl PrHandle {
             comment_id: r.comment_id,
             remote_id: r.comment.remote_id.unwrap_or_default(),
         };
+        // A submitted-but-unreconciled root (id not read back) is still marked
+        // published so it never re-posts and shows no [draft] badge; the sentinel
+        // is a non-numeric placeholder that no edit/delete path mistakes for a real
+        // id, and the next pull replaces it with the true remote comment.
+        let published = outcome
+            .published
+            .into_iter()
+            .map(|(thread_id, remote_id)| {
+                (
+                    thread_id,
+                    remote_id.unwrap_or_else(|| PENDING_REMOTE_ID.to_string()),
+                )
+            })
+            .collect();
         Ok(Submitted {
-            published: outcome.published,
+            published,
             replies: replies.into_iter().chain(conversation).map(stamp).collect(),
             failed_replies: failed_replies + failed_conversation,
         })
     }
 }
+
+/// The placeholder `remote_id` stamped on an inline draft that was submitted but
+/// whose created-comment id could not be read back. It marks the comment
+/// published (no `[draft]` badge, never re-posted) while being deliberately
+/// non-numeric, so every edit/delete path — which parses a real id as `u64` —
+/// treats it as unaddressable until the next pull recovers the true id.
+pub const PENDING_REMOTE_ID: &str = "pending-unreconciled";
 
 /// The kind of review to submit (UI-side mirror of the crate's event).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
