@@ -641,6 +641,9 @@ struct App {
     comment_blocks: Vec<Vec<TextLine<'static>>>,
     /// Rendered Conversation block per thread (root, replies), same order.
     conv_blocks: Vec<Vec<TextLine<'static>>>,
+    /// Per thread, the block-line index where each comment begins (root first,
+    /// then replies) — lets the Conversation cursor land on a single comment.
+    conv_comment_starts: Vec<Vec<usize>>,
     /// Whether each thread is outdated (line-anchored but no longer in the diff),
     /// index-aligned to `review.threads`. Drives the thread index's status icon.
     thread_outdated: Vec<bool>,
@@ -690,14 +693,20 @@ struct App {
     /// Selected position within `conv_order` (the Conversation view / thread
     /// index), not a `review.threads` index — map through `conv_order`.
     conv_cursor: usize,
+    /// Which comment within the selected thread the body cursor rests on (0 =
+    /// root, 1.. = replies). Lets `e`/`d` target a specific reply. Reset to 0
+    /// whenever the selected thread changes.
+    conv_comment: usize,
     /// Scroll offset (in lines) of the Conversation view.
     conv_scroll: usize,
     /// Minimum body width for `auto` layout to choose side-by-side.
     split_min_width: usize,
     /// True while awaiting confirmation to close (delete) the review.
     confirming_close: bool,
-    /// The draft thread index awaiting confirmation to remove, when `d` is armed.
-    confirming_delete: Option<usize>,
+    /// The delete target awaiting confirmation when `d` is armed: a thread index
+    /// and the comment within it to remove (`None` removes the whole thread; a
+    /// reply removes just itself).
+    confirming_delete: Option<(usize, Option<usize>)>,
     /// An in-progress background load (spinner), for `lr pr`.
     loading: Option<Loading>,
     /// A fatal load error to show instead of the diff.
@@ -745,7 +754,7 @@ impl App {
         let layout = Layouts::build(&diff, &review, &block_lens, &HashSet::new());
         let outdated = outdated_flags(&review, &layout.placed);
         let conv_order = conv_display_order(&review);
-        let conv_blocks = build_conversation(
+        let (conv_blocks, conv_comment_starts): (Vec<_>, Vec<_>) = build_conversation(
             &review,
             &diff,
             CONV_DEFAULT_WIDTH,
@@ -753,7 +762,9 @@ impl App {
             &outdated,
             &collapsed,
             repo_dir.as_deref(),
-        );
+        )
+        .into_iter()
+        .unzip();
         let num_width = digits(layout.max_lineno).max(3);
         let file_count = diff.files.len();
         let cline_index = layout
@@ -791,8 +802,10 @@ impl App {
             submit: None,
             comment_blocks,
             conv_blocks,
+            conv_comment_starts,
             thread_outdated: outdated,
             conv_order,
+            conv_comment: 0,
             collapsed,
             manual_fold: HashSet::new(),
             collapsed_files: HashSet::new(),
@@ -1255,7 +1268,7 @@ impl App {
         let layout = Layouts::build(&diff, &self.review, &block_lens, &self.collapsed_files);
         self.thread_outdated = outdated_flags(&self.review, &layout.placed);
         let conv_width = self.body_width.get().clamp(40, 120);
-        self.conv_blocks = build_conversation(
+        (self.conv_blocks, self.conv_comment_starts) = build_conversation(
             &self.review,
             &diff,
             conv_width,
@@ -1263,11 +1276,14 @@ impl App {
             &self.thread_outdated,
             &self.collapsed,
             self.repo_dir.as_deref(),
-        );
+        )
+        .into_iter()
+        .unzip();
         self.conv_order = conv_display_order(&self.review);
         self.conv_cursor = self
             .conv_cursor
             .min(self.conv_order.len().saturating_sub(1));
+        self.conv_comment = self.clamped_conv_comment();
         self.num_width = digits(layout.max_lineno).max(3);
         self.cline_index = layout
             .clines
@@ -1415,11 +1431,18 @@ impl App {
             return;
         }
         // While confirming a draft delete: y/Enter removes, anything else cancels.
-        if let Some(idx) = self.confirming_delete.take() {
+        if let Some((ti, ci)) = self.confirming_delete.take() {
             if matches!(code, KeyCode::Char('y') | KeyCode::Enter) {
-                if idx < self.review.threads.len() {
-                    self.remove_draft(idx, None);
-                    self.status = Some("draft removed".to_string());
+                if ti < self.review.threads.len() {
+                    self.remove_draft(ti, ci);
+                    self.status = Some(
+                        if ci.is_some() {
+                            "reply removed"
+                        } else {
+                            "draft removed"
+                        }
+                        .to_string(),
+                    );
                 }
             } else {
                 self.status = Some("delete cancelled".to_string());
@@ -1510,11 +1533,32 @@ impl App {
         }
     }
 
-    /// Arm the delete confirmation for the draft thread the selection points at.
+    /// Arm the delete confirmation for the unpublished comment the selection
+    /// points at.
     fn request_delete(&mut self) {
-        match self.selected_draft_thread() {
-            Some(idx) => self.confirming_delete = Some(idx),
-            None => self.status = Some("no draft thread here to remove".to_string()),
+        match self.selected_delete_target() {
+            Some(target) => self.confirming_delete = Some(target),
+            None => self.status = Some("nothing removable here (drafts only)".to_string()),
+        }
+    }
+
+    /// What `d` removes: in the Conversation view the selected comment (a reply
+    /// removes just itself; the root takes its whole thread); in Files the thread
+    /// at the cursor. Only when the target is unpublished — GitHub comments stay.
+    fn selected_delete_target(&self) -> Option<(usize, Option<usize>)> {
+        if self.view == View::Conversation {
+            let (ti, ci) = self.selected_comment()?;
+            if self.review.threads[ti].comments.get(ci)?.is_published() {
+                return None;
+            }
+            // Removing the root takes the thread with it; a reply removes itself.
+            Some((ti, if ci == 0 { None } else { Some(ci) }))
+        } else {
+            let ti = self.thread_at_cursor()?;
+            self.review.threads[ti]
+                .root()
+                .is_some_and(|c| !c.is_published())
+                .then_some((ti, None))
         }
     }
 
@@ -1571,48 +1615,42 @@ impl App {
         );
     }
 
-    /// The thread the selection points at (Conversation: the selected thread;
-    /// Files: the thread at the cursor line), if it is unpublished — a local note
-    /// or a draft the reviewer can withdraw. A published thread cannot be removed.
-    fn selected_draft_thread(&self) -> Option<usize> {
-        let idx = if self.view == View::Conversation {
-            self.selected_thread()?
+    /// The comment `e` edits: in the Conversation view the comment the cursor
+    /// rests on (root or reply); in Files the thread's root (the diff shows only
+    /// the root inline).
+    fn edit_target(&self) -> Option<(usize, usize)> {
+        if self.view == View::Conversation {
+            self.selected_comment()
         } else {
-            self.thread_at_cursor()?
-        };
-        self.review.threads[idx]
-            .root()
-            .is_some_and(|c| !c.is_published())
-            .then_some(idx)
+            self.thread_at_cursor().map(|ti| (ti, 0))
+        }
     }
 
-    /// Open the composer to edit the selected thread's root comment, pre-filled
-    /// with its body. Only your own unpublished comment (a draft or a local
-    /// note): a published GitHub comment cannot be edited from here, and
-    /// rewriting another author's note would misattribute it. Editing a reply
-    /// needs comment-level navigation and is not in this version.
+    /// Open the composer to edit the targeted comment, pre-filled with its body.
+    /// Only your own unpublished comment (a draft or a local note): a published
+    /// GitHub comment cannot be edited from here, and rewriting another author's
+    /// comment would misattribute it.
     fn start_edit(&mut self) {
-        let Some(idx) = self.selected_thread_any() else {
+        let Some((ti, ci)) = self.edit_target() else {
             self.status = Some("no comment selected".to_string());
             return;
         };
-        let thread = &self.review.threads[idx];
-        let Some(root) = thread.root() else {
+        let Some(comment) = self.review.threads[ti].comments.get(ci) else {
             return;
         };
-        if root.is_published() {
+        if comment.is_published() {
             self.status = Some("a published comment can't be edited here".to_string());
             return;
         }
-        if root.author != self.author {
+        if comment.author != self.author {
             self.status = Some("only your own comments can be edited".to_string());
             return;
         }
         let compose = Compose {
-            area: TextArea::from_text(&root.body),
+            area: TextArea::from_text(&comment.body),
             kind: ComposeKind::Edit {
-                thread: thread.id.clone(),
-                comment: root.id.clone(),
+                thread: self.review.threads[ti].id.clone(),
+                comment: comment.id.clone(),
             },
             target: "edit comment".to_string(),
             confirming_discard: false,
@@ -2357,10 +2395,11 @@ impl App {
     fn conversation_action(&mut self, action: Action) {
         let page = self.body_height.get().max(1);
         match action {
-            // j/k keep selecting threads (the scroll snaps to follow); the wheel
-            // and the page/end keys scroll the pane freely without changing it.
-            Action::MoveDown => self.move_conv(1),
-            Action::MoveUp => self.move_conv(-1),
+            // j/k step through comments (root, then replies) and cross into the
+            // next thread at a thread's ends; the wheel and page/end keys scroll
+            // the pane freely without moving the cursor.
+            Action::MoveDown => self.move_conv_comment(1),
+            Action::MoveUp => self.move_conv_comment(-1),
             Action::Top => self.conv_scroll = 0,
             Action::Bottom => self.conv_scroll = self.conv_max_scroll(),
             Action::HalfPageDown | Action::PageDown => {
@@ -2455,6 +2494,81 @@ impl App {
         self.conv_order.get(self.conv_cursor).copied()
     }
 
+    /// Number of cursor stops in the selected thread: each comment when it is
+    /// expanded, else one (its header). Always ≥ 1 when a thread is selected.
+    fn selected_comment_count(&self) -> usize {
+        let Some(ti) = self.selected_thread() else {
+            return 0;
+        };
+        if self.collapsed.contains(&self.review.threads[ti].id) {
+            1
+        } else {
+            self.review.threads[ti].comments.len().max(1)
+        }
+    }
+
+    /// `conv_comment` clamped to the selected thread's stop count.
+    fn clamped_conv_comment(&self) -> usize {
+        self.conv_comment
+            .min(self.selected_comment_count().saturating_sub(1))
+    }
+
+    /// The (thread, comment) index the Conversation cursor rests on.
+    fn selected_comment(&self) -> Option<(usize, usize)> {
+        let ti = self.selected_thread()?;
+        let ci = self
+            .conv_comment
+            .min(self.review.threads[ti].comments.len().saturating_sub(1));
+        Some((ti, ci))
+    }
+
+    /// Move the Conversation body cursor by `delta` comments, stepping into the
+    /// next or previous thread at a thread's ends.
+    fn move_conv_comment(&mut self, delta: isize) {
+        if self.conv_order.is_empty() {
+            return;
+        }
+        if delta > 0 {
+            if self.conv_comment + 1 < self.selected_comment_count() {
+                self.conv_comment += 1;
+            } else if self.conv_cursor + 1 < self.conv_order.len() {
+                self.conv_cursor += 1;
+                self.conv_comment = 0;
+            }
+        } else if delta < 0 {
+            if self.conv_comment > 0 {
+                self.conv_comment -= 1;
+            } else if self.conv_cursor > 0 {
+                self.conv_cursor -= 1;
+                self.conv_comment = self.selected_comment_count().saturating_sub(1);
+            }
+        }
+        self.follow_conv_comment();
+        self.reveal_in_sidebar(self.conv_cursor);
+    }
+
+    /// Scroll so the selected comment is visible (its meta line within the block).
+    fn follow_conv_comment(&mut self) {
+        let offsets = self.conv_offsets();
+        let Some(&block_start) = offsets.get(self.conv_cursor) else {
+            return;
+        };
+        let within = self
+            .selected_thread()
+            .and_then(|ti| self.conv_comment_starts.get(ti))
+            .and_then(|starts| starts.get(self.conv_comment.min(starts.len().saturating_sub(1))))
+            .copied()
+            .unwrap_or(0);
+        let target = block_start + within;
+        let height = self.body_height.get().max(1);
+        if target < self.conv_scroll {
+            self.conv_scroll = target;
+        } else if target >= self.conv_scroll + height {
+            self.conv_scroll = target.saturating_sub(height / 2);
+        }
+        self.conv_scroll = self.conv_scroll.min(self.conv_max_scroll());
+    }
+
     /// The display position (within `conv_order`) of thread `storage`.
     fn thread_display_pos(&self, storage: usize) -> usize {
         self.conv_order
@@ -2463,20 +2577,13 @@ impl App {
             .unwrap_or(0)
     }
 
-    fn move_conv(&mut self, delta: isize) {
-        if self.conv_order.is_empty() {
-            return;
-        }
-        let last = (self.conv_order.len() - 1) as isize;
-        let next = (self.conv_cursor as isize + delta).clamp(0, last);
-        self.set_conv(next as usize);
-    }
-
     fn set_conv(&mut self, index: usize) {
         if self.conv_order.is_empty() {
             return;
         }
         self.conv_cursor = index.min(self.conv_order.len() - 1);
+        // Landing on a thread (a sidebar jump) rests the cursor on its root.
+        self.conv_comment = 0;
         self.follow_conv();
         // Keep the thread index (sidebar) tracking the selection too.
         self.reveal_in_sidebar(self.conv_cursor);
@@ -4010,9 +4117,9 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
-    /// The confirmation modal for withdrawing a draft thread with `d`.
+    /// The confirmation modal for withdrawing a draft comment or thread with `d`.
     fn draw_delete_confirm(&self, f: &mut Frame) {
-        let Some(idx) = self.confirming_delete else {
+        let Some((idx, ci)) = self.confirming_delete else {
             return;
         };
         let area = centered_rect(60, 22, f.area());
@@ -4029,11 +4136,13 @@ impl App {
             .get(idx)
             .map(|t| anchor_label(&t.anchor))
             .unwrap_or_default();
+        let what = if ci.is_some() {
+            format!("Withdraw your reply on {label}?")
+        } else {
+            format!("Withdraw your draft thread on {label}?")
+        };
         let lines = vec![
-            TextLine::from(TextSpan::styled(
-                format!("Withdraw your draft thread on {label}?"),
-                Style::default().fg(Color::White),
-            )),
+            TextLine::from(TextSpan::styled(what, Style::default().fg(Color::White))),
             TextLine::from(""),
             TextLine::from(TextSpan::styled(
                 "y / Enter confirm · any other key cancel",
@@ -4089,10 +4198,23 @@ impl App {
         for (pos, &ti) in self.conv_order.iter().enumerate() {
             let block = &self.conv_blocks[ti];
             let selected = pos == self.conv_cursor;
+            // Within the selected thread, the cursor rests on one comment; tint
+            // that comment's line range (plus the header, so the thread reads as
+            // active even when the cursor is on a reply).
+            let (lo, hi) = if selected {
+                let starts = &self.conv_comment_starts[ti];
+                let ci = self.conv_comment.min(starts.len().saturating_sub(1));
+                let lo = starts.get(ci).copied().unwrap_or(0);
+                let hi = starts.get(ci + 1).copied().unwrap_or(block.len());
+                (lo, hi)
+            } else {
+                (0, 0)
+            };
             for (li, line) in block.iter().enumerate() {
                 // The header (first line of a block) gets a full-width band, like
-                // a file header; the selected thread tints its whole block.
-                let bg = if selected {
+                // a file header; the selected comment (and its thread's header)
+                // is tinted.
+                let bg = if selected && (li == 0 || (li >= lo && li < hi)) {
                     Some(select_bg)
                 } else if li == 0 {
                     Some(HEADER_BG)
@@ -5264,6 +5386,10 @@ fn build_comment_blocks(
 /// `review.threads`): where it is anchored and its state, then the root comment
 /// and nested replies, each with an author and a relative timestamp.
 #[allow(clippy::too_many_arguments)]
+/// Each thread's rendered block, paired with the block-line index where each of
+/// its comments (root first, then replies) begins — so the Conversation view can
+/// highlight the one comment the cursor rests on. A collapsed thread's only stop
+/// is its header line (`[0]`).
 fn build_conversation(
     review: &Review,
     diff: &Diff,
@@ -5272,7 +5398,7 @@ fn build_conversation(
     outdated: &[bool],
     collapsed: &HashSet<String>,
     repo_dir: Option<&Path>,
-) -> Vec<Vec<TextLine<'static>>> {
+) -> Vec<(Vec<TextLine<'static>>, Vec<usize>)> {
     let now = now();
     review
         .threads
@@ -5326,8 +5452,12 @@ fn build_conversation(
             lines.push(TextLine::from(header));
 
             if is_collapsed {
-                return lines;
+                // A collapsed thread has a single stop: its header line.
+                return (lines, vec![0]);
             }
+
+            // Track where each comment's meta line lands within the block.
+            let mut comment_starts: Vec<usize> = Vec::with_capacity(thread.comments.len());
 
             // For an outdated thread, show the line it was left on: reconstructed
             // from history (`git show <commit>:<path>`), or the saved snippet.
@@ -5357,6 +5487,7 @@ fn build_conversation(
             }
 
             if let Some(root) = thread.root() {
+                comment_starts.push(lines.len());
                 lines.push(comment_meta_line(root, now, false));
                 lines.extend(crate::markdown::render(
                     &root.body,
@@ -5365,6 +5496,7 @@ fn build_conversation(
                 ));
             }
             for reply in thread.replies() {
+                comment_starts.push(lines.len());
                 lines.push(comment_meta_line(reply, now, true));
                 for line in
                     crate::markdown::render(&reply.body, Some(width.saturating_sub(2)), highlighter)
@@ -5374,7 +5506,10 @@ fn build_conversation(
                     lines.push(TextLine::from(spans));
                 }
             }
-            lines
+            if comment_starts.is_empty() {
+                comment_starts.push(0);
+            }
+            (lines, comment_starts)
         })
         .collect()
 }
@@ -6727,6 +6862,68 @@ mod tests {
                 .unwrap_or("")
                 .contains("published")
         );
+    }
+
+    #[test]
+    fn e_edits_a_reply_via_the_comment_cursor() {
+        let mut app = sample_app(); // author "tester"
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "agent",
+            "root note",
+            CommentKind::Local,
+        );
+        let tid = app.review.threads[0].id.clone();
+        app.add_reply(&tid, "tester", "my reply", CommentKind::Local);
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        // On the root (someone else's), edit is refused.
+        app.on_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(app.input.is_none(), "can't edit another author's root");
+        // j steps to the reply (your own); edit it.
+        app.on_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.conv_comment, 1, "the cursor moved to the reply");
+        app.on_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(
+            app.input.is_some(),
+            "editing your own reply opens the composer"
+        );
+        assert_eq!(app.input.as_ref().unwrap().area.text(), "my reply");
+        app.on_key(KeyCode::Char('!'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.review.threads[0].comments[1].body, "my reply!");
+        assert_eq!(
+            app.review.threads[0].comments[0].body, "root note",
+            "the root is untouched"
+        );
+    }
+
+    #[test]
+    fn d_removes_a_reply_without_the_thread() {
+        let mut app = sample_app();
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "root",
+            CommentKind::Local,
+        );
+        let tid = app.review.threads[0].id.clone();
+        app.add_reply(&tid, "tester", "reply", CommentKind::Local);
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        app.conv_comment = 1; // the reply
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE); // arm the confirm
+        assert!(app.confirming_delete.is_some());
+        app.on_key(KeyCode::Char('y'), KeyModifiers::NONE); // confirm
+        assert_eq!(app.review.threads.len(), 1, "the thread stays");
+        assert_eq!(
+            app.review.threads[0].comments.len(),
+            1,
+            "only the reply is gone"
+        );
+        assert_eq!(app.review.threads[0].comments[0].body, "root");
     }
 
     #[test]

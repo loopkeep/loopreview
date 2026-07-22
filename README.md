@@ -144,13 +144,13 @@ move; `Enter` opens the file; `Esc` closes.
 
 | Key | Action |
 | --- | --- |
-| `j` / `k` | Select a thread |
+| `j` / `k` | Move between comments (root and replies), crossing into the next/previous thread at a thread's ends |
 | `g` / `G` | First / last thread |
 | `Ctrl-D` / `Ctrl-U` (or `PageDown` / `PageUp`) | Scroll |
 | `r` | Reply to the selected thread |
 | `x` | Resolve / reopen |
-| `e` | Edit your own unpublished comment (the selected thread's root) |
-| `d` | Withdraw the selected thread if unpublished (a draft or local note) |
+| `e` | Edit your own unpublished comment at the cursor (root or reply) |
+| `d` | Withdraw the comment at the cursor if unpublished (a reply removes just itself; the root removes the thread) |
 | `t` | Toggle the selected thread between a draft and a local note (pull requests) |
 | `o` | Collapse / expand |
 | `X` | Close the review (asks to confirm) |
