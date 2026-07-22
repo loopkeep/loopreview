@@ -1631,9 +1631,25 @@ impl App {
         }
     }
 
+    /// Whether thread `idx` can be resolved. Local reviews resolve everything (a
+    /// local concept); on a pull request only review threads (line/file-anchored)
+    /// resolve — conversation comments (issue comments and review bodies, which
+    /// anchor at [`Anchor::Review`]) have no resolve affordance on GitHub.
+    fn is_resolvable(&self, idx: usize) -> bool {
+        self.pr.is_none()
+            || !matches!(
+                self.review.threads.get(idx).map(|t| &t.anchor),
+                Some(Anchor::Review)
+            )
+    }
+
     /// Toggle the resolved state of thread `idx`. A published thread in a PR
     /// syncs to GitHub in the background; a local thread just toggles and saves.
     fn resolve_thread(&mut self, idx: usize) {
+        if !self.is_resolvable(idx) {
+            self.status = Some("conversation comments can't be resolved on GitHub".to_string());
+            return;
+        }
         let thread = &self.review.threads[idx];
         let published = thread.root().is_some_and(|c| c.remote_id.is_some());
         let want_resolved = !thread.is_resolved();
@@ -3762,7 +3778,15 @@ impl App {
             let help = if self.focus == Focus::Sidebar {
                 "j/k move · l open · o fold · esc body · ^p find · q quit"
             } else if self.view == View::Conversation {
-                "j/k thread · l open · h fold · r reply · x resolve · b index · tab diff · q quit"
+                // `x` (resolve) only appears when the selected thread can resolve.
+                if self
+                    .selected_thread()
+                    .is_some_and(|i| self.is_resolvable(i))
+                {
+                    "j/k thread · l open · h fold · r reply · x resolve · b index · tab diff · q quit"
+                } else {
+                    "j/k thread · l open · h fold · r reply · b index · tab diff · q quit"
+                }
             } else if self.cursor_is_header() {
                 "h fold · l open · j/k move · b sidebar · ^p find · q quit"
             } else {
@@ -4125,7 +4149,13 @@ impl App {
                 let ti = self.conv_order[pos];
                 let thread = &self.review.threads[ti];
                 let outdated = self.thread_outdated.get(ti).copied().unwrap_or(false);
-                let (glyph, glyph_fg) = thread_status(thread, outdated);
+                // A non-resolvable thread (a PR conversation comment) has no
+                // open/resolved state — show a neutral dot instead.
+                let (glyph, glyph_fg) = if self.is_resolvable(ti) {
+                    thread_status(thread, outdated)
+                } else {
+                    ("·", Color::DarkGray)
+                };
                 // The selected thread is what the right pane shows: a strong fill
                 // while the sidebar has focus, a subtle one when the body does.
                 let is_sel = pos == self.conv_cursor;
@@ -6441,6 +6471,46 @@ mod tests {
         app.focus = Focus::Body;
         app.conversation_action(Action::NavIn);
         assert!(!app.selected_collapsed(), "l expands a collapsed thread");
+    }
+
+    #[test]
+    fn pr_conversation_comments_are_not_resolvable() {
+        let mut app = multi_file_app(&["a.rs"]);
+        app.pr = Some(Arc::new(crate::prsync::PrHandle::for_test(1, "t")));
+        app.review
+            .threads
+            .push(thread_with("conv", Anchor::Review, 0));
+        app.review
+            .threads
+            .push(thread_with("line", Anchor::line("a.rs", Side::New, 1), 1));
+        app.relayout();
+        assert!(
+            !app.is_resolvable(0),
+            "a PR conversation comment can't resolve"
+        );
+        assert!(app.is_resolvable(1), "a PR review thread can resolve");
+
+        // Resolving the conversation comment is a no-op with a friendly status.
+        app.resolve_thread(0);
+        assert!(!app.review.threads[0].is_resolved());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("can't be resolved"),
+            "a friendly status, not an error: {:?}",
+            app.status
+        );
+        // The review thread resolves as usual.
+        app.resolve_thread(1);
+        assert!(
+            app.review.threads[1].is_resolved(),
+            "a review thread resolves"
+        );
+
+        // A local review (no PR) resolves everything, conversation comments too.
+        app.pr = None;
+        assert!(app.is_resolvable(0), "local reviews resolve everything");
     }
 
     #[test]

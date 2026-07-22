@@ -64,6 +64,25 @@ impl PrHandle {
         &self.pr.title
     }
 
+    /// A handle with an offline client, for tests that only need PR mode plus
+    /// the number/title (no network calls are made).
+    #[cfg(test)]
+    pub fn for_test(number: u64, title: &str) -> PrHandle {
+        PrHandle {
+            client: GithubClient::new(std::env::temp_dir()),
+            pr: ResolvedPr {
+                owner: "owner".into(),
+                repo: "repo".into(),
+                number,
+                title: title.into(),
+                base_ref: "main".into(),
+                head_ref: "feature".into(),
+                state: "OPEN".into(),
+                url: String::new(),
+            },
+        }
+    }
+
     /// Re-pull the PR's threads from GitHub.
     pub fn pull(&self) -> Result<Vec<Thread>, String> {
         self.client.pull(&self.pr).map_err(|e| e.to_string())
