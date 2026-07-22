@@ -136,6 +136,38 @@ impl Hunk {
             self.old_start, self.old_lines, self.new_start, self.new_lines
         )
     }
+
+    /// Pair the deletion and addition lines that represent the same logical
+    /// edit, for intra-line (word-level) diffing.
+    ///
+    /// Returns `(deletion_index, addition_index)` pairs of indices into
+    /// [`Self::lines`]. Within each contiguous block of changed lines (a run of
+    /// deletions and additions uninterrupted by context), the k-th deletion is
+    /// paired with the k-th addition; surplus deletions or additions on either
+    /// side are left unpaired (a whole-line insertion or removal).
+    pub fn change_pairs(&self) -> Vec<(usize, usize)> {
+        let mut pairs = Vec::new();
+        let mut deletions: Vec<usize> = Vec::new();
+        let mut additions: Vec<usize> = Vec::new();
+
+        let mut flush = |dels: &mut Vec<usize>, adds: &mut Vec<usize>| {
+            for (&d, &a) in dels.iter().zip(adds.iter()) {
+                pairs.push((d, a));
+            }
+            dels.clear();
+            adds.clear();
+        };
+
+        for (i, line) in self.lines.iter().enumerate() {
+            match line.kind {
+                LineKind::Deletion => deletions.push(i),
+                LineKind::Addition => additions.push(i),
+                LineKind::Context => flush(&mut deletions, &mut additions),
+            }
+        }
+        flush(&mut deletions, &mut additions);
+        pairs
+    }
 }
 
 /// The complete set of changes to one file.
@@ -298,6 +330,53 @@ mod tests {
             lines: vec![],
         };
         assert_eq!(hunk.header(), "@@ -1,3 +1,4 @@");
+    }
+
+    fn hunk_of(lines: Vec<Line>) -> Hunk {
+        Hunk {
+            old_start: 1,
+            old_lines: 0,
+            new_start: 1,
+            new_lines: 0,
+            section: None,
+            lines,
+        }
+    }
+
+    #[test]
+    fn change_pairs_matches_deletions_to_additions_in_a_block() {
+        // context / delete / add / context: the delete and add pair up.
+        let hunk = hunk_of(vec![
+            context("keep", 1, 1),
+            deletion("old", 2),
+            addition("new", 2),
+            context("tail", 3, 3),
+        ]);
+        assert_eq!(hunk.change_pairs(), vec![(1, 2)]);
+    }
+
+    #[test]
+    fn change_pairs_leaves_surplus_lines_unpaired() {
+        // Two deletions, one addition: only the first deletion pairs.
+        let hunk = hunk_of(vec![deletion("a", 1), deletion("b", 2), addition("c", 1)]);
+        assert_eq!(hunk.change_pairs(), vec![(0, 2)]);
+    }
+
+    #[test]
+    fn change_pairs_does_not_cross_a_context_line() {
+        // A deletion and addition separated by context are different edits.
+        let hunk = hunk_of(vec![
+            deletion("x", 1),
+            context("gap", 2, 1),
+            addition("y", 2),
+        ]);
+        assert!(hunk.change_pairs().is_empty());
+    }
+
+    #[test]
+    fn change_pairs_of_a_pure_insertion_is_empty() {
+        let hunk = hunk_of(vec![addition("a", 1), addition("b", 2)]);
+        assert!(hunk.change_pairs().is_empty());
     }
 
     #[test]
