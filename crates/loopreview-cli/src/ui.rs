@@ -57,6 +57,12 @@ const ADD_EMPH_BG: Color = Color::Rgb(30, 84, 44);
 const DEL_EMPH_BG: Color = Color::Rgb(96, 40, 46);
 /// Background of the line the cursor is on (when it has no diff tint).
 const CURSOR_BG: Color = Color::Rgb(38, 43, 56);
+/// Background of the file header the cursor rests on — brighter than a content
+/// line's cursor, since headers are the diff's few anchors and must stand out.
+const HEADER_CURSOR_BG: Color = Color::Rgb(54, 64, 92);
+/// Background marking the sidebar file currently shown in the body (a subtle
+/// blue tint under a cyan bar), distinct from the stronger selection color.
+const SIDEBAR_CURRENT_BG: Color = Color::Rgb(33, 43, 62);
 /// Background of a side-by-side cell with no line (the other side changed).
 const ABSENT_BG: Color = Color::Rgb(22, 24, 30);
 /// The bar background used for the header and footer.
@@ -72,8 +78,9 @@ const HSCROLL_MARGIN: usize = 8;
 /// Sidebar width bounds (the minimum diff width kept beside it is configurable).
 const SIDEBAR_MIN: usize = 22;
 const SIDEBAR_MAX: usize = 44;
-/// Background of a selected sidebar / finder row.
-const SEL_BG: Color = Color::Rgb(45, 50, 66);
+/// Background of a selected sidebar / finder row — a clear blue, distinct at a
+/// glance from the current-file and cursor tints.
+const SEL_BG: Color = Color::Rgb(48, 66, 106);
 /// Background of lines in a range selection (for a multi-line comment).
 const SELECTION_BG: Color = Color::Rgb(38, 48, 74);
 /// A cursor stop's `flat` value meaning "the file header" (not a content line).
@@ -3537,27 +3544,36 @@ impl App {
             String::new()
         };
         // When the row is too narrow, drop the head of the path (not the tail),
-        // so the filename is always visible (DESIGN §4). The chevron is 2 columns.
+        // so the filename is always visible (DESIGN §4). A 1-col cursor marker
+        // and the 2-col chevron precede the path.
         let suffix = format!("  [{}]  +{added} -{removed}{badge}", file.status.label());
         let budget = self
             .body_width
             .get()
-            .saturating_sub(2 + suffix.chars().count());
+            .saturating_sub(1 + 2 + suffix.chars().count());
         let path = truncate_path_head(&path, budget.max(1));
-        // A chevron shows the fold state; bold/white marks the current file; a
-        // background fills the row when the cursor rests on this header.
+        // A chevron shows the fold state; bold/white marks the current file. When
+        // the cursor rests here, a bright bar and a fill brighter than a content
+        // line's cursor make the header stand out (it anchors the whole file).
         let chevron = if collapsed { "▸ " } else { "▾ " };
         let base = if is_cursor {
-            Style::default().bg(CURSOR_BG)
+            Style::default()
+                .bg(HEADER_CURSOR_BG)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
+        let marker = if is_cursor { "▎" } else { " " };
         let path_style = if is_current {
             base.fg(Color::White).add_modifier(Modifier::BOLD)
         } else {
             base.fg(Color::Gray).add_modifier(Modifier::BOLD)
         };
         let mut spans = vec![
+            TextSpan::styled(
+                marker.to_string(),
+                base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
             TextSpan::styled(chevron, base.fg(Color::Cyan)),
             TextSpan::styled(path, path_style),
             TextSpan::styled(
@@ -3663,28 +3679,36 @@ impl App {
         let entries = self.file_entries();
         let width = area.width as usize;
         let height = area.height as usize;
-        // The selection is the sidebar cursor when focused, else the current file.
-        let selected = if self.focus == Focus::Sidebar {
-            self.sidebar_cursor
-        } else {
-            self.current_file()
-        };
+        let current = self.current_file();
+        let sidebar_focused = self.focus == Focus::Sidebar;
         let start = self.sidebar_scroll.min(entries.len());
         let end = (start + height).min(entries.len());
+        // Two states are shown at once and must be told apart: the sidebar
+        // cursor (a clear blue fill + a bright bar, only while the sidebar has
+        // focus) and the file currently open in the body (a subtle blue tint +
+        // a cyan bar, always). A leading marker column carries the bar.
         let lines: Vec<TextLine> = entries[start..end]
             .iter()
             .map(|e| {
-                let base = if e.index == selected {
-                    let bg = if self.focus == Focus::Sidebar {
-                        SEL_BG
-                    } else {
-                        CURSOR_BG
-                    };
-                    Style::default().bg(bg)
+                let is_cursor = sidebar_focused && e.index == self.sidebar_cursor;
+                let is_current = e.index == current;
+                let (base, marker, marker_fg) = if is_cursor {
+                    (
+                        Style::default().bg(SEL_BG).add_modifier(Modifier::BOLD),
+                        "▎",
+                        Color::White,
+                    )
+                } else if is_current {
+                    (Style::default().bg(SIDEBAR_CURRENT_BG), "▎", Color::Cyan)
                 } else {
-                    Style::default()
+                    (Style::default(), " ", Color::Reset)
                 };
-                TextLine::from(self.file_row_spans(e, width, base, &[]))
+                let mut spans = vec![TextSpan::styled(
+                    marker.to_string(),
+                    base.fg(marker_fg).add_modifier(Modifier::BOLD),
+                )];
+                spans.extend(self.file_row_spans(e, width.saturating_sub(1), base, &[]));
+                TextLine::from(spans)
             })
             .collect();
         f.render_widget(Paragraph::new(lines), area);
@@ -5609,6 +5633,71 @@ mod tests {
         app.mouse_down(3, 3);
         assert_eq!(app.current_file(), 2, "a sidebar-row click opens that file");
         assert_eq!(app.focus, Focus::Body);
+    }
+
+    #[test]
+    fn sidebar_shows_cursor_and_current_file_distinctly() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = multi_file_app(&["a.rs", "b.rs", "c.rs"]);
+        app.sidebar_override = Some(true);
+        app.body_width.set(120);
+        // Current file is a.rs (0); the sidebar cursor rests on c.rs (2).
+        app.focus = Focus::Sidebar;
+        app.sidebar_cursor = 2;
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        // The marker column (col 0) carries each row's state background.
+        let mut sel_row = None;
+        let mut current_row = None;
+        for y in 0..24u16 {
+            match buf[(0, y)].bg {
+                SEL_BG => sel_row = Some(y),
+                SIDEBAR_CURRENT_BG => current_row = Some(y),
+                _ => {}
+            }
+        }
+        let sel_row = sel_row.expect("the sidebar cursor row is filled with the selection color");
+        let current_row =
+            current_row.expect("the current-file row is filled with the current-file color");
+        assert_ne!(
+            sel_row, current_row,
+            "cursor and current file are drawn on different rows"
+        );
+        assert_ne!(
+            SEL_BG, SIDEBAR_CURRENT_BG,
+            "the two states use visibly distinct colors"
+        );
+    }
+
+    #[test]
+    fn header_cursor_uses_a_stronger_fill_than_a_line() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = multi_file_app(&["a.rs"]);
+        app.mode = Mode::Unified;
+        app.sidebar_override = Some(false);
+        app.cursor = 0; // the file header is the first cursor stop
+        assert!(app.cursor_is_header());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let mut header_row = None;
+        for y in 0..24u16 {
+            let text: String = (0..80u16).map(|x| buf[(x, y)].symbol()).collect();
+            if text.contains("a.rs") {
+                header_row = Some(y);
+                break;
+            }
+        }
+        let header_row = header_row.expect("the file header is rendered");
+        assert_eq!(
+            buf[(0, header_row)].bg,
+            HEADER_CURSOR_BG,
+            "the cursored header is filled brighter than a content line ({CURSOR_BG:?})"
+        );
+        assert_ne!(HEADER_CURSOR_BG, CURSOR_BG, "stronger than a line cursor");
     }
 
     #[test]
