@@ -86,8 +86,21 @@ pub fn diff_target(dir: &Path, target: &str, pathspec: &[String]) -> Result<Stri
 /// The commit SHA at `HEAD`, or `None` when it cannot be resolved (e.g. a
 /// repository with no commits yet).
 pub fn head_sha(dir: &Path) -> Option<String> {
+    rev_parse(dir, "HEAD")
+}
+
+/// Resolve a revision to its commit SHA, or `None` when it cannot be resolved.
+pub fn rev_parse(dir: &Path, rev: &str) -> Option<String> {
     let mut cmd = Command::new("git");
-    cmd.current_dir(dir).args(["rev-parse", "HEAD"]);
+    cmd.current_dir(dir).args(["rev-parse", "--verify", rev]);
+    let sha = run(cmd).ok()?.trim().to_string();
+    (!sha.is_empty()).then_some(sha)
+}
+
+/// The best common ancestor commit of `a` and `b`, or `None` when there is none.
+pub fn merge_base(dir: &Path, a: &str, b: &str) -> Option<String> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir).args(["merge-base", a, b]);
     let sha = run(cmd).ok()?.trim().to_string();
     (!sha.is_empty()).then_some(sha)
 }

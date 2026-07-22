@@ -107,14 +107,46 @@ impl RefSource {
 impl DiffSource for RefSource {
     fn load(&self) -> Result<Diff, DiffError> {
         let text = git::diff_target(&self.dir, &self.target, &self.pathspec)?;
-        // Provenance for an arbitrary range is left unresolved in M1 (a best
-        // effort would have to interpret git's `..` / `...` range grammar).
-        patch::parse(&text)
+        let mut diff = patch::parse(&text)?;
+        diff.provenance = resolve_ref_provenance(&self.dir, &self.target);
+        Ok(diff)
     }
 
     fn describe(&self) -> String {
         format!("git diff {}", self.target)
     }
+}
+
+/// Resolve the base/head commit SHAs a `git diff <target>` compares, matching
+/// git's range grammar:
+///
+/// * `A...B` — from the merge base of `A` and `B` to `B` (empty side = `HEAD`);
+/// * `A..B` — from `A` to `B` (empty side = `HEAD`);
+/// * `A` — from `A` to the working tree (so the new side is not a commit).
+fn resolve_ref_provenance(dir: &std::path::Path, target: &str) -> Provenance {
+    if let Some((a, b)) = target.split_once("...") {
+        let (a, b) = (default_head(a), default_head(b));
+        Provenance {
+            base: git::merge_base(dir, a, b),
+            head: git::rev_parse(dir, b),
+        }
+    } else if let Some((a, b)) = target.split_once("..") {
+        let (a, b) = (default_head(a), default_head(b));
+        Provenance {
+            base: git::rev_parse(dir, a),
+            head: git::rev_parse(dir, b),
+        }
+    } else {
+        Provenance {
+            base: git::rev_parse(dir, target),
+            head: None,
+        }
+    }
+}
+
+/// An empty range endpoint defaults to `HEAD` (as in `main...`).
+fn default_head(rev: &str) -> &str {
+    if rev.is_empty() { "HEAD" } else { rev }
 }
 
 /// A unified-diff patch read from standard input (`git diff | lr`).
