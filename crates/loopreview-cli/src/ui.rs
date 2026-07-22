@@ -17,8 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use notify::{RecursiveMode, Watcher};
@@ -110,10 +110,15 @@ pub fn run(session: Session) -> Result<()> {
     app.watching = updates.is_some();
 
     let mut terminal = ratatui::init();
-    // Mouse capture is best-effort: the UI is fully usable without it.
-    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    // Mouse capture and bracketed paste are best-effort: the UI is usable
+    // without them, but they make navigation and pasting comments pleasant.
+    let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
     let result = app.event_loop(&mut terminal, updates);
-    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        DisableMouseCapture
+    );
     ratatui::restore();
     result
 }
@@ -220,6 +225,8 @@ struct Compose {
     kind: ComposeKind,
     /// A short description shown in the input header.
     target: String,
+    /// True after Esc on non-empty text, awaiting a discard confirmation.
+    confirming_discard: bool,
 }
 
 /// A relocatable cursor position: a file path and a line number on one side.
@@ -383,6 +390,7 @@ impl App {
                         self.on_key(key.code, key.modifiers);
                     }
                     Event::Mouse(mouse) => self.on_mouse(mouse),
+                    Event::Paste(text) => self.on_paste(&text),
                     _ => {}
                 }
             }
@@ -512,18 +520,41 @@ impl App {
     /// Route a key while the comment composer is open.
     fn on_key_compose(&mut self, code: KeyCode, mods: KeyModifiers) {
         let ctrl = mods.contains(KeyModifiers::CONTROL);
+        let Some(compose) = self.input.as_mut() else {
+            return;
+        };
+
+        // Awaiting discard confirmation: Esc discards, anything else resumes.
+        if compose.confirming_discard {
+            if code == KeyCode::Esc {
+                self.input = None;
+                self.status = Some("comment discarded".to_string());
+            } else {
+                compose.confirming_discard = false;
+            }
+            return;
+        }
+
         match code {
             KeyCode::Esc => {
-                self.input = None;
-                self.status = Some("comment cancelled".to_string());
+                if compose.area.is_blank() {
+                    self.input = None;
+                    self.status = Some("comment cancelled".to_string());
+                } else {
+                    compose.confirming_discard = true;
+                }
             }
             KeyCode::Char('s') if ctrl => self.submit_compose(),
             _ if ctrl => {} // ignore other control combos
-            _ => {
-                if let Some(compose) = self.input.as_mut() {
-                    compose.area.on_key(code);
-                }
-            }
+            _ => compose.area.on_key(code),
+        }
+    }
+
+    /// Insert pasted text into the open composer (bracketed paste).
+    fn on_paste(&mut self, text: &str) {
+        if let Some(compose) = self.input.as_mut() {
+            compose.confirming_discard = false;
+            compose.area.paste(text);
         }
     }
 
@@ -568,6 +599,7 @@ impl App {
             area: TextArea::default(),
             kind: ComposeKind::New(anchor),
             target,
+            confirming_discard: false,
         });
     }
 
@@ -583,6 +615,7 @@ impl App {
             area: TextArea::default(),
             kind: ComposeKind::Reply(thread.id.clone()),
             target: format!("reply to {who}"),
+            confirming_discard: false,
         });
     }
 
@@ -939,16 +972,25 @@ impl App {
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(inner);
         f.render_widget(
-            Paragraph::new(compose.area.render(Style::default())),
+            Paragraph::new(
+                compose
+                    .area
+                    .render(rows[0].width as usize, Style::default()),
+            ),
             rows[0],
         );
-        f.render_widget(
-            Paragraph::new(TextLine::from(TextSpan::styled(
-                "Ctrl-S submit · Esc cancel",
+        let hint = if compose.confirming_discard {
+            TextSpan::styled(
+                "Discard this comment? Esc again to discard · any key to keep editing",
+                Style::default().fg(Color::Yellow),
+            )
+        } else {
+            TextSpan::styled(
+                "Enter newline · Ctrl-S submit · Esc cancel",
                 Style::default().fg(Color::DarkGray),
-            ))),
-            rows[1],
-        );
+            )
+        };
+        f.render_widget(Paragraph::new(TextLine::from(hint)), rows[1]);
     }
 
     fn draw_empty(&self, f: &mut Frame, area: Rect) {

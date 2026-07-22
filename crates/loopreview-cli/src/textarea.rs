@@ -8,6 +8,7 @@
 use crossterm::event::KeyCode;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span as TextSpan};
+use unicode_width::UnicodeWidthChar;
 
 /// A multi-line editable text buffer with a caret.
 pub struct TextArea {
@@ -37,6 +38,18 @@ impl TextArea {
     /// True when the buffer holds no non-whitespace text.
     pub fn is_blank(&self) -> bool {
         self.lines.iter().all(|line| line.trim().is_empty())
+    }
+
+    /// Insert pasted text at the caret, splitting on newlines. Carriage returns
+    /// are dropped so bracketed-paste input never leaks a stray `\r`.
+    pub fn paste(&mut self, text: &str) {
+        for ch in text.chars() {
+            match ch {
+                '\n' => self.newline(),
+                '\r' => {}
+                other => self.insert_char(other),
+            }
+        }
     }
 
     /// Apply an editing key. Submit and cancel are handled by the caller.
@@ -140,38 +153,75 @@ impl TextArea {
         }
     }
 
-    /// Render the buffer as styled lines, drawing the caret as a reversed cell.
-    pub fn render(&self, base: Style) -> Vec<TextLine<'static>> {
+    /// Render the buffer wrapped to `width` display columns, drawing the caret as
+    /// a highlighted cell. Wrapping and the caret both use character *display*
+    /// width, so full-width (CJK) text stays aligned.
+    pub fn render(&self, width: usize, base: Style) -> Vec<TextLine<'static>> {
         let caret = Style::default()
             .fg(Color::Black)
             .bg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
-        self.lines
-            .iter()
-            .enumerate()
-            .map(|(r, line)| {
-                if r != self.row {
-                    return TextLine::from(TextSpan::styled(line.clone(), base));
-                }
-                let chars: Vec<char> = line.chars().collect();
-                let before: String = chars[..self.col.min(chars.len())].iter().collect();
-                let at: String = chars
-                    .get(self.col)
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| " ".to_string());
-                let after: String = if self.col < chars.len() {
-                    chars[self.col + 1..].iter().collect()
+        let width = width.max(1);
+        let mut out = Vec::new();
+        for (r, line) in self.lines.iter().enumerate() {
+            let chars: Vec<char> = line.chars().collect();
+            let starts = wrap_starts(&chars, width);
+            for (b, &start) in starts.iter().enumerate() {
+                let end = starts.get(b + 1).copied().unwrap_or(chars.len());
+                let segment = &chars[start..end];
+                let last = b + 1 == starts.len();
+                // The caret belongs to this visual row when its column falls
+                // inside it, or sits at the very end of the final row.
+                let has_caret = r == self.row
+                    && self.col >= start
+                    && (self.col < end || (last && self.col == end));
+                if has_caret {
+                    out.push(caret_row(segment, self.col - start, base, caret));
                 } else {
-                    String::new()
-                };
-                TextLine::from(vec![
-                    TextSpan::styled(before, base),
-                    TextSpan::styled(at, caret),
-                    TextSpan::styled(after, base),
-                ])
-            })
-            .collect()
+                    out.push(TextLine::from(TextSpan::styled(
+                        segment.iter().collect::<String>(),
+                        base,
+                    )));
+                }
+            }
+        }
+        out
     }
+}
+
+/// The char indices at which each wrapped visual row starts, breaking when the
+/// accumulated display width would exceed `width`.
+fn wrap_starts(chars: &[char], width: usize) -> Vec<usize> {
+    let mut starts = vec![0];
+    let mut used = 0usize;
+    for (i, &c) in chars.iter().enumerate() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + cw > width && i > *starts.last().unwrap() {
+            starts.push(i);
+            used = 0;
+        }
+        used += cw;
+    }
+    starts
+}
+
+/// One visual row with the caret drawn at character `idx` within `segment`.
+fn caret_row(segment: &[char], idx: usize, base: Style, caret: Style) -> TextLine<'static> {
+    let before: String = segment[..idx.min(segment.len())].iter().collect();
+    let at: String = segment
+        .get(idx)
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| " ".to_string());
+    let after: String = if idx < segment.len() {
+        segment[idx + 1..].iter().collect()
+    } else {
+        String::new()
+    };
+    TextLine::from(vec![
+        TextSpan::styled(before, base),
+        TextSpan::styled(at, caret),
+        TextSpan::styled(after, base),
+    ])
 }
 
 #[cfg(test)]
@@ -218,5 +268,22 @@ mod tests {
         area.on_key(KeyCode::Right);
         area.on_key(KeyCode::Char('X'));
         assert_eq!(area.text(), "hXello");
+    }
+
+    #[test]
+    fn paste_inserts_multiline_text_without_carriage_returns() {
+        let mut area = TextArea::default();
+        area.paste("foo\r\nbar");
+        assert_eq!(area.text(), "foo\nbar");
+    }
+
+    #[test]
+    fn wrap_uses_display_width() {
+        // Two full-width chars are 4 cells; width 3 wraps after the first.
+        let full: Vec<char> = "あい".chars().collect();
+        assert_eq!(wrap_starts(&full, 3), vec![0, 1]);
+        // ASCII that fits stays one visual row.
+        let ascii: Vec<char> = "abc".chars().collect();
+        assert_eq!(wrap_starts(&ascii, 3), vec![0]);
     }
 }
