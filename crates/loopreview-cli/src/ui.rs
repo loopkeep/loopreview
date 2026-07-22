@@ -619,6 +619,10 @@ struct App {
     /// Whether each thread is outdated (line-anchored but no longer in the diff),
     /// index-aligned to `review.threads`. Drives the thread index's status icon.
     thread_outdated: Vec<bool>,
+    /// Display order of threads (each entry a `review.threads` index), sorted by
+    /// root-comment time. The Conversation view and thread index render in this
+    /// order; `conv_cursor` is a position within it, not a thread index.
+    conv_order: Vec<usize>,
     /// Thread ids whose inline/Conversation body is collapsed to its header.
     collapsed: HashSet<String>,
     /// File display paths that are collapsed to their header (contents hidden;
@@ -655,7 +659,8 @@ struct App {
     hscroll: usize,
     /// The resolved key bindings (defaults plus config overrides).
     keymap: crate::keys::Keymap,
-    /// Selected thread index in the Conversation view.
+    /// Selected position within `conv_order` (the Conversation view / thread
+    /// index), not a `review.threads` index — map through `conv_order`.
     conv_cursor: usize,
     /// Scroll offset (in lines) of the Conversation view.
     conv_scroll: usize,
@@ -703,6 +708,7 @@ impl App {
         let block_lens: Vec<usize> = comment_blocks.iter().map(Vec::len).collect();
         let layout = Layouts::build(&diff, &review, &block_lens, &HashSet::new());
         let outdated = outdated_flags(&review, &layout.placed);
+        let conv_order = conv_display_order(&review);
         let conv_blocks = build_conversation(
             &review,
             CONV_DEFAULT_WIDTH,
@@ -749,6 +755,7 @@ impl App {
             comment_blocks,
             conv_blocks,
             thread_outdated: outdated,
+            conv_order,
             collapsed: HashSet::new(),
             collapsed_files: HashSet::new(),
             auto_collapse_files: 50,
@@ -1141,9 +1148,10 @@ impl App {
             &self.collapsed,
             self.repo_dir.as_deref(),
         );
+        self.conv_order = conv_display_order(&self.review);
         self.conv_cursor = self
             .conv_cursor
-            .min(self.review.threads.len().saturating_sub(1));
+            .min(self.conv_order.len().saturating_sub(1));
         self.num_width = digits(layout.max_lineno).max(3);
         self.cline_index = layout
             .clines
@@ -1942,14 +1950,15 @@ impl App {
         }
     }
 
-    /// Jump the Conversation view to `thread` and move focus to the body pane so
-    /// the reviewer can read and reply (the sidebar analogue of `jump_to_file`).
-    fn jump_to_thread(&mut self, thread: usize) {
-        if thread >= self.review.threads.len() {
+    /// Jump the Conversation view to the thread at display position `pos` and
+    /// move focus to the body pane so the reviewer can read and reply (the
+    /// sidebar analogue of `jump_to_file`).
+    fn jump_to_thread(&mut self, pos: usize) {
+        if pos >= self.conv_order.len() {
             return;
         }
         self.view = View::Conversation;
-        self.set_conv(thread);
+        self.set_conv(pos);
         self.focus = Focus::Body;
     }
 
@@ -2039,8 +2048,8 @@ impl App {
 
     /// Toggle collapse of the selected Conversation thread.
     fn toggle_collapse_conv(&mut self) {
-        if let Some(thread) = self.review.threads.get(self.conv_cursor) {
-            let id = thread.id.clone();
+        if let Some(t) = self.selected_thread() {
+            let id = self.review.threads[t].id.clone();
             self.toggle_collapse(id);
         }
     }
@@ -2066,8 +2075,16 @@ impl App {
             Action::HalfPageUp | Action::PageUp => {
                 self.conv_scroll = self.conv_scroll.saturating_sub(page / 2)
             }
-            Action::Reply if self.has_review() => self.open_reply(self.conv_cursor),
-            Action::Resolve if self.has_review() => self.resolve_thread(self.conv_cursor),
+            Action::Reply if self.has_review() => {
+                if let Some(t) = self.selected_thread() {
+                    self.open_reply(t);
+                }
+            }
+            Action::Resolve if self.has_review() => {
+                if let Some(t) = self.selected_thread() {
+                    self.resolve_thread(t);
+                }
+            }
             Action::CloseReview if self.has_review() => self.confirming_close = true,
             Action::Fold => self.toggle_collapse_conv(),
             // `h` steps out to the thread index (same cascade grammar as Files).
@@ -2104,33 +2121,46 @@ impl App {
         self.relayout();
     }
 
+    /// The `review.threads` index of the selected thread (Conversation view).
+    fn selected_thread(&self) -> Option<usize> {
+        self.conv_order.get(self.conv_cursor).copied()
+    }
+
+    /// The display position (within `conv_order`) of thread `storage`.
+    fn thread_display_pos(&self, storage: usize) -> usize {
+        self.conv_order
+            .iter()
+            .position(|&t| t == storage)
+            .unwrap_or(0)
+    }
+
     fn move_conv(&mut self, delta: isize) {
-        if self.review.threads.is_empty() {
+        if self.conv_order.is_empty() {
             return;
         }
-        let last = (self.review.threads.len() - 1) as isize;
+        let last = (self.conv_order.len() - 1) as isize;
         let next = (self.conv_cursor as isize + delta).clamp(0, last);
         self.set_conv(next as usize);
     }
 
     fn set_conv(&mut self, index: usize) {
-        if self.review.threads.is_empty() {
+        if self.conv_order.is_empty() {
             return;
         }
-        self.conv_cursor = index.min(self.review.threads.len() - 1);
+        self.conv_cursor = index.min(self.conv_order.len() - 1);
         self.follow_conv();
         // Keep the thread index (sidebar) tracking the selection too.
         self.reveal_in_sidebar(self.conv_cursor);
     }
 
-    /// The first line index of each Conversation thread block (blocks are
-    /// separated by one spacer line).
+    /// The first line index of each Conversation thread block, in display order
+    /// (blocks are separated by one spacer line).
     fn conv_offsets(&self) -> Vec<usize> {
-        let mut offsets = Vec::with_capacity(self.conv_blocks.len());
+        let mut offsets = Vec::with_capacity(self.conv_order.len());
         let mut line = 0;
-        for block in &self.conv_blocks {
+        for &t in &self.conv_order {
             offsets.push(line);
-            line += block.len() + 1;
+            line += self.conv_blocks[t].len() + 1;
         }
         offsets
     }
@@ -2351,10 +2381,8 @@ impl App {
         let cursor = self.current_anchor();
         let thread = match self.view {
             View::Conversation => self
-                .review
-                .threads
-                .get(self.conv_cursor)
-                .map(|t| t.id.clone()),
+                .selected_thread()
+                .map(|t| self.review.threads[t].id.clone()),
             View::Files => self
                 .thread_at_cursor()
                 .map(|idx| self.review.threads[idx].id.clone()),
@@ -2425,7 +2453,7 @@ impl App {
                 if let Some(cursor) = self.find_anchor(&target) {
                     self.view = View::Files;
                     self.set_cursor(cursor);
-                    self.conv_cursor = idx;
+                    self.conv_cursor = self.thread_display_pos(idx);
                     self.status = Some(format!("agent → {file}:{end}"));
                     return Ok(NavigateResult {
                         moved: true,
@@ -2643,8 +2671,8 @@ impl App {
             self.cursor = self.cursor.min(self.clines.len() - 1);
         }
         self.scroll = self.scroll.min(self.rows_len().saturating_sub(1));
-        if !self.review.threads.is_empty() {
-            self.conv_cursor = self.conv_cursor.min(self.review.threads.len() - 1);
+        if !self.conv_order.is_empty() {
+            self.conv_cursor = self.conv_cursor.min(self.conv_order.len() - 1);
         }
         self.conv_scroll = self.conv_scroll.min(self.conv_max_scroll());
         self.follow_cursor();
@@ -3376,8 +3404,9 @@ impl App {
     fn draw_conversation(&self, f: &mut Frame, area: Rect) {
         let select_bg = Color::Rgb(40, 46, 60);
         let mut lines: Vec<TextLine> = Vec::new();
-        for (ti, block) in self.conv_blocks.iter().enumerate() {
-            let selected = ti == self.conv_cursor;
+        for (pos, &ti) in self.conv_order.iter().enumerate() {
+            let block = &self.conv_blocks[ti];
+            let selected = pos == self.conv_cursor;
             for line in block {
                 if selected {
                     let spans: Vec<TextSpan> = line
@@ -3913,17 +3942,19 @@ impl App {
         let width = area.width as usize;
         let height = area.height as usize;
         let sidebar_focused = self.focus == Focus::Sidebar;
-        let n = self.review.threads.len();
+        let n = self.conv_order.len();
         let start = self.sidebar_scroll.min(n);
         let end = (start + height).min(n);
+        // Rows are display positions; each maps through `conv_order` to a thread.
         let lines: Vec<TextLine> = (start..end)
-            .map(|i| {
-                let thread = &self.review.threads[i];
-                let outdated = self.thread_outdated.get(i).copied().unwrap_or(false);
+            .map(|pos| {
+                let ti = self.conv_order[pos];
+                let thread = &self.review.threads[ti];
+                let outdated = self.thread_outdated.get(ti).copied().unwrap_or(false);
                 let (glyph, glyph_fg) = thread_status(thread, outdated);
                 // The selected thread is what the right pane shows: a strong fill
                 // while the sidebar has focus, a subtle one when the body does.
-                let is_sel = i == self.conv_cursor;
+                let is_sel = pos == self.conv_cursor;
                 let (base, marker, marker_fg) = if sidebar_focused && is_sel {
                     (
                         Style::default().bg(SEL_BG).add_modifier(Modifier::BOLD),
@@ -4685,6 +4716,18 @@ fn anchor_label(anchor: &Anchor) -> String {
         Anchor::File { file } => file.clone(),
         Anchor::Review => "changeset".to_string(),
     }
+}
+
+/// The display order of threads: by root-comment time (ascending), ties broken
+/// by thread id for stability. Returns `review.threads` indices, so storage
+/// order (which `conv_blocks` / `thread_outdated` align to) is left untouched.
+fn conv_display_order(review: &Review) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..review.threads.len()).collect();
+    order.sort_by_key(|&i| {
+        let t = &review.threads[i];
+        (t.root().map(|c| c.created_at).unwrap_or(0), t.id.clone())
+    });
+    order
 }
 
 /// A compact anchor label for the thread index: `file:line` / `file` /
@@ -5870,6 +5913,84 @@ mod tests {
         app.review.threads.push(thread_on("b.rs", 2, "bob", 0));
         app.relayout();
         app
+    }
+
+    /// A single-comment thread with a given anchor and root time.
+    fn thread_with(id: &str, anchor: Anchor, created_at: u64) -> Thread {
+        Thread {
+            id: id.into(),
+            anchor,
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: format!("{id}-root"),
+                author: "author".into(),
+                body: "b".into(),
+                created_at,
+                remote_id: None,
+            }],
+        }
+    }
+
+    /// An app whose threads are stored out of chronological order: an inline
+    /// thread (newest), a review-level thread (oldest), and a file-level thread
+    /// (middle) — so display order must differ from storage order.
+    fn app_mixed_threads() -> App {
+        let mut app = multi_file_app(&["a.rs"]);
+        app.sidebar_override = Some(true);
+        app.review.threads.push(thread_with(
+            "inline",
+            Anchor::line("a.rs", Side::New, 1),
+            300,
+        ));
+        app.review
+            .threads
+            .push(thread_with("review", Anchor::Review, 100));
+        app.review.threads.push(thread_with(
+            "file",
+            Anchor::File {
+                file: "a.rs".into(),
+            },
+            200,
+        ));
+        app.relayout();
+        app
+    }
+
+    #[test]
+    fn conversation_orders_threads_by_root_time() {
+        let app = app_mixed_threads();
+        // Sorted by root created_at ascending: review(100), file(200), inline(300),
+        // which are storage indices 1, 2, 0 — storage order is left untouched.
+        assert_eq!(app.conv_order, vec![1, 2, 0]);
+        assert_eq!(
+            app.review.threads[0].id, "inline",
+            "storage order unchanged"
+        );
+    }
+
+    #[test]
+    fn thread_index_selection_matches_display_order() {
+        let mut app = app_mixed_threads();
+        app.view = View::Conversation;
+        app.body_width.set(120);
+        app.hit.set(hit(1, 22, None, 0));
+
+        // Clicking the top thread-index row selects the oldest thread (the
+        // review thread, storage index 1) — the same thread drawn on that row.
+        app.mouse_down(3, 1); // sidebar body row 0 = display position 0
+        assert_eq!(app.conv_cursor, 0, "top row is display position 0");
+        assert_eq!(
+            app.selected_thread(),
+            Some(1),
+            "row 0 selects the oldest thread"
+        );
+
+        // j moves down the display order to the middle then newest thread.
+        app.focus = Focus::Sidebar;
+        app.sidebar_action(Action::MoveDown);
+        assert_eq!(app.selected_thread(), Some(2), "next is the file thread");
+        app.sidebar_action(Action::MoveDown);
+        assert_eq!(app.selected_thread(), Some(0), "last is the newest inline");
     }
 
     #[test]
