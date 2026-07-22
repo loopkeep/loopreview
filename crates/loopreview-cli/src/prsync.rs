@@ -250,7 +250,15 @@ pub fn merge_drafts(previous: &Review, fresh: Vec<Thread>) -> Vec<Thread> {
             result.push(old.clone());
             continue;
         }
-        // A published thread: carry over any draft replies it accumulated.
+        // A published thread: carry over any draft replies it accumulated,
+        // matching the fresh thread by id. A thread published normally keeps the
+        // GraphQL node id it was pulled under, so this matches. The exception is a
+        // locally-created thread whose root was submitted but left id-pending (its
+        // root carries the `PENDING_REMOTE_ID` sentinel): its id is a local id, not
+        // the GraphQL node id the fresh pull carries, so no fresh thread matches
+        // and any draft reply under it is intentionally dropped here — it was never
+        // sent (a reply cannot attach to an unreconciled root) and the real thread
+        // arrives fresh from the pull. This is a rare, accepted edge.
         let drafts: Vec<_> = old
             .comments
             .iter()
