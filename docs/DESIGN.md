@@ -165,7 +165,8 @@ Anchor =
 - **ランタイム依存境界**: 素の diff 表示(lr / lr diff / lr patch)は **git のみ**で動く。`gh` は PR 機能(`lr pr`)使用時のみ必須
 - **ライセンス: MIT、Copyright (c) 2026 kumaaa LLC**(LICENSE 追加済み。公開タイミングとは独立に確定)
 - **バージョニング**: **v0.1.0 が初版** = ここまでに確定した全スコープ(M1 + M2a + M2b + M3)のフル実装。v0.0.x は出さない。以後はフィードバック対応で刻む
-- **リリース工程**: M1 完了 → ユーザー実機確認・フィードバック → フィードバック対応 + 残スコープ全実装 → 動作確認 → v0.1.0 タグ → Releases(前身の release.yml の型: タグ=バージョン一致検証、4ターゲット、checksums)。brew tap / cargo-binstall 対応は後続
+- **リリース工程**: M1 完了 → ユーザー実機確認・フィードバック → フィードバック対応 + 残スコープ全実装 → 動作確認 → **README 最新化・リッチ化(リリースゲート)** → v0.1.0 タグ → Releases(前身の release.yml の型: タグ=バージョン一致検証、macOS/Linux/Windows ターゲット、checksums)。brew tap / cargo-binstall 対応は後続
+- **タグライン**: 名前に loop / preview / review が三重に読める綴りの仕掛け(loo**preview** — p を共有)があり、これを活かす。候補: "Preview the loop, review the change."(メイン)+ "A review-first diff TUI for the agent era."(説明文)。最終決定はリリース前のユーザー確認
 - M4(herdr ラッパー / loopkeep アダプタ)は本体リリースとは別成果物(それぞれの repo 側の作業)として扱う
 
 ## 8. 開発運用ルール
