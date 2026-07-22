@@ -106,6 +106,16 @@ Anchor =
 | **M2a** | レビュー(ローカル完結): コメントモデル + `~/.config/loopreview/` ストア + 2ビュー UI。PR なしの worktree レビューでコメント可能 |
 | **M2b** | GitHub シンク: PR ソース、コメント双方向(pull = スレッド注入 / push = review submit・返信)、resolve |
 | **M3** | 制御面: セッションデーモン + CLI(エージェントが読む・注釈する・操作するための API)。hunk の制約(root 固定・表示状態外部制御不可)を設計で回避 |
+
+### M3 制御面の設計方針 — hunk の骨格を継承し、モデルを対応させる
+
+**継承**(hunk で実証済み): ローカルデーモン + セッションレジストリ(外部から live セッションを発見)/ CLI 動詞体系 list・get・context・review・**navigate(人間の視線誘導)**・reload・comment / 「共有成果物への相互書き込み」という非同期対話モデル / エージェント向けスキル文書をツール自身が同梱(`lr skill path` 相当)/ watch が対話の背景で live 反映。
+
+**置き換え・超える**: flat ノート + マーカーハック → Thread が第一級(返信・resolve・draft)/ 人間入力のポーリング → **イベント購読・wait 動詞**(例: `lr session wait --for reply`)/ reload の root 固定 → 任意ソース読込可 / 表示状態も制御面の操作対象。
+
+### Review は第一級概念
+
+コメントは「レビュー」に属する。**PR はレビューの一種、ローカルレビュー(PR なし・worktree 上)も同格**。素の diff 表示(`git diff | lr`)にコメント UI は出ず、レビュー文脈が始まる瞬間 — 人間が最初の `c` を押す / エージェントが制御面で注釈する / PR を開く — にタブ構造が現れる。ローカルレビューは repo 単位ストアに閉じ、後から同 branch の PR へ昇格(submit)できる余地を残す。エージェント対話(M3)と loopkeep 連携(M4)は PR なしレビューが前提。
 | **M4** | 統合アダプタ: herdr ラッパー(picker 移植)、loopkeep ソース/シンク |
 
 ## 7. 外部統合方針
