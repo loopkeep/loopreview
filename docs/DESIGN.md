@@ -160,10 +160,10 @@ Anchor =
 
 ## 7.5 対応環境・依存境界・リリース(2026-07-22 確定)
 
-- **対応 OS**: macOS / Linux。Windows は非対象(crossterm により将来の可能性は残るが、テスト・CI をしない)
+- **対応 OS**: macOS / Linux / **Windows(フル対応ターゲット)** — CI で windows-latest の build + test を常時実行し、Release に msvc ターゲット(zip)を含める。実機検証はユーザーの Windows マシンで実施。実装上の注意: パス区切り・CRLF の丁寧な処理、**M3 のデーモン通信は最初から transport 抽象**(Unix socket / named pipe / localhost TCP を差し替え可能に)
 - **VCS**: v1 は git のみ。jj 等はソース trait の裏に将来追加
 - **ランタイム依存境界**: 素の diff 表示(lr / lr diff / lr patch)は **git のみ**で動く。`gh` は PR 機能(`lr pr`)使用時のみ必須
-- **ライセンス: MIT**(公開タイミングとは独立に確定)
+- **ライセンス: MIT、Copyright (c) 2026 kumaaa LLC**(LICENSE 追加済み。公開タイミングとは独立に確定)
 - **バージョニング**: **v0.1.0 が初版** = ここまでに確定した全スコープ(M1 + M2a + M2b + M3)のフル実装。v0.0.x は出さない。以後はフィードバック対応で刻む
 - **リリース工程**: M1 完了 → ユーザー実機確認・フィードバック → フィードバック対応 + 残スコープ全実装 → 動作確認 → v0.1.0 タグ → Releases(前身の release.yml の型: タグ=バージョン一致検証、4ターゲット、checksums)。brew tap / cargo-binstall 対応は後続
 - M4(herdr ラッパー / loopkeep アダプタ)は本体リリースとは別成果物(それぞれの repo 側の作業)として扱う
