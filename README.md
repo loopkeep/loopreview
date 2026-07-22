@@ -108,11 +108,13 @@ files from a working-tree review.
 | `n` / `p` | Next / previous file |
 | `]` `}` / `[` `{` | Next / previous hunk |
 | `v` | Toggle unified / side-by-side |
-| `c` | Comment on the cursor line |
+| `c` | Comment on the cursor line (or the selected range) |
+| `V` | Start / cancel a line-range selection (`j` / `k` to extend, then `c`) |
 | `r` | Reply to the thread on the cursor line |
 | `x` | Resolve / reopen that thread |
 | `o` | Fold: expand the current file if collapsed, else fold the thread at the cursor, else collapse the current file |
 | Wheel / click | Scroll / move the cursor |
+| Drag | Select a line range (then `c` to comment) |
 
 **Sidebar** (focused after `b`)
 
@@ -144,8 +146,10 @@ move; `Enter` opens the file; `Esc` closes.
 ## Reviewing
 
 Press `c` on any line to open a markdown composer; the comment shows inline under
-its line and starts a thread. `r` replies to the thread on the cursor's line and
-`x` resolves or reopens it. Once a review has any threads, `Tab` opens a
+its line and starts a thread. To comment on several lines, select a range first —
+`V` then `j` / `k`, or drag over the lines — and the composer's title shows the
+`file:start-end` range. `r` replies to the thread on the cursor's line and `x`
+resolves or reopens it. Once a review has any threads, `Tab` opens a
 Conversation view — every thread as a root comment with its nested replies and
 relative timestamps, GitHub-style — where `r` and `x` also work and `X` closes
 (deletes) the review. Comments are authored as your `git config user.name`.

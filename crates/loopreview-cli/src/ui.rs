@@ -69,6 +69,8 @@ const SIDEBAR_MAX: usize = 44;
 const SIDEBAR_MIN_CONTENT: usize = 44;
 /// Background of a selected sidebar / finder row.
 const SEL_BG: Color = Color::Rgb(45, 50, 66);
+/// Background of lines in a range selection (for a multi-line comment).
+const SELECTION_BG: Color = Color::Rgb(38, 48, 74);
 /// How often the event loop wakes to repaint when idle.
 const POLL_MS: u64 = 200;
 /// Quiet period after a filesystem event before a watched source is reloaded,
@@ -524,6 +526,10 @@ struct App {
     sidebar_scroll: usize,
     /// The fuzzy file-finder overlay, when open.
     finder: Option<Finder>,
+    /// The cursor line where a line-range selection began (`V` or a drag).
+    selection: Option<usize>,
+    /// The cursor line a mouse-drag started on (to distinguish a click).
+    drag_anchor: Option<usize>,
     /// Selected thread index in the Conversation view.
     conv_cursor: usize,
     /// Scroll offset (in lines) of the Conversation view.
@@ -627,6 +633,8 @@ impl App {
             sidebar_cursor: 0,
             sidebar_scroll: 0,
             finder: None,
+            selection: None,
+            drag_anchor: None,
             conv_cursor: 0,
             conv_scroll: 0,
             split_min_width: 160,
@@ -1142,6 +1150,12 @@ impl App {
             }
             return;
         }
+        // Esc first cancels an active range selection rather than quitting.
+        if self.selection.is_some() && code == KeyCode::Esc {
+            self.clear_selection();
+            self.status = Some("selection cleared".to_string());
+            return;
+        }
         self.status = None;
 
         // Tab switches views once a review exists; Esc/q/^c always quit.
@@ -1198,6 +1212,7 @@ impl App {
             (KeyCode::Char('r'), false) => self.start_reply(),
             (KeyCode::Char('x'), false) => self.toggle_resolve(),
             (KeyCode::Char('o'), false) => self.toggle_fold(),
+            (KeyCode::Char('V'), false) => self.start_selection(),
             _ => {}
         }
     }
@@ -1249,36 +1264,8 @@ impl App {
             self.status = Some("comments need a git repository or a pull request".to_string());
             return;
         }
-        if self.clines.is_empty() {
+        let Some((anchor, target)) = self.compose_target() else {
             return;
-        }
-        let (file, flat) = self.clines[self.cursor];
-        let (hi, li) = self.flats[file][flat];
-        let f = &self.diff.files[file];
-        let line = &f.hunks[hi].lines[li];
-        let new_side = line.kind != LineKind::Deletion;
-        let side = if new_side { Side::New } else { Side::Old };
-        let number = if new_side {
-            line.new_lineno
-        } else {
-            line.old_lineno
-        }
-        .unwrap_or(0);
-        let commit = if new_side {
-            self.diff.provenance.head.clone()
-        } else {
-            self.diff.provenance.base.clone()
-        };
-        let context = context_snippet(&f.hunks[hi], li);
-        let path = f.display_path().to_string();
-        let target = format!("{path}:{number}");
-        let anchor = Anchor::Line {
-            file: path,
-            side,
-            start: number,
-            end: number,
-            commit,
-            context,
         };
         self.input = Some(Compose {
             area: TextArea::default(),
@@ -1286,6 +1273,129 @@ impl App {
             target,
             confirming_discard: false,
         });
+        // The range is captured in the anchor; drop the visual selection.
+        self.clear_selection();
+    }
+
+    /// The anchor and label for a new comment: a line range when a selection is
+    /// active, otherwise the single cursor line. Ranges are addressed on the new
+    /// side when any selected line has a new-side number (a reviewer points at
+    /// the after-state), falling back to the old side for a pure deletion.
+    fn compose_target(&self) -> Option<(Anchor, String)> {
+        if self.clines.is_empty() {
+            return None;
+        }
+        // The range is the selection (clamped to its own file), else the cursor
+        // line; the anchor file comes from the range, not the cursor (which may
+        // have moved past the selection's file while extending).
+        let (lo, hi) = self.selection_range().unwrap_or((self.cursor, self.cursor));
+        let afile = self.clines[lo].0;
+        let f = &self.diff.files[afile];
+        let path = f.display_path().to_string();
+
+        let mut new_nums = Vec::new();
+        let mut old_nums = Vec::new();
+        for idx in lo..=hi {
+            let (file, flat) = self.clines[idx];
+            if file != afile {
+                continue;
+            }
+            let (h, l) = self.flats[file][flat];
+            let line = &self.diff.files[file].hunks[h].lines[l];
+            if let Some(n) = line.new_lineno {
+                new_nums.push(n);
+            }
+            if let Some(n) = line.old_lineno {
+                old_nums.push(n);
+            }
+        }
+        let (side, start, end) = if !new_nums.is_empty() {
+            (
+                Side::New,
+                *new_nums.iter().min().unwrap(),
+                *new_nums.iter().max().unwrap(),
+            )
+        } else if !old_nums.is_empty() {
+            (
+                Side::Old,
+                *old_nums.iter().min().unwrap(),
+                *old_nums.iter().max().unwrap(),
+            )
+        } else {
+            return None;
+        };
+        let commit = if side == Side::New {
+            self.diff.provenance.head.clone()
+        } else {
+            self.diff.provenance.base.clone()
+        };
+        // Context snippet from the range's last line (the display anchor).
+        let (hfile, hflat) = self.clines[hi];
+        let (ehi, eli) = self.flats[hfile][hflat];
+        let context = context_snippet(&self.diff.files[hfile].hunks[ehi], eli);
+        let target = if start == end {
+            format!("{path}:{start}")
+        } else {
+            format!("{path}:{start}-{end}")
+        };
+        let anchor = Anchor::Line {
+            file: path,
+            side,
+            start,
+            end,
+            commit,
+            context,
+        };
+        Some((anchor, target))
+    }
+
+    /// Begin (or, if already active, cancel) a line-range selection at the cursor.
+    fn start_selection(&mut self) {
+        if self.clines.is_empty() {
+            return;
+        }
+        if self.selection.is_some() {
+            self.clear_selection();
+            self.status = Some("selection cleared".to_string());
+        } else {
+            self.selection = Some(self.cursor);
+            self.status = Some("visual line — j/k extend · c comment · Esc cancel".to_string());
+        }
+    }
+
+    /// Clear any line-range selection.
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.drag_anchor = None;
+    }
+
+    /// The selected cursor-line range `(lo, hi)`, clamped to the file the
+    /// selection started in (selections stay within one file).
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        let sel = self.selection?;
+        if self.clines.is_empty() || sel >= self.clines.len() {
+            return None;
+        }
+        let afile = self.clines[sel].0;
+        let mut lo = sel.min(self.cursor);
+        let mut hi = sel.max(self.cursor).min(self.clines.len() - 1);
+        while lo < hi && self.clines[lo].0 != afile {
+            lo += 1;
+        }
+        while hi > lo && self.clines[hi].0 != afile {
+            hi -= 1;
+        }
+        (self.clines[lo].0 == afile).then_some((lo, hi))
+    }
+
+    /// Whether the line `(file, flat)` is inside the current range selection.
+    fn in_selection(&self, file: usize, flat: usize) -> bool {
+        let Some((lo, hi)) = self.selection_range() else {
+            return false;
+        };
+        self.cline_index
+            .get(&(file, flat))
+            .is_some_and(|&idx| lo <= idx && idx <= hi)
     }
 
     /// Begin replying to the thread anchored at the cursor's line (Files view).
@@ -2229,7 +2339,14 @@ impl App {
         match mouse.kind {
             MouseEventKind::ScrollDown => self.scroll_view(3),
             MouseEventKind::ScrollUp => self.scroll_view(-3),
-            MouseEventKind::Down(MouseButton::Left) => self.click(mouse.column, mouse.row),
+            MouseEventKind::Down(MouseButton::Left) => {
+                // A press starts fresh: move the cursor and arm a possible drag.
+                self.clear_selection();
+                self.click(mouse.column, mouse.row);
+                self.drag_anchor = Some(self.cursor);
+            }
+            // Dragging with the button held extends a line-range selection.
+            MouseEventKind::Drag(MouseButton::Left) => self.drag_to(mouse.column, mouse.row),
             _ => {}
         }
     }
@@ -2241,27 +2358,44 @@ impl App {
         self.scroll = (self.scroll as isize + delta).clamp(0, max_scroll) as usize;
     }
 
-    /// Move the cursor to the diff line under a click, if any.
-    fn click(&mut self, column: u16, row: u16) {
+    /// The cursor line under a body cell, if any.
+    fn cline_at(&self, column: u16, row: u16) -> Option<usize> {
         // Row 0 is the header; the body starts at row 1.
         if row < 1 {
-            return;
+            return None;
         }
         let body_row = (row - 1) as usize;
         if body_row >= self.body_height.get() {
-            return; // footer or below
+            return None; // footer or below
         }
         let row_index = self.scroll + body_row;
         if row_index >= self.rows_len() {
-            return;
+            return None;
         }
-        let target = if self.sbs() {
+        if self.sbs() {
             self.sbs_click(row_index, column as usize)
         } else {
             self.unified_click(row_index)
-        };
-        if let Some(cursor) = target {
+        }
+    }
+
+    /// Move the cursor to the diff line under a click, if any.
+    fn click(&mut self, column: u16, row: u16) {
+        if let Some(cursor) = self.cline_at(column, row) {
             self.set_cursor(cursor);
+        }
+    }
+
+    /// Extend a line-range selection to the dragged-over line.
+    fn drag_to(&mut self, column: u16, row: u16) {
+        let Some(anchor) = self.drag_anchor else {
+            return;
+        };
+        if let Some(target) = self.cline_at(column, row) {
+            if target != anchor {
+                self.selection = Some(anchor);
+            }
+            self.set_cursor(target);
         }
     }
 
@@ -3005,6 +3139,8 @@ impl App {
         let (tint, emph_bg, sign, sign_color) = kind_style(line.kind);
         let bg = if is_cursor {
             Some(tint.unwrap_or(CURSOR_BG))
+        } else if self.in_selection(file, flat) {
+            Some(SELECTION_BG)
         } else {
             tint
         };
@@ -3260,6 +3396,8 @@ impl App {
         let (tint, emph_bg, sign, sign_color) = kind_style(line.kind);
         let bg = if is_cursor {
             Some(tint.unwrap_or(CURSOR_BG))
+        } else if self.in_selection(file, flat) {
+            Some(SELECTION_BG)
         } else {
             tint
         };
@@ -4600,6 +4738,86 @@ mod tests {
         narrow.draw(|f| app.draw(f)).unwrap();
         assert!(app.sidebar_width(50).is_none(), "sidebar hides when narrow");
         assert!(app.sidebar_width(120).is_some(), "sidebar shows when wide");
+    }
+
+    // -- multi-line range selection -----------------------------------------
+
+    #[test]
+    fn single_line_compose_target_without_selection() {
+        let mut app = sample_app();
+        app.mode = Mode::Unified;
+        app.cursor = 1; // a.rs new line 2 (an addition)
+        let (anchor, target) = app.compose_target().unwrap();
+        match anchor {
+            Anchor::Line {
+                start, end, side, ..
+            } => assert_eq!((start, end, side), (2, 2, Side::New)),
+            other => panic!("unexpected anchor {other:?}"),
+        }
+        assert_eq!(target, "a.rs:2");
+    }
+
+    #[test]
+    fn selection_produces_a_range_anchor_and_clears_on_compose() {
+        let mut app = sample_app(); // a.rs: new 1 (context), new 2 (addition)
+        app.mode = Mode::Unified;
+        app.cursor = 0;
+        app.start_selection();
+        assert!(app.selection.is_some());
+        app.move_cursor(1);
+        let (anchor, target) = app.compose_target().unwrap();
+        match anchor {
+            Anchor::Line {
+                file,
+                side,
+                start,
+                end,
+                ..
+            } => {
+                assert_eq!(file, "a.rs");
+                assert_eq!(side, Side::New);
+                assert_eq!((start, end), (1, 2));
+            }
+            other => panic!("unexpected anchor {other:?}"),
+        }
+        assert_eq!(target, "a.rs:1-2");
+        app.start_compose();
+        assert!(
+            app.selection.is_none(),
+            "opening the composer captures the range and clears the selection"
+        );
+    }
+
+    #[test]
+    fn selection_stays_within_one_file() {
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        app.cursor = 0; // file a
+        app.start_selection();
+        app.cursor = app.clines.len() - 1; // last line, file b
+        let (lo, hi) = app.selection_range().unwrap();
+        assert_eq!(app.clines[lo].0, 0);
+        assert_eq!(
+            app.clines[hi].0, 0,
+            "the range clamps to the selection's file"
+        );
+        match app.compose_target().unwrap().0 {
+            Anchor::Line { file, .. } => assert_eq!(file, "a.rs"),
+            other => panic!("unexpected anchor {other:?}"),
+        }
+    }
+
+    #[test]
+    fn esc_cancels_a_selection_instead_of_quitting() {
+        let mut app = sample_app();
+        app.mode = Mode::Unified;
+        app.start_selection();
+        assert!(app.selection.is_some());
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.selection.is_none());
+        assert!(
+            !app.quit,
+            "the first Esc cancels the selection, not the app"
+        );
     }
 
     // -- robustness (resize, hostile input, truncation) ---------------------
