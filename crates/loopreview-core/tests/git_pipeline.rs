@@ -97,6 +97,36 @@ fn worktree_source_parses_a_real_modification() {
 }
 
 #[test]
+fn worktree_source_includes_untracked_files() {
+    let repo = init_repo("untracked");
+    std::fs::write(repo.join("new.txt"), "alpha\nbeta\n").expect("write untracked");
+
+    let diff = WorktreeSource::new(&repo).load().expect("load");
+    let untracked = diff
+        .files
+        .iter()
+        .find(|f| f.new_path.as_deref() == Some("new.txt"))
+        .expect("untracked file present");
+    assert_eq!(untracked.status, ChangeStatus::Added);
+    assert_eq!(untracked.old_path, None);
+    assert_eq!(untracked.line_stats(), (2, 0));
+
+    // Opting out drops it.
+    let without = WorktreeSource::new(&repo)
+        .include_untracked(false)
+        .load()
+        .expect("load");
+    assert!(
+        without
+            .files
+            .iter()
+            .all(|f| f.new_path.as_deref() != Some("new.txt"))
+    );
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
 fn ref_source_parses_a_commit_range() {
     let repo = init_repo("ref");
     // Second commit adds a new file.

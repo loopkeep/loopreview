@@ -44,6 +44,7 @@ fn try_run() -> Result<()> {
     let Invocation {
         action,
         no_watch,
+        exclude_untracked,
         mode,
     } = Cli::parse().resolve();
 
@@ -61,7 +62,7 @@ fn try_run() -> Result<()> {
         );
     }
 
-    let (source, repo_dir) = build_source(action)?;
+    let (source, repo_dir) = build_source(action, exclude_untracked)?;
     let label = source.describe();
     let diff = source
         .load()
@@ -115,13 +116,18 @@ fn layout_mode(mode: LayoutMode) -> ui::Mode {
 
 /// Choose the diff source from the resolved action and the environment. Returns
 /// the directory to watch for a live source, or `None` for a static one.
-fn build_source(action: Action) -> Result<(SharedSource, Option<PathBuf>)> {
+fn build_source(
+    action: Action,
+    exclude_untracked: bool,
+) -> Result<(SharedSource, Option<PathBuf>)> {
     match action {
         // Bare `lr`: a piped patch when stdin is redirected, else the worktree.
         Action::Dispatch => {
             if io::stdin().is_terminal() {
                 let root = repo_root()?;
-                Ok((Arc::new(WorktreeSource::new(root.clone())), Some(root)))
+                let source =
+                    WorktreeSource::new(root.clone()).include_untracked(!exclude_untracked);
+                Ok((Arc::new(source), Some(root)))
             } else {
                 Ok((Arc::new(StdinPatchSource::new()), None))
             }
@@ -131,7 +137,8 @@ fn build_source(action: Action) -> Result<(SharedSource, Option<PathBuf>)> {
             let root = repo_root()?;
             let source = WorktreeSource::new(root.clone())
                 .staged(staged)
-                .pathspec(pathspec);
+                .pathspec(pathspec)
+                .include_untracked(!exclude_untracked);
             Ok((Arc::new(source), Some(root)))
         }
         Action::Ref { target, pathspec } => {

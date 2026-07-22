@@ -38,6 +38,9 @@ pub struct Cli {
     /// Do not auto-refresh a live diff as the working tree changes.
     #[arg(long, global = true)]
     no_watch: bool,
+    /// Do not include untracked files in a working-tree review.
+    #[arg(long, global = true)]
+    exclude_untracked: bool,
     /// Diff layout: auto (by width), unified, or split.
     #[arg(long, value_enum, default_value_t = LayoutMode::Auto, global = true)]
     mode: LayoutMode,
@@ -49,6 +52,8 @@ pub struct Invocation {
     pub action: Action,
     /// Whether auto-refresh is disabled.
     pub no_watch: bool,
+    /// Whether untracked files are excluded from a working-tree review.
+    pub exclude_untracked: bool,
     /// The requested diff layout.
     pub mode: LayoutMode,
 }
@@ -129,10 +134,12 @@ impl Cli {
     /// Resolve the parsed command line into an [`Invocation`].
     pub fn resolve(self) -> Invocation {
         let no_watch = self.no_watch;
+        let exclude_untracked = self.exclude_untracked;
         let mode = self.mode;
         Invocation {
             action: self.action(),
             no_watch,
+            exclude_untracked,
             mode,
         }
     }

@@ -89,6 +89,24 @@ pub fn head_sha(dir: &Path) -> Option<String> {
     rev_parse(dir, "HEAD")
 }
 
+/// The repository's untracked (but not ignored) files, relative to `dir`,
+/// optionally restricted to `pathspec`. Empty on failure.
+pub fn untracked(dir: &Path, pathspec: &[String]) -> Vec<String> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir).args([
+        "-c",
+        "core.quotepath=false",
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+    ]);
+    append_pathspec(&mut cmd, pathspec);
+    match run(cmd) {
+        Ok(out) => out.lines().map(str::to_string).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Resolve a revision to its commit SHA, or `None` when it cannot be resolved.
 pub fn rev_parse(dir: &Path, rev: &str) -> Option<String> {
     let mut cmd = Command::new("git");

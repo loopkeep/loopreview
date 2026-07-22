@@ -7,11 +7,11 @@
 //! unchanged.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::DiffError;
 use crate::git;
-use crate::model::{Diff, Provenance};
+use crate::model::{ChangeStatus, Diff, FileDiff, Hunk, Line, LineKind, Provenance};
 use crate::patch;
 
 /// A provider of a [`Diff`], plus a short human-readable description of what it
@@ -30,6 +30,7 @@ pub struct WorktreeSource {
     dir: PathBuf,
     staged: bool,
     pathspec: Vec<String>,
+    include_untracked: bool,
 }
 
 impl WorktreeSource {
@@ -39,6 +40,7 @@ impl WorktreeSource {
             dir: dir.into(),
             staged: false,
             pathspec: Vec::new(),
+            include_untracked: true,
         }
     }
 
@@ -54,12 +56,29 @@ impl WorktreeSource {
         self.pathspec = pathspec;
         self
     }
+
+    /// Whether to include untracked files as added (default `true`). Ignored for
+    /// a staged diff, where untracked files do not apply.
+    pub fn include_untracked(mut self, include: bool) -> WorktreeSource {
+        self.include_untracked = include;
+        self
+    }
 }
 
 impl DiffSource for WorktreeSource {
     fn load(&self) -> Result<Diff, DiffError> {
         let text = git::diff_worktree(&self.dir, self.staged, &self.pathspec)?;
         let mut diff = patch::parse(&text)?;
+
+        // Untracked files are invisible to `git diff`, but an agent's work is
+        // mostly new files — show them as fully-added so a worktree review is
+        // complete. Only for the working tree (not the staged index).
+        if self.include_untracked && !self.staged {
+            for path in git::untracked(&self.dir, &self.pathspec) {
+                diff.files.push(added_file(&self.dir, &path));
+            }
+        }
+
         // The old side is HEAD; the new side is the working tree or index, which
         // are not commits.
         diff.provenance = Provenance {
@@ -76,6 +95,45 @@ impl DiffSource for WorktreeSource {
             "working tree".to_string()
         }
     }
+}
+
+/// Synthesize the [`FileDiff`] for an untracked file: every line added, or a
+/// binary/unreadable placeholder.
+fn added_file(dir: &Path, path: &str) -> FileDiff {
+    let bytes = std::fs::read(dir.join(path)).unwrap_or_default();
+    // Git's heuristic: a NUL byte near the start means binary.
+    let binary = bytes.iter().take(8000).any(|&b| b == 0);
+    let mut file = FileDiff {
+        old_path: None,
+        new_path: Some(path.to_string()),
+        status: ChangeStatus::Added,
+        hunks: Vec::new(),
+        binary,
+    };
+    if binary || bytes.is_empty() {
+        return file;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<Line> = text
+        .lines()
+        .enumerate()
+        .map(|(i, content)| Line {
+            kind: LineKind::Addition,
+            content: content.to_string(),
+            old_lineno: None,
+            new_lineno: Some((i + 1) as u32),
+        })
+        .collect();
+    let count = lines.len() as u32;
+    file.hunks.push(Hunk {
+        old_start: 0,
+        old_lines: 0,
+        new_start: 1,
+        new_lines: count,
+        section: None,
+        lines,
+    });
+    file
 }
 
 /// An arbitrary `git diff` comparison, e.g. `main`, `main...HEAD`, or
