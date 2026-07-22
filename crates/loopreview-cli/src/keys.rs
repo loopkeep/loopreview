@@ -107,6 +107,15 @@ const FIXED: &[(&str, Action)] = &[
     ("{", Action::PrevHunk),
 ];
 
+/// Keys the review UI intercepts before consulting this map — quit (`q` / `Esc`
+/// / `Ctrl-C`), the view switch (`Tab`), and the confirm-modal `y`. They cannot
+/// be reassigned to an action (a remap onto one is silently shadowed), so no
+/// remappable action's default may sit on one — the `defaults_avoid_structural`
+/// test enforces it. (`Enter` is reserved too, but as a fixed `NavIn` alternate,
+/// covered by `FIXED`; the finder and composer reserve their own modal keys.)
+#[cfg(test)]
+const STRUCTURAL: &[&str] = &["q", "esc", "ctrl+c", "tab", "y"];
+
 /// A resolved key-to-action map.
 #[derive(Debug, Clone)]
 pub struct Keymap {
@@ -313,6 +322,23 @@ mod tests {
             if let Some(prev) = seen.insert(binding, name) {
                 panic!("default key `{key}` is bound to both `{prev}` and `{name}`");
             }
+        }
+    }
+
+    #[test]
+    fn defaults_avoid_structural_keys() {
+        // A remappable action's default must not sit on a key the UI handles
+        // before the keymap (quit / view switch / confirm) — the structural
+        // handler would silently shadow it. Users likewise cannot remap onto
+        // these (documented as reserved).
+        let structural: Vec<(KeyCode, KeyModifiers)> =
+            STRUCTURAL.iter().map(|k| parse_key(k).unwrap()).collect();
+        for (_, name, key) in DEFAULTS {
+            let binding = parse_key(key).unwrap();
+            assert!(
+                !structural.contains(&binding),
+                "default `{name}` = `{key}` sits on a structural key the UI intercepts"
+            );
         }
     }
 

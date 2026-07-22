@@ -288,7 +288,10 @@ legacy `config.json` is still read with a migration hint, but TOML is preferred.
 Every command's key can be remapped in a `[keys]` table by action name. Keys are
 written like `j`, `V` (or `shift+v`), `ctrl+p`, `enter`, `esc`, `tab`, `space`,
 `pageup`. The arrow, page, and home/end keys always work and are not remappable;
-an invalid binding is reported at startup with the offending line. Action names:
+an invalid binding is reported at startup with the offending line. A few keys are
+reserved by the UI and cannot be reassigned to an action: `q` / `Esc` / `Ctrl-C`
+(quit), `Tab` (switch view), and `y` / `Enter` (confirm); the finder and comment
+composer likewise keep their own keys while open. Action names:
 `cursor_down`, `cursor_up`, `half_page_down`, `half_page_up`, `top`, `bottom`,
 `next_file`, `prev_file`, `next_hunk`, `prev_hunk`, `nav_in`, `nav_out`,
 `scroll_left`, `scroll_right`, `layout_toggle`, `comment`, `reply`, `resolve`,
