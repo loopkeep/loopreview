@@ -272,10 +272,11 @@ impl GithubClient {
     /// `body` and `event`.
     ///
     /// After the POST the created comments are read back and matched to the
-    /// drafts that produced them, so the returned [`SubmitOutcome`] carries the
-    /// `(thread id, remote comment id)` pairs the caller stamps onto its store —
-    /// the model is updated by return value, never written here. Draft replies
-    /// and resolutions are handled by [`reply`](Self::reply) and
+    /// drafts that produced them, so the returned [`SubmitOutcome`] carries a
+    /// remote comment id per submitted draft (or `None` when the read-back failed
+    /// — see [`SubmitOutcome`]) for the caller to stamp onto its store; the model
+    /// is updated by return value, never written here. Draft replies and
+    /// resolutions are handled by [`reply`](Self::reply) and
     /// [`resolve_thread`](Self::resolve_thread) respectively.
     pub fn submit_review(
         &self,
