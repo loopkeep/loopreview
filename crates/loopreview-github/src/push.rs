@@ -254,6 +254,7 @@ mod tests {
             body: body.to_string(),
             created_at: 0,
             remote_id: None,
+            kind: loopreview_core::CommentKind::Draft,
         }
     }
 
@@ -264,6 +265,7 @@ mod tests {
             body: body.to_string(),
             created_at: 0,
             remote_id: Some(remote.to_string()),
+            kind: loopreview_core::CommentKind::Draft,
         }
     }
 

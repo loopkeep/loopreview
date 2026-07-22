@@ -20,7 +20,7 @@
 //! functions here are pure — they take already-deserialized responses — so they
 //! are unit-tested against fixtures shaped like real `gh` output.
 
-use loopreview_core::{Anchor, Comment, Side, Thread, ThreadState};
+use loopreview_core::{Anchor, Comment, CommentKind, Side, Thread, ThreadState};
 use serde::Deserialize;
 
 use crate::error::GithubError;
@@ -315,6 +315,7 @@ fn map_thread_comment(comment: &ReviewThreadComment) -> Comment {
         body: comment.body.clone(),
         created_at: iso8601_to_epoch(&comment.created_at),
         remote_id,
+        kind: CommentKind::Draft,
     }
 }
 
@@ -331,6 +332,7 @@ pub(crate) fn map_issue_comment(comment: &IssueComment) -> Thread {
             body: comment.body.clone(),
             created_at: iso8601_to_epoch(&comment.created_at),
             remote_id: Some(remote_id),
+            kind: CommentKind::Draft,
         }],
     }
 }
@@ -358,6 +360,7 @@ pub(crate) fn map_review_summary(review: &SubmittedReview) -> Option<Thread> {
                 .map(iso8601_to_epoch)
                 .unwrap_or(0),
             remote_id: Some(remote_id),
+            kind: CommentKind::Draft,
         }],
     })
 }

@@ -2464,6 +2464,7 @@ impl App {
                 body: body.trim_end().to_string(),
                 created_at: now(),
                 remote_id: None,
+                kind: loopreview_core::CommentKind::Draft,
             }],
         });
         self.emit(EventKind::Comment, Some(thread_id.clone()));
@@ -2481,6 +2482,7 @@ impl App {
             body: body.trim_end().to_string(),
             created_at: now(),
             remote_id: None,
+            kind: loopreview_core::CommentKind::Draft,
         });
         self.emit(EventKind::Reply, Some(thread_id.to_string()));
         Some(comment_id)
@@ -5934,6 +5936,7 @@ mod tests {
                 body: "b".into(),
                 created_at: 0,
                 remote_id: Some("PRRC_1".into()),
+                kind: loopreview_core::CommentKind::Draft,
             }],
         });
         app.relayout();
@@ -5990,7 +5993,8 @@ mod tests {
                 author: "reviewer".into(),
                 body: "b".into(),
                 created_at: 0,
-                remote_id: Some("R1".into()), // published
+                remote_id: Some("R1".into()),
+                kind: loopreview_core::CommentKind::Draft, // published
             }],
         });
         let response = app.handle_control(Request::CommentResolve(protocol::CommentResolve {
@@ -6325,6 +6329,7 @@ mod tests {
                     body: "b".into(),
                     created_at: 0,
                     remote_id: None,
+                    kind: loopreview_core::CommentKind::Draft,
                 }],
             }],
         };
@@ -6476,6 +6481,7 @@ mod tests {
             body: "root".into(),
             created_at: 0,
             remote_id: None,
+            kind: loopreview_core::CommentKind::Draft,
         }];
         for r in 0..replies {
             comments.push(Comment {
@@ -6484,6 +6490,7 @@ mod tests {
                 body: "reply".into(),
                 created_at: (r + 1) as u64,
                 remote_id: None,
+                kind: loopreview_core::CommentKind::Draft,
             });
         }
         Thread {
@@ -6515,6 +6522,7 @@ mod tests {
                 body: "b".into(),
                 created_at,
                 remote_id: None,
+                kind: loopreview_core::CommentKind::Draft,
             }],
         }
     }
@@ -6590,6 +6598,7 @@ mod tests {
             body: "root".into(),
             created_at: 0,
             remote_id: None,
+            kind: loopreview_core::CommentKind::Draft,
         }];
         for i in 0..40u64 {
             comments.push(Comment {
@@ -6598,6 +6607,7 @@ mod tests {
                 body: format!("reply {i}"),
                 created_at: i + 1,
                 remote_id: None,
+                kind: loopreview_core::CommentKind::Draft,
             });
         }
         app.review.threads.push(Thread {
@@ -7309,6 +7319,7 @@ mod tests {
                 body: "note".into(),
                 created_at: 0,
                 remote_id: None,
+                kind: loopreview_core::CommentKind::Draft,
             }],
         });
         app.relayout();
@@ -7384,6 +7395,7 @@ mod tests {
                 body: "note".into(),
                 created_at: 0,
                 remote_id: None,
+                kind: loopreview_core::CommentKind::Draft,
             }],
         });
         app.relayout();
@@ -7487,6 +7499,7 @@ mod tests {
                 body: "b".into(),
                 created_at: 0,
                 remote_id: None,
+                kind: loopreview_core::CommentKind::Draft,
             }],
         });
         app.relayout();

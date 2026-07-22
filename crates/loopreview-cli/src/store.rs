@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use loopreview_core::Review;
+use loopreview_core::{CommentKind, Review};
 
 use crate::config::config_dir;
 
@@ -132,7 +132,12 @@ impl Store {
 
     /// Load the working-tree review, empty when the file does not exist.
     pub fn load(&self) -> Result<Review> {
-        Ok(self.read_doc()?.review)
+        let mut review = self.read_doc()?.review;
+        // A working-tree review never submits to GitHub, so all its comments are
+        // local notes — mark them, regardless of what an older store recorded
+        // (old data defaults to `Draft`; PR drafts, loaded separately, keep it).
+        mark_local(&mut review);
+        Ok(review)
     }
 
     /// Load the working-tree review, recovering from a corrupt or unreadable
@@ -215,6 +220,16 @@ impl Store {
                 }
             }
         })
+    }
+}
+
+/// Mark every comment in `review` as a local note (the working-tree review is
+/// never submitted).
+fn mark_local(review: &mut Review) {
+    for thread in &mut review.threads {
+        for comment in &mut thread.comments {
+            comment.kind = CommentKind::Local;
+        }
     }
 }
 
@@ -310,11 +325,42 @@ mod tests {
                     body: "looks off".to_string(),
                     created_at: 42,
                     remote_id: None,
+                    kind: loopreview_core::CommentKind::Draft,
                 }],
             }],
         };
         store.save(&review).unwrap();
-        assert_eq!(store.load().unwrap(), review);
+        // load() normalizes a working-tree review's comments to local notes.
+        let mut expected = review.clone();
+        expected.threads[0].comments[0].kind = CommentKind::Local;
+        assert_eq!(store.load().unwrap(), expected);
+        let _ = std::fs::remove_dir_all(store.path.parent().unwrap());
+    }
+
+    #[test]
+    fn working_tree_loads_local_while_pr_drafts_stay_draft() {
+        let store = temp_store();
+        let mk = |id: &str| Review {
+            threads: vec![Thread {
+                id: id.to_string(),
+                anchor: Anchor::line("a", Side::New, 1),
+                state: ThreadState::Open,
+                comments: vec![Comment {
+                    id: format!("{id}-c"),
+                    author: "me".to_string(),
+                    body: "b".to_string(),
+                    created_at: 0,
+                    remote_id: None,
+                    kind: CommentKind::Draft, // as an old store (or a fresh save) records
+                }],
+            }],
+        };
+        store.save(&mk("wt")).unwrap();
+        store.save_pr_drafts("owner/repo#1", &mk("pr")).unwrap();
+        // The working-tree review comes back as local notes...
+        assert!(store.load().unwrap().threads[0].comments[0].is_local());
+        // ...while the PR draft set keeps its draft kind (it will be submitted).
+        assert!(store.load_pr_drafts("owner/repo#1").unwrap().threads[0].comments[0].is_draft());
         let _ = std::fs::remove_dir_all(store.path.parent().unwrap());
     }
 
@@ -332,6 +378,8 @@ mod tests {
                     body: "b".to_string(),
                     created_at: 0,
                     remote_id: None,
+                    // A working-tree review loads as local notes, so expect that.
+                    kind: CommentKind::Local,
                 }],
             }],
         };
@@ -346,6 +394,7 @@ mod tests {
                     body: "draft".to_string(),
                     created_at: 0,
                     remote_id: None,
+                    kind: loopreview_core::CommentKind::Draft,
                 }],
             }],
         };
@@ -378,6 +427,7 @@ mod tests {
                     body: body.to_string(),
                     created_at: 0,
                     remote_id: None,
+                    kind: loopreview_core::CommentKind::Draft,
                 })
                 .collect(),
         }

@@ -78,6 +78,23 @@ pub enum ThreadState {
     Resolved,
 }
 
+/// What a comment is *for*, independent of whether it has been published. A
+/// `local` note is agent-conversation only and is never sent to GitHub; a
+/// `draft` is queued for the next `review submit`. Publication is orthogonal: a
+/// published comment carries a `remote_id`, and a draft becomes published on
+/// submit. Old stores (no `kind`) deserialize as `Draft`, preserving the
+/// historical "everything is a draft" behavior; the store's loader downgrades a
+/// working-tree review to `Local` (a non-PR review sends nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommentKind {
+    /// A note for the agent conversation — never sent to GitHub.
+    Local,
+    /// Queued for the next `review submit` (the historical default).
+    #[default]
+    Draft,
+}
+
 /// A single comment: the root of a thread, or a reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Comment {
@@ -89,16 +106,30 @@ pub struct Comment {
     pub body: String,
     /// Creation time, seconds since the Unix epoch (sorts chronologically).
     pub created_at: u64,
-    /// The remote (GitHub) comment id once published; `None` while a local
-    /// draft.
+    /// The remote (GitHub) comment id once published; `None` while unpublished.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub remote_id: Option<String>,
+    /// Whether this is a local note or a draft to submit. Defaults to `Draft` for
+    /// data written before this field existed.
+    #[serde(default)]
+    pub kind: CommentKind,
 }
 
 impl Comment {
     /// True while this comment has not been published to a remote.
+    pub fn is_published(&self) -> bool {
+        self.remote_id.is_some()
+    }
+
+    /// True for a local note (never sent to GitHub).
+    pub fn is_local(&self) -> bool {
+        self.kind == CommentKind::Local
+    }
+
+    /// True while this comment is an unpublished draft queued to submit — not a
+    /// local note, and not yet on the remote.
     pub fn is_draft(&self) -> bool {
-        self.remote_id.is_none()
+        self.remote_id.is_none() && self.kind == CommentKind::Draft
     }
 }
 
@@ -181,6 +212,7 @@ mod tests {
             body: body.to_string(),
             created_at: 1_000,
             remote_id: None,
+            kind: CommentKind::Draft,
         }
     }
 
@@ -206,6 +238,23 @@ mod tests {
         let anchor = Anchor::line("a.rs", Side::Old, 3);
         assert_eq!(anchor.file(), Some("a.rs"));
         assert_eq!(Anchor::Review.file(), None);
+    }
+
+    #[test]
+    fn missing_kind_deserializes_as_draft() {
+        // Data written before `kind` existed must load as a draft (it was queued
+        // to submit), never as a silent local note that would not be sent.
+        let json = r#"{"id":"c","author":"a","body":"b","created_at":0}"#;
+        let c: Comment = serde_json::from_str(json).unwrap();
+        assert_eq!(c.kind, CommentKind::Draft);
+        assert!(c.is_draft() && !c.is_local());
+        // A local note round-trips.
+        let local = Comment {
+            kind: CommentKind::Local,
+            ..c
+        };
+        let back: Comment = serde_json::from_str(&serde_json::to_string(&local).unwrap()).unwrap();
+        assert!(back.is_local() && !back.is_draft());
     }
 
     #[test]

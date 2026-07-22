@@ -204,6 +204,7 @@ mod tests {
             body: "b".to_string(),
             created_at: 0,
             remote_id: remote.map(str::to_string),
+            kind: loopreview_core::CommentKind::Draft,
         }
     }
 

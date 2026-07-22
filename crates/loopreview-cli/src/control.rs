@@ -510,6 +510,7 @@ mod tests {
                 body: "here".into(),
                 created_at: 5,
                 remote_id: None,
+                kind: loopreview_core::CommentKind::Draft,
             }],
         };
         let info = thread_info(&thread, false);
