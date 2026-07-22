@@ -103,7 +103,7 @@ files from a working-tree review.
 | --- | --- |
 | `j` / `k` (or `↓` / `↑`) | Move the cursor (over file headers and lines) |
 | `l` (or `→`) | Go in: expand a folded file, or move from a header to its first line |
-| `h` (or `←`) | Go out: a line jumps to its file header; a header moves focus to the sidebar (fold with `o`) |
+| `h` (or `←`) | Go out: line → its file header, expanded header → fold, folded header → sidebar (`b` jumps straight to the sidebar) |
 | `Ctrl-D` / `Ctrl-U` | Half-page down / up |
 | `Space` / `PageDown`, `PageUp` | Page down / up |
 | `g` / `G` (or `Home` / `End`) | First / last line |

@@ -57,12 +57,22 @@ const ADD_EMPH_BG: Color = Color::Rgb(30, 84, 44);
 const DEL_EMPH_BG: Color = Color::Rgb(96, 40, 46);
 /// Background of the line the cursor is on (when it has no diff tint).
 const CURSOR_BG: Color = Color::Rgb(38, 43, 56);
+/// The line cursor when the body is the inactive pane (sidebar focused): a
+/// faint fill so it reads as "not the active target".
+const CURSOR_DIM_BG: Color = Color::Rgb(30, 33, 42);
 /// Background of the file header the cursor rests on — brighter than a content
 /// line's cursor, since headers are the diff's few anchors and must stand out.
 const HEADER_CURSOR_BG: Color = Color::Rgb(54, 64, 92);
+/// The header cursor when the body is the inactive pane (sidebar focused).
+const HEADER_CURSOR_DIM_BG: Color = Color::Rgb(40, 45, 62);
 /// Background marking the sidebar file currently shown in the body (a subtle
 /// blue tint under a cyan bar), distinct from the stronger selection color.
 const SIDEBAR_CURRENT_BG: Color = Color::Rgb(33, 43, 62);
+/// The sidebar's resting selection when the sidebar is not the focused pane —
+/// a faint fill, dimmer than the focused selection and the current-file tint.
+const SIDEBAR_SEL_DIM_BG: Color = Color::Rgb(31, 35, 47);
+/// Accent used on the focused pane's divider (dim when it is not focused).
+const FOCUS_ACCENT: Color = Color::Cyan;
 /// Background of a side-by-side cell with no line (the other side changed).
 const ABSENT_BG: Color = Color::Rgb(22, 24, 30);
 /// The bar background used for the header and footer.
@@ -1667,11 +1677,10 @@ impl App {
         }
     }
 
-    /// `h` in the body: go one level out. On a line, jump to the file's own
-    /// header. On a header (folded or expanded alike), move focus to the sidebar
-    /// when it is showing — a no-op otherwise. Folding lives on `o`, a header
-    /// click, and the sidebar's toggle, not on `h`, so the cascade can't strand
-    /// the reviewer away from the sidebar.
+    /// `h` in the body: go one level out, in a hierarchy (nvim-tree style). On a
+    /// line, jump to the file's own header; an expanded header collapses; a
+    /// collapsed header moves focus to the sidebar (when it is showing). `b` is
+    /// the direct jump to the sidebar for when the cascade is more than you want.
     fn nav_out(&mut self) {
         let file = self.current_file();
         if !self.cursor_is_header() {
@@ -1680,8 +1689,17 @@ impl App {
             }
             return;
         }
-        if self.sidebar_width(self.body_width.get()).is_some() {
-            self.focus_sidebar();
+        let collapsed = self
+            .diff
+            .files
+            .get(file)
+            .is_some_and(|f| self.collapsed_files.contains(f.display_path()));
+        if collapsed {
+            if self.sidebar_width(self.body_width.get()).is_some() {
+                self.focus_sidebar();
+            }
+        } else {
+            self.set_file_collapsed(file, Some(true));
         }
     }
 
@@ -2754,6 +2772,12 @@ impl App {
         }
     }
 
+    /// Whether the diff body is the inactive pane (the sidebar holds focus). A
+    /// hidden sidebar forces focus back to the body, so this is false then.
+    fn body_dimmed(&self) -> bool {
+        self.focus == Focus::Sidebar
+    }
+
     // -- navigation -------------------------------------------------------
 
     fn sbs(&self) -> bool {
@@ -2988,10 +3012,15 @@ impl App {
                 ])
                 .split(body);
             self.draw_sidebar(f, cols[0]);
+            // The divider doubles as a focus cue: accent when the sidebar holds
+            // focus, dim when the diff body does.
+            let (glyph, divider_fg) = if self.focus == Focus::Sidebar {
+                ("┃", FOCUS_ACCENT)
+            } else {
+                ("│", Color::DarkGray)
+            };
             let divider: Vec<TextLine> = (0..cols[1].height)
-                .map(|_| {
-                    TextLine::from(TextSpan::styled("│", Style::default().fg(Color::DarkGray)))
-                })
+                .map(|_| TextLine::from(TextSpan::styled(glyph, Style::default().fg(divider_fg))))
                 .collect();
             f.render_widget(Paragraph::new(divider), cols[1]);
             content = cols[2];
@@ -3419,12 +3448,16 @@ impl App {
         if let Some(status) = &self.status {
             spans.push(TextSpan::styled(status.clone(), bar.fg(Color::Yellow)));
         } else {
+            // The hint switches with focus and with what the cursor rests on, so
+            // the keys shown are always the ones that act right now.
             let help = if self.focus == Focus::Sidebar {
-                "j/k file · enter open · o fold · esc body · ^p find · q quit"
+                "l/enter open · o fold · h/esc back · ^p find · q quit"
             } else if self.view == View::Conversation {
                 "j/k thread · o fold · r reply · x resolve · X close · b files · tab diff · q quit"
+            } else if self.cursor_is_header() {
+                "l open · h fold · j/k move · b sidebar · ^p find · q quit"
             } else {
-                "j/k move · n/p file · c comment · r reply · x resolve · o fold · b sidebar · ^p find · q quit"
+                "j/k move · l/h in·out · c comment · r reply · o fold · b sidebar · q quit"
             };
             spans.push(TextSpan::styled(help, bar.fg(Color::DarkGray)));
             if self.pr.is_some() {
@@ -3530,8 +3563,13 @@ impl App {
         let (hi, li) = self.flats[file][flat];
         let line = &self.diff.files[file].hunks[hi].lines[li];
         let (tint, emph_bg, sign, sign_color) = kind_style(line.kind);
+        let dim = self.body_dimmed();
         let bg = if is_cursor {
-            Some(tint.unwrap_or(CURSOR_BG))
+            Some(if dim {
+                CURSOR_DIM_BG
+            } else {
+                tint.unwrap_or(CURSOR_BG)
+            })
         } else if self.in_selection(file, flat) {
             Some(SELECTION_BG)
         } else {
@@ -3539,6 +3577,7 @@ impl App {
         };
         let base = bg.map_or_else(Style::default, |c| Style::default().bg(c));
         let marker = if is_cursor { "▎" } else { " " };
+        let marker_fg = if dim { Color::DarkGray } else { Color::Cyan };
         let number = if new_side {
             line.new_lineno
         } else {
@@ -3550,7 +3589,7 @@ impl App {
         let mut spans = vec![
             TextSpan::styled(
                 marker.to_string(),
-                base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                base.fg(marker_fg).add_modifier(Modifier::BOLD),
             ),
             TextSpan::styled(
                 format!("{} ", optional_number(number, self.num_width)),
@@ -3592,14 +3631,23 @@ impl App {
         // the cursor rests here, a bright bar and a fill brighter than a content
         // line's cursor make the header stand out (it anchors the whole file).
         let chevron = if collapsed { "▸ " } else { "▾ " };
+        let dim = self.body_dimmed();
         let base = if is_cursor {
-            Style::default()
-                .bg(HEADER_CURSOR_BG)
-                .add_modifier(Modifier::BOLD)
+            let bg = if dim {
+                HEADER_CURSOR_DIM_BG
+            } else {
+                HEADER_CURSOR_BG
+            };
+            Style::default().bg(bg).add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
         let marker = if is_cursor { "▎" } else { " " };
+        let marker_fg = if is_cursor && dim {
+            Color::DarkGray
+        } else {
+            Color::Cyan
+        };
         let path_style = if is_current {
             base.fg(Color::White).add_modifier(Modifier::BOLD)
         } else {
@@ -3608,7 +3656,7 @@ impl App {
         let mut spans = vec![
             TextSpan::styled(
                 marker.to_string(),
-                base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                base.fg(marker_fg).add_modifier(Modifier::BOLD),
             ),
             TextSpan::styled(chevron, base.fg(Color::Cyan)),
             TextSpan::styled(path, path_style),
@@ -3719,16 +3767,17 @@ impl App {
         let sidebar_focused = self.focus == Focus::Sidebar;
         let start = self.sidebar_scroll.min(entries.len());
         let end = (start + height).min(entries.len());
-        // Two states are shown at once and must be told apart: the sidebar
-        // cursor (a clear blue fill + a bright bar, only while the sidebar has
-        // focus) and the file currently open in the body (a subtle blue tint +
-        // a cyan bar, always). A leading marker column carries the bar.
+        // Three states are shown and must be told apart by intensity, carried in
+        // a leading marker column: the sidebar cursor while the sidebar has focus
+        // (a clear blue fill + a bright white bar + bold); the file open in the
+        // body (a subtle blue tint + a cyan bar, always); and — when focus is in
+        // the body — the sidebar's resting cursor (a faint fill + a dim bar).
         let lines: Vec<TextLine> = entries[start..end]
             .iter()
             .map(|e| {
-                let is_cursor = sidebar_focused && e.index == self.sidebar_cursor;
+                let is_sel = e.index == self.sidebar_cursor;
                 let is_current = e.index == current;
-                let (base, marker, marker_fg) = if is_cursor {
+                let (base, marker, marker_fg) = if sidebar_focused && is_sel {
                     (
                         Style::default().bg(SEL_BG).add_modifier(Modifier::BOLD),
                         "▎",
@@ -3736,6 +3785,12 @@ impl App {
                     )
                 } else if is_current {
                     (Style::default().bg(SIDEBAR_CURRENT_BG), "▎", Color::Cyan)
+                } else if is_sel {
+                    (
+                        Style::default().bg(SIDEBAR_SEL_DIM_BG),
+                        "▎",
+                        Color::DarkGray,
+                    )
                 } else {
                     (Style::default(), " ", Color::Reset)
                 };
@@ -3824,8 +3879,13 @@ impl App {
         let (hi, li) = self.flats[file][flat];
         let line = &self.diff.files[file].hunks[hi].lines[li];
         let (tint, emph_bg, sign, sign_color) = kind_style(line.kind);
+        let dim = self.body_dimmed();
         let bg = if is_cursor {
-            Some(tint.unwrap_or(CURSOR_BG))
+            Some(if dim {
+                CURSOR_DIM_BG
+            } else {
+                tint.unwrap_or(CURSOR_BG)
+            })
         } else if self.in_selection(file, flat) {
             Some(SELECTION_BG)
         } else {
@@ -3833,6 +3893,7 @@ impl App {
         };
         let base = bg.map_or_else(Style::default, |c| Style::default().bg(c));
         let marker = if is_cursor { "▎" } else { " " };
+        let marker_fg = if dim { Color::DarkGray } else { Color::Cyan };
         let old = optional_number(line.old_lineno, self.num_width);
         let new = optional_number(line.new_lineno, self.num_width);
         // A fixed gutter (marker + old/new numbers + sign), then the content
@@ -3841,7 +3902,7 @@ impl App {
         let mut spans = vec![
             TextSpan::styled(
                 marker.to_string(),
-                base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                base.fg(marker_fg).add_modifier(Modifier::BOLD),
             ),
             TextSpan::styled(format!("{old} {new} "), base.fg(Color::DarkGray)),
             TextSpan::styled(format!("{sign} "), base.fg(sign_color)),
@@ -5269,36 +5330,138 @@ mod tests {
         // h jumps from a line back to its header.
         app.nav_out();
         assert!(app.cursor_is_header());
-        // h on a header no longer folds (no sidebar to focus here) — it is `o`
-        // that collapses the file.
+        // h on an expanded header collapses the file (the hierarchy cascade).
         app.nav_out();
-        assert!(!app.collapsed_files.contains("a.rs"), "h does not collapse");
-        app.toggle_fold();
-        assert!(app.collapsed_files.contains("a.rs"), "o collapses");
+        assert!(
+            app.collapsed_files.contains("a.rs"),
+            "h collapses an open file"
+        );
     }
 
     #[test]
-    fn h_on_a_header_focuses_the_sidebar_when_shown() {
+    fn h_on_a_collapsed_header_focuses_the_sidebar_when_shown() {
         let mut app = multi_file_app(&["a.rs", "b.rs"]);
         app.sidebar_override = Some(true);
         app.body_width.set(120);
-        app.relayout();
-        // An expanded header: h focuses the sidebar (not fold).
-        app.cursor = 0;
-        assert!(app.cursor_is_header());
-        app.nav_out();
-        assert_eq!(app.focus, Focus::Sidebar);
-        assert!(
-            !app.collapsed_files.contains("a.rs"),
-            "h did not fold the file"
-        );
-        // A collapsed header behaves the same way.
-        app.focus = Focus::Body;
         app.collapsed_files.insert("a.rs".to_string());
         app.relayout();
-        app.cursor = 0;
+        app.cursor = 0; // a's collapsed header
         app.nav_out();
         assert_eq!(app.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn h_cascade_reaches_the_sidebar_through_keys() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // A real draw wires up the sidebar; then key events drive the cascade
+        // line → header → fold → sidebar, checking focus at each step.
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        app.sidebar_override = Some(true);
+        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(app.sidebar_width(app.body_width.get()).is_some());
+
+        let line = app.file_first_line(0).expect("file a has a content line");
+        app.set_cursor(line);
+        assert_eq!(app.focus, Focus::Body);
+        // h: a line jumps to its own header.
+        app.on_key(KeyCode::Char('h'), KeyModifiers::NONE);
+        assert!(app.cursor_is_header());
+        assert_eq!(app.focus, Focus::Body);
+        // h: an expanded header collapses the file.
+        app.on_key(KeyCode::Char('h'), KeyModifiers::NONE);
+        assert!(app.collapsed_files.contains("a.rs"));
+        assert_eq!(app.focus, Focus::Body);
+        // h: a collapsed header moves focus to the sidebar.
+        app.on_key(KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar,
+            "the h cascade reaches the sidebar"
+        );
+    }
+
+    /// The background under the body's cursor bar (`▎`), scanning only the
+    /// content area so the sidebar's own bars are not picked up.
+    fn body_cursor_bg(
+        term: &ratatui::Terminal<ratatui::backend::TestBackend>,
+        content_x0: u16,
+    ) -> Option<Color> {
+        let buf = term.backend().buffer();
+        let (w, h) = (buf.area().width, buf.area().height);
+        for y in 0..h {
+            for x in content_x0..w {
+                if buf[(x, y)].symbol() == "▎" {
+                    return Some(buf[(x, y)].bg);
+                }
+            }
+        }
+        None
+    }
+
+    fn footer_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buf = term.backend().buffer();
+        let (w, h) = (buf.area().width, buf.area().height);
+        (0..w).map(|x| buf[(x, h - 1)].symbol()).collect()
+    }
+
+    #[test]
+    fn body_cursor_dims_when_the_sidebar_has_focus() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = multi_file_app(&["a.rs"]);
+        app.mode = Mode::Unified;
+        app.sidebar_override = Some(true);
+        let line = app.file_first_line(0).expect("a content line");
+        app.set_cursor(line);
+        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+
+        // Body focused: the cursor bar is the bright cursor color.
+        app.focus = Focus::Body;
+        term.draw(|f| app.draw(f)).unwrap();
+        let x0 = app.hit.get().sidebar_w + 1;
+        assert_eq!(
+            body_cursor_bg(&term, x0),
+            Some(CURSOR_BG),
+            "the active body cursor is bright"
+        );
+
+        // Sidebar focused: the same cursor dims.
+        app.focus = Focus::Sidebar;
+        term.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(
+            body_cursor_bg(&term, x0),
+            Some(CURSOR_DIM_BG),
+            "the inactive body cursor dims"
+        );
+        assert_ne!(CURSOR_BG, CURSOR_DIM_BG);
+    }
+
+    #[test]
+    fn footer_hint_follows_focus() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = multi_file_app(&["a.rs"]);
+        app.sidebar_override = Some(true);
+        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+
+        app.focus = Focus::Sidebar;
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(
+            footer_text(&term).contains("h/esc back"),
+            "the sidebar shows its own hint"
+        );
+
+        // Body focus, cursor on a file header (index 0).
+        app.focus = Focus::Body;
+        app.cursor = 0;
+        assert!(app.cursor_is_header());
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(
+            footer_text(&term).contains("h fold"),
+            "the body header shows the fold/open hint"
+        );
     }
 
     // -- file explorer (sidebar + finder) -----------------------------------
