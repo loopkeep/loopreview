@@ -81,6 +81,20 @@ pub fn connect(socket: &str) -> Result<Connection<Stream>> {
     Ok(Connection::new(stream))
 }
 
+/// A cheap liveness probe: whether something is actually listening on `socket`.
+///
+/// A live session accepts the connect; a crashed one leaves a stale socket file
+/// (Unix) or a vanished pipe (Windows) that refuses it. This distinguishes a
+/// genuinely running session from a registry record whose pid has since been
+/// reused by an unrelated process. The probe connection is dropped immediately;
+/// the session's accept loop treats it as a peer that hung up.
+pub fn is_reachable(socket: &str) -> bool {
+    match name(socket) {
+        Ok(name) => Stream::connect(name).is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// The largest control message accepted, in bytes. A peer that sends a longer
 /// line (or a line with no terminator) is dropped rather than allowed to grow the
 /// read buffer without bound.

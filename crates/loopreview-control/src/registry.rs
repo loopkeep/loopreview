@@ -3,13 +3,17 @@
 //! There is no central daemon. Each UI writes a [`SessionRecord`] into a
 //! sessions directory when it starts and removes it when it exits. `lr session
 //! list` reads the directory and, because a crashed UI cannot clean up after
-//! itself, drops any record whose process is no longer alive (and, on Unix, its
-//! leftover socket file). The caller owns the directory path so this module
-//! stays free of any environment convention and is easy to test.
+//! itself, drops any record that is no longer live — its process has exited, or
+//! (guarding against a reused pid) nothing is listening on its socket — reclaiming
+//! the leftover record and, on Unix, its socket file. The caller owns the
+//! directory path so this module stays free of any environment convention and is
+//! easy to test.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::transport;
 
 /// A registered review session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,9 +57,13 @@ pub fn remove(dir: &Path, id: &str) {
     let _ = std::fs::remove_file(record_path(dir, id));
 }
 
-/// Read every live session from `dir`, discarding (and cleaning up) records
-/// whose process has exited. Records are returned sorted by start time, oldest
-/// first, for stable listing.
+/// Read every live session from `dir`, discarding (and cleaning up) records that
+/// are no longer live. A record is live only when its process is still running
+/// **and** something answers on its socket: a session binds its listener before
+/// it registers, so a live record is always reachable, while a record whose pid
+/// has been reused by an unrelated process fails the socket probe and is
+/// reclaimed. Records are returned sorted by start time, oldest first, for stable
+/// listing.
 pub fn list(dir: &Path) -> Vec<SessionRecord> {
     let mut records = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -67,10 +75,11 @@ pub fn list(dir: &Path) -> Vec<SessionRecord> {
             continue;
         }
         let Ok(record) = read(&path) else { continue };
-        if process_alive(record.pid) {
+        if process_alive(record.pid) && transport::is_reachable(&record.socket) {
             records.push(record);
         } else {
-            // A crashed session: reclaim its record and socket file.
+            // A crashed session, or a record left by a since-reused pid: reclaim
+            // its record and socket file.
             remove_socket(&record.socket);
             let _ = std::fs::remove_file(&path);
         }
@@ -142,15 +151,33 @@ mod tests {
         dir
     }
 
-    fn record(id: &str, pid: u32) -> SessionRecord {
+    /// A unique socket id for one test session, so parallel tests never collide.
+    fn unique_socket(id: &str) -> String {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        crate::transport::socket_id(&format!("reg-{}-{n}-{id}", std::process::id()))
+    }
+
+    fn record_with_socket(id: &str, pid: u32, socket: &str) -> SessionRecord {
         SessionRecord {
             id: id.to_string(),
             pid,
-            socket: format!("{id}.sock"),
+            socket: socket.to_string(),
             repo: Some("/repo".to_string()),
             source: "working tree".to_string(),
             started_at: 100,
         }
+    }
+
+    /// A record for a live session: the current pid plus a real listener the
+    /// caller must keep alive for the duration of the test.
+    fn live_record(id: &str) -> (SessionRecord, crate::transport::Listener) {
+        let socket = unique_socket(id);
+        let listener = crate::transport::listen(&socket).unwrap();
+        (
+            record_with_socket(id, std::process::id(), &socket),
+            listener,
+        )
     }
 
     #[test]
@@ -167,7 +194,7 @@ mod tests {
     #[test]
     fn register_then_list_round_trips() {
         let dir = temp_dir();
-        let record = record("abc", std::process::id());
+        let (record, _listener) = live_record("abc");
         register(&dir, &record).unwrap();
         let listed = list(&dir);
         assert_eq!(listed, vec![record]);
@@ -177,8 +204,13 @@ mod tests {
     #[test]
     fn list_drops_dead_sessions_and_reclaims_their_records() {
         let dir = temp_dir();
-        register(&dir, &record("live", std::process::id())).unwrap();
-        register(&dir, &record("dead", 4_000_000_000)).unwrap();
+        let (live, _listener) = live_record("live");
+        register(&dir, &live).unwrap();
+        register(
+            &dir,
+            &record_with_socket("dead", 4_000_000_000, &unique_socket("dead")),
+        )
+        .unwrap();
         let listed = list(&dir);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, "live");
@@ -188,9 +220,24 @@ mod tests {
     }
 
     #[test]
+    fn list_reclaims_a_record_whose_pid_was_reused() {
+        // A crashed session's pid can be reassigned to an unrelated process, so a
+        // live-looking pid is not enough: with nothing listening on the recorded
+        // socket, the record must be reclaimed rather than reported alive.
+        let dir = temp_dir();
+        let stale = record_with_socket("reused", std::process::id(), &unique_socket("reused"));
+        register(&dir, &stale).unwrap();
+        let listed = list(&dir);
+        assert!(listed.is_empty(), "an unreachable session is not listed");
+        assert!(!record_path(&dir, "reused").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn remove_deletes_the_record() {
         let dir = temp_dir();
-        register(&dir, &record("gone", std::process::id())).unwrap();
+        let (record, _listener) = live_record("gone");
+        register(&dir, &record).unwrap();
         remove(&dir, "gone");
         assert!(list(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
