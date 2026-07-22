@@ -204,8 +204,9 @@ enum JobMsg {
 enum JobOutcome {
     /// A re-pulled thread list to merge with local drafts.
     Refreshed(Vec<Thread>),
-    /// Thread at `index` had its resolution synced.
-    Resolved { index: usize, resolved: bool },
+    /// The thread (by id) had its resolution synced. Id, not index: the review
+    /// can shift while the network job runs.
+    Resolved { thread_id: String, resolved: bool },
     /// A submitted review's id stamps.
     Submitted(crate::prsync::Submitted),
     /// A published comment's body was edited on GitHub; apply it locally.
@@ -432,11 +433,12 @@ enum ComposeKind {
 
 /// A pending removal awaiting `d` confirmation.
 struct DeleteTarget {
-    /// The thread's index in `review.threads`.
-    thread: usize,
-    /// The comment index to remove, or `None` to remove the whole draft thread
+    /// The thread's id — resolved to a fresh index at confirm time, since the
+    /// review can shift between arming `d` and pressing `y`.
+    thread_id: String,
+    /// The comment id to remove, or `None` to remove the whole draft thread
     /// (a draft root takes its thread with it).
-    comment: Option<usize>,
+    comment_id: Option<String>,
     /// For a published comment, its `(remote id, is-review-comment)` — the
     /// removal goes to GitHub first. `None` for a purely-local removal.
     published: Option<(u64, bool)>,
@@ -925,15 +927,18 @@ impl App {
                 self.status = Some("refreshed from GitHub".to_string());
                 self.relayout();
             }
-            Ok(JobOutcome::Resolved { index, resolved }) => {
+            Ok(JobOutcome::Resolved {
+                thread_id,
+                resolved,
+            }) => {
                 let mut changed = None;
-                if let Some(thread) = self.review.threads.get_mut(index) {
+                if let Some(thread) = self.review.thread_mut(&thread_id) {
                     thread.state = if resolved {
                         ThreadState::Resolved
                     } else {
                         ThreadState::Open
                     };
-                    changed = Some(thread.id.clone());
+                    changed = Some(thread_id);
                 }
                 // Fold on resolve / expand on reopen, via the default-fold pass.
                 if let Some(id) = &changed {
@@ -1572,38 +1577,62 @@ impl App {
     /// is removed in place.
     fn confirm_delete(&mut self, target: DeleteTarget) {
         match target.published {
+            // A published comment always names a single comment; delete it on
+            // GitHub, then remove it locally by id when the job succeeds.
             Some((remote_id, review)) => {
-                let ids = self.review.threads.get(target.thread).and_then(|t| {
-                    let cid = target.comment.and_then(|ci| t.comments.get(ci))?;
-                    Some((t.id.clone(), cid.id.clone()))
-                });
-                if let (Some((thread_id, comment_id)), Some(pr)) = (ids, self.pr.clone()) {
-                    self.start_job(
-                        "Deleting on GitHub",
-                        Box::new(move |progress| {
-                            progress("deleting comment…");
-                            pr.delete_published(remote_id, review)
-                                .map_err(friendly_github_write_error)?;
-                            Ok(JobOutcome::Deleted {
-                                thread_id,
-                                comment_id,
-                            })
-                        }),
-                    );
-                }
+                let (Some(comment_id), Some(pr)) = (target.comment_id, self.pr.clone()) else {
+                    return;
+                };
+                let thread_id = target.thread_id;
+                self.start_job(
+                    "Deleting on GitHub",
+                    Box::new(move |progress| {
+                        progress("deleting comment…");
+                        pr.delete_published(remote_id, review)
+                            .map_err(friendly_github_write_error)?;
+                        Ok(JobOutcome::Deleted {
+                            thread_id,
+                            comment_id,
+                        })
+                    }),
+                );
             }
+            // Local removal: re-resolve the ids to fresh indices — the review may
+            // have changed between arming and confirming (an agent event).
             None => {
-                if target.thread < self.review.threads.len() {
-                    self.remove_draft(target.thread, target.comment);
-                    self.status = Some(
-                        if target.comment.is_some() {
-                            "reply removed"
-                        } else {
-                            "draft removed"
+                let Some(ti) = self
+                    .review
+                    .threads
+                    .iter()
+                    .position(|t| t.id == target.thread_id)
+                else {
+                    self.status = Some("the thread is gone".to_string());
+                    return;
+                };
+                let is_reply = target.comment_id.is_some();
+                let ci = match &target.comment_id {
+                    Some(cid) => match self.review.threads[ti]
+                        .comments
+                        .iter()
+                        .position(|c| c.id == *cid)
+                    {
+                        Some(ci) => Some(ci),
+                        None => {
+                            self.status = Some("the comment is gone".to_string());
+                            return;
                         }
-                        .to_string(),
-                    );
-                }
+                    },
+                    None => None,
+                };
+                self.remove_draft(ti, ci);
+                self.status = Some(
+                    if is_reply {
+                        "reply removed"
+                    } else {
+                        "draft removed"
+                    }
+                    .to_string(),
+                );
             }
         }
     }
@@ -1619,23 +1648,25 @@ impl App {
         } else {
             (self.thread_at_cursor()?, 0)
         };
+        let thread_id = self.review.threads[ti].id.clone();
         let comment = self.review.threads[ti].comments.get(ci)?;
+        let comment_id = comment.id.clone();
         if comment.is_published() {
             if !self.comment_is_mine(comment) {
                 return None;
             }
-            let (remote_id, review) =
-                self.published_comment_ref(&self.review.threads[ti].id, &comment.id)?;
+            let (remote_id, review) = self.published_comment_ref(&thread_id, &comment_id)?;
             // A published delete removes just that one comment.
             Some(DeleteTarget {
-                thread: ti,
-                comment: Some(ci),
+                thread_id,
+                comment_id: Some(comment_id),
                 published: Some((remote_id, review)),
             })
         } else {
             Some(DeleteTarget {
-                thread: ti,
-                comment: if ci == 0 { None } else { Some(ci) },
+                // A draft root takes its whole thread; a reply removes itself.
+                comment_id: (ci != 0).then_some(comment_id),
+                thread_id,
                 published: None,
             })
         }
@@ -2031,7 +2062,7 @@ impl App {
                     });
                     pr.set_resolved(&node_id, want_resolved)?;
                     Ok(JobOutcome::Resolved {
-                        index: idx,
+                        thread_id: node_id,
                         resolved: want_resolved,
                     })
                 }),
@@ -4289,28 +4320,25 @@ impl App {
             .border_style(Style::default().fg(if published { Color::Red } else { Color::Yellow }));
         let inner = block.inner(area);
         f.render_widget(block, area);
-        let label = self
-            .review
-            .threads
-            .get(target.thread)
-            .map(|t| anchor_label(&t.anchor))
-            .unwrap_or_default();
+        let thread = self.review.thread(&target.thread_id);
+        let label = thread.map(|t| anchor_label(&t.anchor)).unwrap_or_default();
         let what = if published {
             format!(
                 "Permanently delete your published comment on {label} from GitHub? This can't be undone."
             )
-        } else if target.comment.is_some() {
+        } else if target.comment_id.is_some() {
             format!("Withdraw your reply on {label}?")
         } else {
             format!("Withdraw your draft thread on {label}?")
         };
         // A one-line excerpt of the exact comment, so the delete can't misfire on
-        // the wrong one. `None` (a whole-thread draft) points at the root.
-        let excerpt = self
-            .review
-            .threads
-            .get(target.thread)
-            .and_then(|t| t.comments.get(target.comment.unwrap_or(0)))
+        // the wrong one. A whole-thread draft (`comment_id` is `None`) shows its
+        // root; otherwise the named comment.
+        let excerpt = thread
+            .and_then(|t| match &target.comment_id {
+                Some(cid) => t.comments.iter().find(|c| c.id == *cid),
+                None => t.root(),
+            })
             .map(|c| one_line_excerpt(&c.body, 56))
             .unwrap_or_default();
         let lines = vec![
@@ -7353,6 +7381,72 @@ mod tests {
         assert_eq!(app.review.threads[0].comments[0].body, "root");
     }
 
+    #[test]
+    fn confirm_delete_targets_by_id_after_the_review_shifts() {
+        // Arm a delete on thread B, then have an agent remove thread A before the
+        // confirm — B's index shifts from 1 to 0. The id-based target must still
+        // remove B (an index-based one would miss it).
+        let mut app = sample_app();
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 1),
+            "me",
+            "A",
+            CommentKind::Local,
+        );
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "me",
+            "B",
+            CommentKind::Local,
+        );
+        app.relayout();
+        let b_id = app.review.threads[1].id.clone();
+        app.confirming_delete = Some(DeleteTarget {
+            thread_id: b_id.clone(),
+            comment_id: None,
+            published: None,
+        });
+        // Interleave: thread A is removed, shifting B to index 0.
+        app.review.threads.remove(0);
+        app.relayout();
+        let target = app.confirming_delete.take().unwrap();
+        app.confirm_delete(target);
+        assert!(
+            app.review.threads.iter().all(|t| t.id != b_id),
+            "B was removed by id despite the index shift"
+        );
+    }
+
+    #[test]
+    fn resolved_outcome_applies_by_id_after_the_review_shifts() {
+        // A resolve job for B finishes after A was removed (indices shifted).
+        let mut app = sample_app();
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 1),
+            "me",
+            "A",
+            CommentKind::Draft,
+        );
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "me",
+            "B",
+            CommentKind::Draft,
+        );
+        app.relayout();
+        let b_id = app.review.threads[1].id.clone();
+        app.review.threads.remove(0);
+        app.relayout();
+        app.apply_job(Ok(JobOutcome::Resolved {
+            thread_id: b_id.clone(),
+            resolved: true,
+        }));
+        assert!(
+            app.review.thread(&b_id).is_some_and(|t| t.is_resolved()),
+            "the resolution applied to B by id, not a stale index"
+        );
+    }
+
     fn published_comment(id: &str, author: &str, remote: &str) -> Thread {
         Thread {
             id: "t".into(),
@@ -7390,7 +7484,7 @@ mod tests {
         // Deleting it targets that single published comment; a line-anchored
         // thread is a review comment.
         let target = app.selected_delete_target().expect("a deletable target");
-        assert_eq!(target.comment, Some(0));
+        assert_eq!(target.comment_id.as_deref(), Some("c"));
         assert_eq!(target.published, Some((555, true)));
     }
 
