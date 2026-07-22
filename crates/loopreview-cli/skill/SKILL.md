@@ -105,7 +105,8 @@ lr session wait --repo . --for reply --after 12              # only events past 
 - `--for` takes `comment`, `reply`, `resolve`, `submit`, or `reload`; repeat it
   for several kinds, or omit it to wait for any event.
 - `--timeout <seconds>` bounds the wait; on timeout the event is null and the
-  command still exits 0.
+  command exits non-zero. A wait always returns within 600 seconds even with no
+  `--timeout`, so a long vigil is a loop of waits, each chained with `--after`.
 - To not miss an event between two waits, read `event_seq` from `context` (or the
   `event_seq` a previous `wait` returned) and pass it as `--after`.
 

@@ -14,6 +14,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use loopreview_control::ControlError;
 use loopreview_control::events::EventLog;
 use loopreview_control::protocol::{
     AnchorInfo, CommentInfo, FileInfo, Hello, HunkInfo, LineInfo, PROTOCOL_VERSION, Reply, Request,
@@ -133,6 +134,10 @@ fn handle<S: std::io::Read + std::io::Write>(
 
     let request = match conn.read::<Request>() {
         Ok(request) => request,
+        Err(ControlError::LineTooLong) => {
+            let _ = conn.write(&Response::Error("request too large".to_string()));
+            return;
+        }
         Err(_) => return,
     };
     let response = match request {
@@ -140,8 +145,10 @@ fn handle<S: std::io::Read + std::io::Write>(
         Request::Wait(wait) => {
             // Without an explicit floor, wait for the next event after now.
             let after = wait.after.unwrap_or_else(|| events.latest_seq());
-            let timeout = wait.timeout_ms.map(Duration::from_millis);
-            let (event, event_seq) = events.wait(&wait.events, after, timeout);
+            // Cap the wait so a disconnected client's handler thread cannot park
+            // forever: even an open-ended wait wakes within MAX_WAIT and exits.
+            let timeout = capped_wait(wait.timeout_ms);
+            let (event, event_seq) = events.wait(&wait.events, after, Some(timeout));
             Response::Ok(Reply::Wait(WaitResult { event, event_seq }))
         }
         other => {
@@ -161,6 +168,22 @@ fn handle<S: std::io::Read + std::io::Write>(
         }
     };
     let _ = conn.write(&response);
+}
+
+/// The ceiling on a single `wait`, whether or not the client asked for a
+/// timeout. It bounds how long a handler thread can stay parked after its client
+/// has gone away (a socket that is merely half-open cannot be detected without
+/// consuming protocol bytes, so a hard cap is the reliable bound); the client can
+/// simply wait again with `--after` to continue.
+const MAX_WAIT: Duration = Duration::from_secs(600);
+
+/// Resolve the effective wait timeout: the requested one clamped to [`MAX_WAIT`],
+/// or [`MAX_WAIT`] when none was given.
+fn capped_wait(timeout_ms: Option<u64>) -> Duration {
+    match timeout_ms {
+        Some(ms) => Duration::from_millis(ms).min(MAX_WAIT),
+        None => MAX_WAIT,
+    }
 }
 
 /// A process-unique session id (pid, a timestamp, and a counter, hex-encoded).
@@ -429,6 +452,14 @@ mod tests {
                 ],
             }],
         }
+    }
+
+    #[test]
+    fn capped_wait_bounds_open_ended_and_oversized_timeouts() {
+        // No timeout is capped, an oversized one is clamped, a small one is kept.
+        assert_eq!(capped_wait(None), MAX_WAIT);
+        assert_eq!(capped_wait(Some(10_000_000_000)), MAX_WAIT);
+        assert_eq!(capped_wait(Some(1_500)), Duration::from_millis(1_500));
     }
 
     #[test]

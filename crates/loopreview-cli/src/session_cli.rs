@@ -156,7 +156,7 @@ pub fn run(args: SessionArgs) -> Result<()> {
                 bail!("unexpected reply");
             };
             if json {
-                emit(&result)
+                emit(&result)?;
             } else {
                 match &result.event {
                     Some(event) => {
@@ -169,8 +169,13 @@ pub fn run(args: SessionArgs) -> Result<()> {
                     }
                     None => println!("timed out (no event; latest seq {})", result.event_seq),
                 }
-                Ok(())
             }
+            // A timeout (no event) exits non-zero so scripts can branch on it,
+            // while the result is still printed to stdout.
+            if result.event.is_none() {
+                std::process::exit(1);
+            }
+            Ok(())
         }
     }
 }
