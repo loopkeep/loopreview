@@ -242,7 +242,7 @@ pub(crate) fn map_review_thread(thread: &ReviewThread) -> Thread {
 /// missing (a fully unplaceable outdated thread), anchors on the file. Anything
 /// else anchors on the resolved line, preferring the current line and falling
 /// back to the original line for outdated threads. The original commit and diff
-/// hunk are taken from the root comment so the outdated-display path (§5) has a
+/// hunk are taken from the root comment so the outdated-display path has a
 /// snippet to reconstruct from.
 fn thread_anchor(thread: &ReviewThread) -> Anchor {
     let Some(path) = thread.path.clone() else {

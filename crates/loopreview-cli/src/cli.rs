@@ -1,4 +1,4 @@
-//! Command-line surface (DESIGN.md §3.5).
+//! The command-line surface.
 //!
 //! Bare `lr` is dispatch sugar (a piped patch, otherwise the working tree).
 //! `lr diff` reviews a VCS diff and never reads stdin; `lr patch` reviews a

@@ -1,12 +1,11 @@
 //! [`PrSource`] — a [`DiffSource`] that shows a pull request's diff.
 //!
-//! Following the design's ruling (§7.5, §9), a PR is reviewed **without a
-//! checkout**. The source fetches the base branch and the PR head from `origin`,
-//! resolves both to commit SHAs, and then delegates to loopreview-core's
-//! [`RefSource`] to produce the three-dot `base...head` diff — the same
-//! comparison GitHub's "Files changed" tab shows. Fetching the base from
-//! `origin` (rather than reusing a possibly-stale local branch) is what keeps
-//! unrelated changes from leaking into the diff (the §9 lesson).
+//! A PR is reviewed **without a checkout**. The source fetches the base branch
+//! and the PR head from `origin`, resolves both to commit SHAs, and then
+//! delegates to loopreview-core's [`RefSource`] to produce the three-dot
+//! `base...head` diff — the same comparison GitHub's "Files changed" tab shows.
+//! Fetching the base from `origin` (rather than reusing a possibly-stale local
+//! branch) is what keeps unrelated changes from leaking into the diff.
 
 use std::path::PathBuf;
 
