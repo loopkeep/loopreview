@@ -317,6 +317,8 @@ struct App {
     conv_scroll: usize,
     /// Minimum body width for `auto` layout to choose side-by-side.
     split_min_width: usize,
+    /// True while awaiting confirmation to close (delete) the review.
+    confirming_close: bool,
     /// A transient status message (feedback or error).
     status: Option<String>,
     quit: bool,
@@ -375,6 +377,7 @@ impl App {
             conv_cursor: 0,
             conv_scroll: 0,
             split_min_width: 160,
+            confirming_close: false,
             status: None,
             reloaded_at: None,
             quit: false,
@@ -526,6 +529,16 @@ impl App {
         // While composing, keys edit the comment (or submit/cancel).
         if self.input.is_some() {
             self.on_key_compose(code, mods);
+            return;
+        }
+        // While confirming a close: y/Enter closes, anything else cancels.
+        if self.confirming_close {
+            self.confirming_close = false;
+            if matches!(code, KeyCode::Char('y') | KeyCode::Enter) {
+                self.close_review();
+            } else {
+                self.status = Some("close cancelled".to_string());
+            }
             return;
         }
         self.status = None;
@@ -727,8 +740,22 @@ impl App {
             (KeyCode::Char('x'), false) if self.has_review() => {
                 self.resolve_thread(self.conv_cursor)
             }
+            (KeyCode::Char('X'), false) if self.has_review() => self.confirming_close = true,
             _ => {}
         }
+    }
+
+    /// Close the review: delete the store and clear all threads.
+    fn close_review(&mut self) {
+        self.status = match self.store.as_ref().map(Store::delete) {
+            Some(Ok(())) | None => Some("review closed".to_string()),
+            Some(Err(e)) => Some(format!("could not remove the store: {e:#}")),
+        };
+        self.review.threads.clear();
+        self.conv_cursor = 0;
+        self.conv_scroll = 0;
+        self.view = View::Files;
+        self.relayout();
     }
 
     fn move_conv(&mut self, delta: isize) {
@@ -1124,6 +1151,34 @@ impl App {
         if let Some(compose) = &self.input {
             self.draw_compose(f, compose);
         }
+        if self.confirming_close {
+            self.draw_close_confirm(f);
+        }
+    }
+
+    /// The "close review?" confirmation modal.
+    fn draw_close_confirm(&self, f: &mut Frame) {
+        let area = centered_rect(60, 22, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Close review? ")
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let count = self.review.threads.len();
+        let lines = vec![
+            TextLine::from(TextSpan::styled(
+                format!("Delete all {count} thread(s) and close this review?"),
+                Style::default().fg(Color::White),
+            )),
+            TextLine::from(""),
+            TextLine::from(TextSpan::styled(
+                "y / Enter confirm · any other key cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines), inner);
     }
 
     fn draw_tabs(&self, f: &mut Frame, area: Rect) {
@@ -1298,7 +1353,7 @@ impl App {
             spans.push(TextSpan::styled(status.clone(), bar.fg(Color::Yellow)));
         } else {
             let help = if self.view == View::Conversation {
-                "j/k thread · r reply · x resolve · tab files · q quit"
+                "j/k thread · r reply · x resolve · X close review · tab files · q quit"
             } else {
                 "j/k move · n/p file · c comment · r reply · x resolve · v split · q quit"
             };

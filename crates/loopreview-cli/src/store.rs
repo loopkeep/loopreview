@@ -57,6 +57,15 @@ impl Store {
         }
     }
 
+    /// Delete the store file, if it exists (closing the review).
+    pub fn delete(&self) -> Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", self.path.display())),
+        }
+    }
+
     /// Save the review, creating the directory and writing atomically (via a
     /// temp file and rename) so a crash never truncates the store.
     pub fn save(&self, review: &Review) -> Result<()> {
