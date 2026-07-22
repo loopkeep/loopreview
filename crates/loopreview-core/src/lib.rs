@@ -18,6 +18,7 @@ pub mod git;
 pub mod intraline;
 pub mod model;
 pub mod patch;
+pub mod review;
 pub mod source;
 
 pub use error::DiffError;
@@ -25,4 +26,5 @@ pub use intraline::{Segment, word_diff};
 pub use model::{
     ChangeStatus, Diff, DiffStats, FileDiff, Hunk, Line, LineAnchor, LineKind, Provenance, Side,
 };
+pub use review::{Anchor, Comment, Review, Thread, ThreadState};
 pub use source::{DiffSource, FilePatchSource, RefSource, StdinPatchSource, WorktreeSource};

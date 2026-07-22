@@ -10,7 +10,8 @@
 ///
 /// A line removed from the original is addressed on the [`Side::Old`] side; a
 /// line added, or an unchanged context line, is addressed on [`Side::New`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Side {
     /// The original ("before") version of the file.
     Old,
