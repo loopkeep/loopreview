@@ -50,6 +50,22 @@ crates/
 - **git の unified diff 出力を自前パーサで解析するのが主軸**(stdin patch と同一パーサ)。理由: レビュアーの基準系は `git diff` そのものであり hunk 境界の一致が信頼性に直結。rename / binary / mode は git 任せが堅牢。`-U<n>` 等のオプション透過も安価
 - **similar は「変更行ペアの語単位(intra-line)ハイライト」レイヤとして使用**。リッチな diff view の中核体験
 
+## 3.5 CLI サーフェス
+
+```
+lr                          # シュガー: stdin がパイプ → patch 表示 / TTY & repo 内 → worktree diff
+lr diff [target] [--staged] [-- <pathspec>]   # VCS diff 専用(stdin は読まない)
+lr patch [file]             # unified diff をファイル or stdin から(明示形)
+lr show [ref]               # コミットレビュー(M2 以降)
+lr pr <number|url>          # PR レビュー(M2b)
+lr session <verb>           # 制御面(M3)
+lr daemon serve             # (M3)
+lr skill path               # agent スキル文書(M3)
+```
+
+- 裸の `lr` は dispatch シュガー(pager 慣習)。`lr diff` は VCS 専用と割り切り、stdin との曖昧さを構造から排除(パイプ + `lr diff` は丁寧なエラーで `lr` / `lr patch` へ誘導)
+- 将来 verb の名前空間は M1 の clap 構造で予約。`--help` / `-V` は TTY ガードより先に処理
+
 ## 4. UI 設計
 
 ### ビューの出し分け
