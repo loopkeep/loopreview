@@ -246,6 +246,7 @@ legacy `config.json` is still read with a migration hint, but TOML is preferred.
 | `auto_collapse_lines` | integer | `20000` | A diff with more changed lines than this opens with every file collapsed |
 | `sidebar` | `"auto"` / `"open"` / `"closed"` | `"auto"` | Whether the file-explorer sidebar is shown by default (`auto` = when wide enough) |
 | `sidebar_min_content` | integer | `44` | Minimum diff width kept beside the sidebar; below this it auto-hides |
+| `sidebar_width` | integer | auto | Pin the sidebar to a fixed width in columns (clamped to 22–44); unset auto-fits the longest file row |
 
 ### Key bindings
 

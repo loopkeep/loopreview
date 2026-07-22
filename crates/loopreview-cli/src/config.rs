@@ -36,6 +36,9 @@ pub struct Config {
     /// Minimum diff width (columns) kept beside the sidebar; below this the
     /// sidebar auto-hides so the diff stays usable.
     pub sidebar_min_content: usize,
+    /// A fixed sidebar width (columns), clamped to the sensible bounds. When
+    /// unset, the width auto-fits the longest file row.
+    pub sidebar_width: Option<usize>,
     /// Per-action key overrides (the `[keys]` table); action name → key string.
     pub keys: HashMap<String, String>,
 }
@@ -48,6 +51,7 @@ impl Default for Config {
             auto_collapse_lines: 20_000,
             sidebar: SidebarMode::Auto,
             sidebar_min_content: 44,
+            sidebar_width: None,
             keys: HashMap::new(),
         }
     }

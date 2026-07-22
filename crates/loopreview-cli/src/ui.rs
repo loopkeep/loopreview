@@ -141,6 +141,8 @@ pub struct Session {
     pub sidebar_mode: crate::config::SidebarMode,
     /// Minimum diff width kept beside the sidebar.
     pub sidebar_min_content: usize,
+    /// A fixed sidebar width, if the user pinned one (else it auto-fits).
+    pub sidebar_width: Option<usize>,
     /// The resolved key bindings.
     pub keymap: crate::keys::Keymap,
     /// The repository directory, for reconstructing outdated comment lines from
@@ -241,6 +243,7 @@ pub fn run(session: Session) -> Result<()> {
         auto_collapse_lines,
         sidebar_mode,
         sidebar_min_content,
+        sidebar_width,
         keymap,
         repo_dir,
         loader,
@@ -262,6 +265,7 @@ pub fn run(session: Session) -> Result<()> {
     app.auto_collapse_lines = auto_collapse_lines;
     app.sidebar_mode = sidebar_mode;
     app.sidebar_min_content = sidebar_min_content;
+    app.sidebar_width_cfg = sidebar_width;
     app.keymap = keymap;
     app.status = notice;
     // For a directly-loaded diff (not a background PR load), apply auto-collapse
@@ -658,6 +662,8 @@ struct App {
     sidebar_override: Option<bool>,
     /// Minimum diff width kept beside the sidebar (below which it auto-hides).
     sidebar_min_content: usize,
+    /// A fixed sidebar width (columns), if the user pinned one; else it auto-fits.
+    sidebar_width_cfg: Option<usize>,
     /// Which pane has the keyboard focus.
     focus: Focus,
     /// Selected file index in the sidebar.
@@ -800,6 +806,7 @@ impl App {
             sidebar_mode: crate::config::SidebarMode::Auto,
             sidebar_override: None,
             sidebar_min_content: 44,
+            sidebar_width_cfg: None,
             focus: Focus::Body,
             sidebar_cursor: 0,
             sidebar_scroll: 0,
@@ -2200,6 +2207,7 @@ impl App {
                     index,
                     comments: self.file_comment_count(&path),
                     collapsed: self.collapsed_files.contains(&path),
+                    status: f.status,
                     path,
                     added,
                     removed,
@@ -4811,18 +4819,25 @@ impl App {
         if !self.sidebar_wanted() {
             return None;
         }
-        let widest = self
-            .file_entries()
-            .iter()
-            .map(|e| {
-                e.path.chars().count()
-                    + 2
-                    + format!(" +{} -{}", e.added, e.removed).chars().count()
-                    + if e.comments > 0 { 4 } else { 0 }
-            })
-            .max()
-            .unwrap_or(SIDEBAR_MIN);
-        let desired = widest.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+        // A pinned width (config) is honored within bounds; otherwise the width
+        // auto-fits the longest file row.
+        let desired = if let Some(fixed) = self.sidebar_width_cfg {
+            fixed.clamp(SIDEBAR_MIN, SIDEBAR_MAX)
+        } else {
+            let widest = self
+                .file_entries()
+                .iter()
+                .map(|e| {
+                    // chevron (2) + status glyph (2) + path + stats + comment badge.
+                    e.path.chars().count()
+                        + 4
+                        + format!(" +{} -{}", e.added, e.removed).chars().count()
+                        + if e.comments > 0 { 4 } else { 0 }
+                })
+                .max()
+                .unwrap_or(SIDEBAR_MIN);
+            widest.clamp(SIDEBAR_MIN, SIDEBAR_MAX)
+        };
         // Framing overhead beside the diff: the sidebar's two borders, a 1-col
         // gap, and the diff pane's two borders — five columns before content.
         (total >= desired + 5 + self.sidebar_min_content).then_some(desired)
@@ -4848,7 +4863,13 @@ impl App {
         matched: &[u32],
     ) -> Vec<TextSpan<'static>> {
         let chevron = if entry.collapsed { "▸ " } else { "  " };
-        let left = vec![TextSpan::styled(chevron, base.fg(Color::Cyan))];
+        let left = vec![
+            TextSpan::styled(chevron, base.fg(Color::Cyan)),
+            TextSpan::styled(
+                format!("{} ", status_glyph(entry.status)),
+                base.fg(status_color(entry.status)),
+            ),
+        ];
         // Right-fixed cluster: the line stats, then a comment badge.
         let mut right = vec![
             TextSpan::styled(format!("+{}", entry.added), base.fg(Color::Green)),
@@ -5178,6 +5199,8 @@ struct FileEntry {
     index: usize,
     /// The file's display path.
     path: String,
+    /// How the file changed (added/deleted/modified/renamed/copied).
+    status: loopreview_core::ChangeStatus,
     /// Added lines.
     added: u32,
     /// Removed lines.
@@ -5457,6 +5480,18 @@ fn status_color(status: loopreview_core::ChangeStatus) -> Color {
         Deleted => Color::Red,
         Modified => Color::Yellow,
         Renamed | Copied => Color::Magenta,
+    }
+}
+
+/// The one-character status marker for a file's change kind (`A`/`D`/`M`/`R`/`C`).
+fn status_glyph(status: loopreview_core::ChangeStatus) -> char {
+    use loopreview_core::ChangeStatus::*;
+    match status {
+        Added => 'A',
+        Deleted => 'D',
+        Modified => 'M',
+        Renamed => 'R',
+        Copied => 'C',
     }
 }
 
@@ -8449,11 +8484,35 @@ mod tests {
         FileEntry {
             index,
             path: path.into(),
+            status: ChangeStatus::Modified,
             added: 1,
             removed: 0,
             comments: 0,
             collapsed: false,
         }
+    }
+
+    #[test]
+    fn sidebar_width_honors_a_pinned_config() {
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        // A pinned width is used as-is when it fits and is within bounds.
+        app.sidebar_width_cfg = Some(40);
+        assert_eq!(app.sidebar_width(200), Some(40));
+        // Out-of-bounds values clamp to the sensible range.
+        app.sidebar_width_cfg = Some(100);
+        assert_eq!(app.sidebar_width(200), Some(SIDEBAR_MAX));
+        app.sidebar_width_cfg = Some(1);
+        assert_eq!(app.sidebar_width(200), Some(SIDEBAR_MIN));
+    }
+
+    #[test]
+    fn status_glyph_marks_each_change_kind() {
+        use loopreview_core::ChangeStatus::*;
+        assert_eq!(status_glyph(Added), 'A');
+        assert_eq!(status_glyph(Deleted), 'D');
+        assert_eq!(status_glyph(Modified), 'M');
+        assert_eq!(status_glyph(Renamed), 'R');
+        assert_eq!(status_glyph(Copied), 'C');
     }
 
     #[test]
