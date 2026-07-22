@@ -131,7 +131,7 @@ Anchor =
 
 | M | 内容 |
 |---|---|
-| **M1** | 読む: workspace scaffold、3入力(worktree / ref / stdin patch)、unified + シンタックス + intra-line、ナビ、**watch(live ソース既定 ON)**、CLI(clap、TTY ガード)、CI |
+| **M1** | 読む: workspace scaffold、3入力(worktree / ref / stdin patch)、**unified + side-by-side + auto レスポンシブ**、シンタックス + intra-line、**行カーソルナビ + マウス**、**watch(live ソース既定 ON)**、CLI(§3.5: lr / lr diff --staged・pathspec / lr patch)、CI |
 | **M2a** | レビュー(ローカル完結): コメントモデル + `~/.config/loopreview/` ストア + 2ビュー UI。PR なしの worktree レビューでコメント可能 |
 | **M2b** | GitHub シンク: PR ソース、コメント双方向(pull = スレッド注入 / push = review submit・返信)、resolve |
 | **M3** | 制御面: セッションデーモン + CLI(エージェントが読む・注釈する・操作するための API)。hunk の制約(root 固定・表示状態外部制御不可)を設計で回避 |
