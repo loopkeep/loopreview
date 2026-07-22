@@ -174,18 +174,38 @@ pub struct PlannedReply {
     pub body: String,
 }
 
-/// Decide which draft comments are replies to existing GitHub threads.
+/// Whether a thread is an inline review-comment thread (line- or file-anchored),
+/// as opposed to the PR conversation ([`Anchor::Review`]).
 ///
-/// A reply is a draft comment (no `remote_id`) that follows a published root
-/// (the thread's first comment carries a numeric `remote_id`). Each such draft
-/// is posted with `in_reply_to` set to that root's remote id.
+/// Only inline threads live in GitHub's `pulls/{n}/comments` collection and take
+/// a threaded reply via `in_reply_to`; the conversation has no threads, so a
+/// draft under it is posted as a fresh conversation comment instead.
+fn is_inline_thread(thread: &Thread) -> bool {
+    matches!(thread.anchor, Anchor::Line { .. } | Anchor::File { .. })
+}
+
+/// Decide which draft comments are threaded replies to existing inline review
+/// threads.
+///
+/// A reply is a draft comment (no `remote_id`) under an **inline** thread
+/// (line- or file-anchored) whose root already exists on GitHub (its first
+/// comment carries a numeric `remote_id`). Each such draft is posted with
+/// `in_reply_to` set to that root's remote id.
+///
+/// Conversation-anchored threads ([`Anchor::Review`], from issue comments and
+/// review summaries) are deliberately excluded: their root ids are not review
+/// comment ids, so `in_reply_to` would 422. Their draft replies are handled by
+/// [`plan_conversation_comments`] instead.
 pub(crate) fn plan_replies(threads: &[Thread]) -> Vec<PlannedReply> {
     let mut replies = Vec::new();
     for thread in threads {
+        if !is_inline_thread(thread) {
+            continue;
+        }
         let Some(root) = thread.comments.first() else {
             continue;
         };
-        // Only threads that already exist on GitHub can take a threaded reply.
+        // Only inline threads that already exist on GitHub can take a reply.
         let Some(in_reply_to) = root
             .remote_id
             .as_deref()
@@ -205,6 +225,46 @@ pub(crate) fn plan_replies(threads: &[Thread]) -> Vec<PlannedReply> {
         }
     }
     replies
+}
+
+/// A draft comment to post to the PR conversation (`POST /issues/{n}/comments`).
+///
+/// The GitHub conversation is a flat list with no threads, so a draft left under
+/// a conversation thread ([`Anchor::Review`]) — or a brand-new conversation draft
+/// — is sent as a new top-level comment, not a threaded reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedConversationComment {
+    /// The local id of the thread the draft belongs to.
+    pub thread_id: String,
+    /// The local id of the draft comment being posted.
+    pub comment_id: String,
+    /// The comment body.
+    pub body: String,
+}
+
+/// Decide which draft comments become new PR-conversation comments.
+///
+/// Every draft comment (root or reply) under a conversation-anchored thread
+/// ([`Anchor::Review`]) is posted individually as a new conversation comment.
+/// Local notes and already-published comments are skipped. Inline threads are
+/// handled by [`plan_inline_comments`] / [`plan_replies`], not here.
+pub(crate) fn plan_conversation_comments(threads: &[Thread]) -> Vec<PlannedConversationComment> {
+    let mut planned = Vec::new();
+    for thread in threads {
+        if thread.anchor != Anchor::Review {
+            continue;
+        }
+        for comment in &thread.comments {
+            if comment.is_draft() {
+                planned.push(PlannedConversationComment {
+                    thread_id: thread.id.clone(),
+                    comment_id: comment.id.clone(),
+                    body: comment.body.clone(),
+                });
+            }
+        }
+    }
+    planned
 }
 
 /// One comment as returned by `GET /pulls/{n}/reviews/{id}/comments` after a
@@ -382,10 +442,19 @@ mod tests {
     }
 
     #[test]
-    fn plans_replies_to_published_threads_only() {
+    fn plans_replies_to_published_inline_threads_only() {
+        // An inline (line-anchored) review thread whose root is published takes a
+        // threaded reply via in_reply_to.
         let published = Thread {
             id: "t1".to_string(),
-            anchor: Anchor::Review,
+            anchor: Anchor::Line {
+                file: "src/a.rs".to_string(),
+                side: Side::New,
+                start: 7,
+                end: 7,
+                commit: None,
+                context: Vec::new(),
+            },
             state: ThreadState::Open,
             comments: vec![
                 published_comment("c1", "500", "root"),
@@ -401,6 +470,89 @@ mod tests {
         assert_eq!(replies[0].comment_id, "c2");
         assert_eq!(replies[0].in_reply_to, 500);
         assert_eq!(replies[0].body, "my reply");
+    }
+
+    #[test]
+    fn conversation_thread_replies_do_not_take_in_reply_to() {
+        // A draft reply under an issuecomment/review conversation thread must NOT
+        // be planned as an inline reply: its root id is a conversation id, so
+        // in_reply_to against pulls/{n}/comments would 422. It belongs to the
+        // conversation-comment plan instead.
+        let issue_thread = Thread {
+            id: "issuecomment:900".to_string(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![
+                published_comment("900", "900", "conversation root"),
+                draft_comment("d1", "my conversation reply"),
+            ],
+        };
+        let review_thread = Thread {
+            id: "review:42".to_string(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![
+                published_comment("42", "42", "review summary"),
+                draft_comment("d2", "reply under a review summary"),
+            ],
+        };
+
+        // No inline reply is planned for either.
+        assert!(plan_replies(&[issue_thread.clone(), review_thread.clone()]).is_empty());
+
+        // Both drafts route to the conversation-comment plan.
+        let convo = plan_conversation_comments(&[issue_thread, review_thread]);
+        assert_eq!(convo.len(), 2);
+        assert_eq!(convo[0].thread_id, "issuecomment:900");
+        assert_eq!(convo[0].comment_id, "d1");
+        assert_eq!(convo[0].body, "my conversation reply");
+        assert_eq!(convo[1].comment_id, "d2");
+    }
+
+    #[test]
+    fn conversation_comments_skip_published_and_inline() {
+        // A published conversation root is not re-posted; only its draft replies
+        // are. Inline threads never appear in the conversation plan.
+        let issue_thread = Thread {
+            id: "issuecomment:1".to_string(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![
+                published_comment("1", "1", "already sent"),
+                draft_comment("d", "new"),
+            ],
+        };
+        let inline = line_thread("t", Side::New, 3, draft_comment("c", "inline draft"));
+
+        let convo = plan_conversation_comments(&[issue_thread, inline]);
+        assert_eq!(convo.len(), 1);
+        assert_eq!(convo[0].comment_id, "d");
+    }
+
+    #[test]
+    fn new_conversation_draft_thread_is_planned() {
+        // A brand-new conversation thread the user drafted locally (Review anchor,
+        // draft root) is posted as a fresh conversation comment.
+        let new_convo = Thread {
+            id: "local-convo".to_string(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![draft_comment("c", "a general note")],
+        };
+        let convo = plan_conversation_comments(&[new_convo]);
+        assert_eq!(convo.len(), 1);
+        assert_eq!(convo[0].thread_id, "local-convo");
+        assert_eq!(convo[0].comment_id, "c");
+        // It is not an inline comment or reply.
+        assert!(
+            plan_inline_comments(&[Thread {
+                id: "local-convo".to_string(),
+                anchor: Anchor::Review,
+                state: ThreadState::Open,
+                comments: vec![draft_comment("c", "a general note")],
+            }])
+            .is_empty()
+        );
     }
 
     #[test]

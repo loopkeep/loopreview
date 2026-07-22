@@ -156,17 +156,21 @@ impl PrHandle {
             .client
             .submit_replies(&self.pr, &threads)
             .map_err(|e| e.to_string())?;
+        // Drafts under the PR conversation (issue comments / review summaries) are
+        // posted as new conversation comments, never as inline in_reply_to replies.
+        let (conversation, failed_conversation) = self
+            .client
+            .submit_conversation_comments(&self.pr, &threads)
+            .map_err(|e| e.to_string())?;
+        let stamp = |r: loopreview_github::ReplyOutcome| ReplyStamp {
+            thread_id: r.thread_id,
+            comment_id: r.comment_id,
+            remote_id: r.comment.remote_id.unwrap_or_default(),
+        };
         Ok(Submitted {
             published: outcome.published,
-            replies: replies
-                .into_iter()
-                .map(|r| ReplyStamp {
-                    thread_id: r.thread_id,
-                    comment_id: r.comment_id,
-                    remote_id: r.comment.remote_id.unwrap_or_default(),
-                })
-                .collect(),
-            failed_replies,
+            replies: replies.into_iter().chain(conversation).map(stamp).collect(),
+            failed_replies: failed_replies + failed_conversation,
         })
     }
 }

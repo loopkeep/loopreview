@@ -354,6 +354,58 @@ impl GithubClient {
         Ok((outcomes, failed))
     }
 
+    /// Post every draft under a PR-conversation thread ([`Anchor::Review`]) as a
+    /// new conversation comment, returning one [`ReplyOutcome`] per posted comment
+    /// plus a count of any that failed.
+    ///
+    /// GitHub's conversation is a flat list with no threads, so a draft left under
+    /// an issue-comment or review-summary thread is sent as a fresh
+    /// `POST /issues/{n}/comments` — never with `in_reply_to`, which only works on
+    /// inline review comments. As with [`submit_replies`](Self::submit_replies), a
+    /// failed post leaves its draft untouched so it survives and can be re-sent.
+    pub fn submit_conversation_comments(
+        &self,
+        pr: &ResolvedPr,
+        threads: &[Thread],
+    ) -> Result<(Vec<ReplyOutcome>, usize), GithubError> {
+        let planned = push::plan_conversation_comments(threads);
+        let mut outcomes = Vec::with_capacity(planned.len());
+        let mut failed = 0usize;
+        for comment in planned {
+            match self.create_conversation_comment(pr, &comment.body) {
+                Ok(posted) => outcomes.push(ReplyOutcome {
+                    thread_id: comment.thread_id,
+                    comment_id: comment.comment_id,
+                    comment: posted,
+                }),
+                Err(_) => failed += 1,
+            }
+        }
+        Ok((outcomes, failed))
+    }
+
+    /// Post one new comment to the PR conversation (`POST /issues/{n}/comments`)
+    /// and return the created [`Comment`], its `remote_id` set.
+    pub fn create_conversation_comment(
+        &self,
+        pr: &ResolvedPr,
+        body: &str,
+    ) -> Result<Comment, GithubError> {
+        let payload = serde_json::to_string(&push::BodyPayload { body })
+            .map_err(|e| GithubError::parse("conversation comment payload", e))?;
+        let path = format!(
+            "repos/{}/{}/issues/{}/comments",
+            pr.owner, pr.repo, pr.number
+        );
+        let out = cmd::run_ok(
+            "gh",
+            &["api", "-X", "POST", &path, "--input", "-"],
+            &self.dir,
+            Some(&payload),
+        )?;
+        parse_created_comment(&out, body)
+    }
+
     /// Post a threaded reply to an existing review thread and return the created
     /// [`Comment`], its `remote_id` set.
     ///
