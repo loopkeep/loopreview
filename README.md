@@ -69,6 +69,20 @@ cargo build --release
 # binaries land in target/release/{loopreview,lr}
 ```
 
+## Updating
+
+A prebuilt binary updates itself in place from GitHub Releases:
+
+```sh
+lr update           # download and install the latest release
+lr update --check   # only report whether a newer release exists
+```
+
+`lr update` replaces the running binary (and its `lr` alias) with the latest
+matching your platform, verifying the download's checksum first; on Windows the
+previous executable is swept on the next launch. A build from source or a
+package manager updates through that channel instead.
+
 ## Quickstart
 
 ```sh
@@ -234,6 +248,11 @@ A full `SKILL.md` — the workflow and etiquette an agent needs to drive a revie
 is published to [`loopkeep/skills`](https://github.com/loopkeep/skills). Install
 it into an agent with `npx skills add loopkeep/skills -s loopreview-session`.
 
+The same `lr session` control plane is what higher-level tooling uses to run a
+review beside your agents — including a plugin for **herdr**, a terminal
+multiplexer for coding agents, which opens and steers a loopreview session in
+its own pane.
+
 ## Configuration
 
 Settings live in `<config-dir>/loopreview/config.toml` (all keys optional). A
@@ -274,6 +293,23 @@ Data is stored under the same directory: local reviews in `reviews/`, live
 control-plane sessions in `sessions/`. `<config-dir>` is `$XDG_CONFIG_HOME` (or
 `~/.config`) on macOS/Linux and `%APPDATA%` on Windows.
 
+## Dependencies
+
+loopreview keeps a deliberately small footprint at runtime:
+
+- **`git`** — the only requirement for reviewing diffs (worktree, ref, or a
+  piped/saved patch). No library binding; loopreview shells out to `git`.
+- **`gh`** — the GitHub CLI, needed only for the pull-request features
+  (`lr pr`, submit, resolve, and editing your own published comments). It must
+  be installed and authenticated; loopreview never handles a token itself.
+
+The binary itself is self-contained — syntax highlighting, the control-plane
+socket, and the self-updater are all built in. Notable libraries: `ratatui` and
+`crossterm` for the terminal UI, `syntect` with `two-face` for highlighting,
+`interprocess` for the per-session control socket, `nucleo-matcher` for the
+fuzzy finder, and `notify` for the live file watcher. `lr update` adds `ureq`
+(rustls), `flate2`, `tar`, and `sha2` for downloading and verifying releases.
+
 ## Development
 
 The workspace has four crates:
@@ -294,12 +330,6 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo build --release          # optimized binaries in target/release/
 ```
-
-## About the name
-
-_loopreview_ folds three words into one — **loop**, **preview**, and **review** —
-sharing the middle `p` (loo·**p**·review). It reviews the changes an agent
-**loop** produces, and lets you **preview** the change before it lands.
 
 ## License
 
