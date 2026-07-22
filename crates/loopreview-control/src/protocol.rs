@@ -333,6 +333,9 @@ pub struct CommentInfo {
     pub created_at: u64,
     /// True while the comment is an unpublished draft.
     pub draft: bool,
+    /// The comment's disposition: `local` (a note, never sent), `draft` (queued
+    /// to submit), or `published` (already on GitHub).
+    pub kind: String,
 }
 
 /// The outcome of a [`Request::Navigate`].
@@ -535,6 +538,7 @@ mod tests {
                 body: "hi".into(),
                 created_at: 1,
                 draft: true,
+                kind: "draft".into(),
             }],
         };
         let replies = [

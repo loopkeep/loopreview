@@ -275,6 +275,14 @@ pub fn thread_info(thread: &Thread, outdated: bool) -> ThreadInfo {
                 body: c.body.clone(),
                 created_at: c.created_at,
                 draft: c.is_draft(),
+                kind: if c.is_published() {
+                    "published"
+                } else if c.is_local() {
+                    "local"
+                } else {
+                    "draft"
+                }
+                .to_string(),
             })
             .collect(),
     }
@@ -519,6 +527,7 @@ mod tests {
         assert_eq!(info.anchor.side, Some(Side::New));
         assert_eq!(info.anchor.end, Some(2));
         assert!(info.comments[0].draft);
+        assert_eq!(info.comments[0].kind, "draft");
         assert!(info.draft, "a draft root marks the thread as a draft");
     }
 
