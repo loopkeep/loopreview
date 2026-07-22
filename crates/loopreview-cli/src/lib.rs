@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod highlight;
 mod markdown;
+mod prsync;
 mod store;
 mod textarea;
 mod ui;
@@ -118,33 +119,16 @@ fn try_run() -> Result<()> {
 /// Review a GitHub pull request: resolve, fetch the diff, and pull comments on a
 /// background thread while the UI shows a spinner.
 fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
-    use loopreview_github::{GithubClient, PrQuery};
-
     let dir = repo_root()?;
-    let pr_query = if detect {
-        PrQuery::Detect
-    } else {
-        let text = query.ok_or_else(|| {
-            anyhow!("give a pull request (number, URL, or owner/repo#N), or pass --detect")
-        })?;
-        PrQuery::parse(&text).ok_or_else(|| {
-            anyhow!("`{text}` is not a pull request number, URL, or owner/repo#N reference")
-        })?
-    };
-
+    let pr_query = prsync::query(query, detect).map_err(|m| anyhow!(m))?;
     let author = git::config(&dir, "user.name").unwrap_or_else(|| "you".to_string());
-    let client = GithubClient::new(dir);
     let loader: ui::Loader = Box::new(move |progress| {
-        progress("resolving pull request…");
-        let pr = client.resolve_pr(&pr_query).map_err(|e| e.to_string())?;
-        progress(&format!("fetching {} diff…", pr.label()));
-        let diff = client.pr_source(&pr).load().map_err(|e| e.to_string())?;
-        progress("fetching comments…");
-        let threads = client.pull(&pr).map_err(|e| e.to_string())?;
+        let (handle, label, diff, threads) = prsync::fetch(dir, pr_query, progress)?;
         Ok(ui::Loaded {
-            label: pr.label(),
+            label,
             diff,
             review: loopreview_core::Review { threads },
+            pr: Some(handle),
         })
     });
 

@@ -34,6 +34,7 @@ use loopreview_core::{
 };
 
 use crate::highlight::{Highlighter, Span as HlSpan};
+use crate::prsync::PrHandle;
 use crate::store::Store;
 use crate::textarea::TextArea;
 
@@ -114,6 +115,8 @@ pub struct Loaded {
     pub diff: Diff,
     /// The review threads to seed (e.g. a PR's pulled comments).
     pub review: Review,
+    /// The PR handle, when this load is a pull request (enables sync/submit).
+    pub pr: Option<PrHandle>,
 }
 
 /// A background load job: reports progress via the callback, then yields the
@@ -132,6 +135,33 @@ struct Loading {
     stage: String,
     rx: Receiver<LoadMsg>,
 }
+
+/// A short-lived background action against GitHub (refresh, resolve, submit),
+/// shown as a spinner overlay while it runs.
+struct Job {
+    title: String,
+    stage: String,
+    rx: Receiver<JobMsg>,
+}
+
+/// A message streamed from a running [`Job`].
+enum JobMsg {
+    Stage(String),
+    Done(Result<JobOutcome, String>),
+}
+
+/// The result a finished [`Job`] applies to the review.
+enum JobOutcome {
+    /// A re-pulled thread list to merge with local drafts.
+    Refreshed(Vec<Thread>),
+    /// Thread at `index` had its resolution synced.
+    Resolved { index: usize, resolved: bool },
+    /// A submitted review's id stamps.
+    Submitted(crate::prsync::Submitted),
+}
+
+/// A background action worker: reports progress, then yields an outcome.
+type JobWorker = Box<dyn FnOnce(&dyn Fn(&str)) -> Result<JobOutcome, String> + Send>;
 
 /// Spinner frames shown while a background load runs.
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -270,6 +300,32 @@ enum ComposeKind {
     Reply(String),
 }
 
+/// The review events offered in the submit modal.
+const SUBMIT_EVENTS: &[(&str, crate::prsync::SubmitEvent)] = &[
+    ("Comment", crate::prsync::SubmitEvent::Comment),
+    ("Approve", crate::prsync::SubmitEvent::Approve),
+    (
+        "Request changes",
+        crate::prsync::SubmitEvent::RequestChanges,
+    ),
+    (
+        "Pending (don't submit)",
+        crate::prsync::SubmitEvent::Pending,
+    ),
+];
+
+/// The review-submission modal for a pull request.
+struct SubmitModal {
+    /// Selected index into [`SUBMIT_EVENTS`].
+    selected: usize,
+    /// The optional summary body.
+    body: TextArea,
+    /// New inline drafts that will be posted.
+    new_count: usize,
+    /// Draft replies that will be posted.
+    reply_count: usize,
+}
+
 /// An in-progress comment being composed.
 struct Compose {
     /// The text being edited.
@@ -344,6 +400,8 @@ struct App {
     author: String,
     /// The active comment composer, when writing.
     input: Option<Compose>,
+    /// The active review-submission modal, when submitting a PR review.
+    submit: Option<SubmitModal>,
     /// Rendered inline block per thread, index-aligned to `review.threads`.
     comment_blocks: Vec<Vec<TextLine<'static>>>,
     /// Rendered Conversation block per thread (root, replies), same order.
@@ -362,6 +420,10 @@ struct App {
     loading: Option<Loading>,
     /// A fatal load error to show instead of the diff.
     load_error: Option<String>,
+    /// A short-lived background action against GitHub, when one is running.
+    job: Option<Job>,
+    /// The pull-request handle, when reviewing a PR (enables sync/submit).
+    pr: Option<Arc<PrHandle>>,
     /// Repaint tick, for the spinner animation.
     tick: usize,
     /// A transient status message (feedback or error).
@@ -417,6 +479,7 @@ impl App {
             store,
             author,
             input: None,
+            submit: None,
             comment_blocks,
             conv_blocks,
             view: View::Files,
@@ -426,6 +489,8 @@ impl App {
             confirming_close: false,
             loading: None,
             load_error: None,
+            job: None,
+            pr: None,
             tick: 0,
             status: None,
             reloaded_at: None,
@@ -453,16 +518,204 @@ impl App {
         });
     }
 
-    /// Install a completed load: swap in the diff and threads.
+    /// Install a completed load: swap in the diff, threads, and PR handle.
     fn install_loaded(&mut self, loaded: Loaded) {
         self.label = loaded.label;
         self.review = loaded.review;
+        self.pr = loaded.pr.map(Arc::new);
         self.apply_layout(loaded.diff);
         self.cursor = 0;
         self.scroll = 0;
         self.conv_cursor = 0;
         self.conv_scroll = 0;
         self.loading = None;
+    }
+
+    /// Spawn a background action and show its spinner.
+    fn start_job(&mut self, title: &str, worker: JobWorker) {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let stage_tx = tx.clone();
+            let progress = move |stage: &str| {
+                let _ = stage_tx.send(JobMsg::Stage(stage.to_string()));
+            };
+            let outcome = worker(&progress);
+            let _ = tx.send(JobMsg::Done(outcome));
+        });
+        self.job = Some(Job {
+            title: title.to_string(),
+            stage: "working…".to_string(),
+            rx,
+        });
+    }
+
+    /// Drain the job channel, applying the result when it finishes.
+    fn poll_job(&mut self) {
+        let Some(mut job) = self.job.take() else {
+            return;
+        };
+        let mut outcome: Option<Result<JobOutcome, String>> = None;
+        loop {
+            match job.rx.try_recv() {
+                Ok(JobMsg::Stage(stage)) => job.stage = stage,
+                Ok(JobMsg::Done(result)) => {
+                    outcome = Some(result);
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    outcome = Some(Err("the action ended unexpectedly".to_string()));
+                    break;
+                }
+            }
+        }
+        match outcome {
+            Some(result) => self.apply_job(result),
+            None => self.job = Some(job), // still running
+        }
+    }
+
+    /// Apply a finished background action.
+    fn apply_job(&mut self, result: Result<JobOutcome, String>) {
+        match result {
+            Ok(JobOutcome::Refreshed(threads)) => {
+                self.review.threads = crate::prsync::merge_drafts(&self.review, threads);
+                self.status = Some("refreshed from GitHub".to_string());
+                self.relayout();
+            }
+            Ok(JobOutcome::Resolved { index, resolved }) => {
+                if let Some(thread) = self.review.threads.get_mut(index) {
+                    thread.state = if resolved {
+                        ThreadState::Resolved
+                    } else {
+                        ThreadState::Open
+                    };
+                }
+                self.status = Some(
+                    if resolved {
+                        "resolved on GitHub"
+                    } else {
+                        "reopened on GitHub"
+                    }
+                    .to_string(),
+                );
+                self.relayout();
+            }
+            Ok(JobOutcome::Submitted(submitted)) => self.apply_submitted(submitted),
+            Err(reason) => self.status = Some(format!("failed: {reason}")),
+        }
+    }
+
+    /// Re-pull the PR's threads (keeping local drafts).
+    fn refresh(&mut self) {
+        let Some(pr) = self.pr.clone() else {
+            return;
+        };
+        self.start_job(
+            "Refreshing",
+            Box::new(move |progress| {
+                progress("fetching comments…");
+                Ok(JobOutcome::Refreshed(pr.pull()?))
+            }),
+        );
+    }
+
+    /// Count the local drafts that a submit would post: new inline threads and
+    /// replies (comments without a remote id).
+    fn draft_counts(&self) -> (usize, usize) {
+        let mut new_inline = 0;
+        let mut replies = 0;
+        for thread in &self.review.threads {
+            for (i, comment) in thread.comments.iter().enumerate() {
+                if comment.remote_id.is_some() {
+                    continue;
+                }
+                if i == 0 {
+                    if matches!(thread.anchor, Anchor::Line { .. }) {
+                        new_inline += 1;
+                    }
+                } else {
+                    replies += 1;
+                }
+            }
+        }
+        (new_inline, replies)
+    }
+
+    /// Open the review-submission modal (pull requests only).
+    fn open_submit(&mut self) {
+        if self.pr.is_none() {
+            return;
+        }
+        let (new_count, reply_count) = self.draft_counts();
+        self.submit = Some(SubmitModal {
+            selected: 0,
+            body: TextArea::default(),
+            new_count,
+            reply_count,
+        });
+    }
+
+    /// Route a key while the submit modal is open.
+    fn on_key_submit(&mut self, code: KeyCode, mods: KeyModifiers) {
+        let ctrl = mods.contains(KeyModifiers::CONTROL);
+        let Some(modal) = self.submit.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => {
+                self.submit = None;
+                self.status = Some("submit cancelled".to_string());
+            }
+            KeyCode::Char('s') if ctrl => self.confirm_submit(),
+            KeyCode::Up => modal.selected = modal.selected.saturating_sub(1),
+            KeyCode::Down => modal.selected = (modal.selected + 1).min(SUBMIT_EVENTS.len() - 1),
+            _ if ctrl => {}
+            _ => modal.body.on_key(code),
+        }
+    }
+
+    /// Submit the review in the background.
+    fn confirm_submit(&mut self) {
+        let Some(modal) = self.submit.take() else {
+            return;
+        };
+        let Some(pr) = self.pr.clone() else {
+            return;
+        };
+        let event = SUBMIT_EVENTS[modal.selected].1;
+        let body = modal.body.text().trim().to_string();
+        let threads = self.review.threads.clone();
+        self.start_job(
+            "Submitting review",
+            Box::new(move |progress| {
+                progress("submitting review…");
+                Ok(JobOutcome::Submitted(pr.submit(event, &body, &threads)?))
+            }),
+        );
+    }
+
+    /// Stamp remote ids from a submitted review onto the local threads.
+    fn apply_submitted(&mut self, submitted: crate::prsync::Submitted) {
+        for (thread_id, remote_id) in submitted.published {
+            if let Some(thread) = self.review.thread_mut(&thread_id)
+                && let Some(root) = thread.comments.first_mut()
+            {
+                root.remote_id = Some(remote_id);
+            }
+        }
+        for stamp in submitted.replies {
+            if let Some(thread) = self.review.thread_mut(&stamp.thread_id)
+                && let Some(comment) = thread
+                    .comments
+                    .iter_mut()
+                    .find(|c| c.id == stamp.comment_id)
+            {
+                comment.remote_id = Some(stamp.remote_id);
+            }
+        }
+        self.status = Some("review submitted".to_string());
+        self.relayout();
     }
 
     /// Drain the load channel, updating the stage or finishing the load.
@@ -507,6 +760,7 @@ impl App {
         while !self.quit {
             self.tick = self.tick.wrapping_add(1);
             self.poll_loading();
+            self.poll_job();
 
             // Drain watch messages: apply the newest diff, or record an error.
             // Held back while composing so an incoming change can't reshuffle the
@@ -644,8 +898,9 @@ impl App {
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
-        // While loading or showing a load error, only quit is accepted.
-        if self.loading.is_some() || self.load_error.is_some() {
+        // While loading, a background job runs, or a load error shows, only quit
+        // is accepted (the job keeps running until it reports back).
+        if self.loading.is_some() || self.load_error.is_some() || self.job.is_some() {
             if matches!(code, KeyCode::Esc | KeyCode::Char('q'))
                 || (code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL))
             {
@@ -653,10 +908,28 @@ impl App {
             }
             return;
         }
-        // While composing, keys edit the comment (or submit/cancel).
+        // Modals take keys next: the composer, then the submit modal.
         if self.input.is_some() {
             self.on_key_compose(code, mods);
             return;
+        }
+        if self.submit.is_some() {
+            self.on_key_submit(code, mods);
+            return;
+        }
+        // PR sync shortcuts, available in either view.
+        if mods.contains(KeyModifiers::CONTROL) && self.pr.is_some() {
+            match code {
+                KeyCode::Char('r') => {
+                    self.refresh();
+                    return;
+                }
+                KeyCode::Char('s') => {
+                    self.open_submit();
+                    return;
+                }
+                _ => {}
+            }
         }
         // While confirming a close: y/Enter closes, anything else cancels.
         if self.confirming_close {
@@ -762,8 +1035,8 @@ impl App {
 
     /// Begin composing a comment on the cursor's line.
     fn start_compose(&mut self) {
-        if self.store.is_none() {
-            self.status = Some("comments need a git repository".to_string());
+        if self.store.is_none() && self.pr.is_none() {
+            self.status = Some("comments need a git repository or a pull request".to_string());
             return;
         }
         if self.clines.is_empty() {
@@ -833,8 +1106,31 @@ impl App {
         }
     }
 
-    /// Toggle the resolved state of thread `idx` and persist.
+    /// Toggle the resolved state of thread `idx`. A published thread in a PR
+    /// syncs to GitHub in the background; a local thread just toggles and saves.
     fn resolve_thread(&mut self, idx: usize) {
+        let thread = &self.review.threads[idx];
+        let published = thread.root().is_some_and(|c| c.remote_id.is_some());
+        let want_resolved = !thread.is_resolved();
+        if published && let Some(pr) = self.pr.clone() {
+            let node_id = thread.id.clone();
+            self.start_job(
+                "Syncing resolution",
+                Box::new(move |progress| {
+                    progress(if want_resolved {
+                        "resolving on GitHub…"
+                    } else {
+                        "reopening on GitHub…"
+                    });
+                    pr.set_resolved(&node_id, want_resolved)?;
+                    Ok(JobOutcome::Resolved {
+                        index: idx,
+                        resolved: want_resolved,
+                    })
+                }),
+            );
+            return;
+        }
         let thread = &mut self.review.threads[idx];
         thread.state = if thread.is_resolved() {
             ThreadState::Open
@@ -1005,13 +1301,19 @@ impl App {
                 Ok(()) => Some(done.to_string()),
                 Err(e) => Some(format!("{done}, but save failed: {e:#}")),
             },
+            // A pull-request draft is not stored; it is sent on submit.
+            None if self.pr.is_some() => Some(format!("{done} — draft, Ctrl-S to submit")),
             None => Some(format!("{done} (not saved)")),
         }
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent) {
-        if self.input.is_some() {
-            return; // the composer owns input
+        if self.input.is_some()
+            || self.submit.is_some()
+            || self.job.is_some()
+            || self.loading.is_some()
+        {
+            return; // a modal or a background action owns input
         }
         match mouse.kind {
             MouseEventKind::ScrollDown => self.scroll_view(3),
@@ -1286,9 +1588,107 @@ impl App {
         if let Some(compose) = &self.input {
             self.draw_compose(f, compose);
         }
+        if let Some(modal) = &self.submit {
+            self.draw_submit(f, modal);
+        }
         if self.confirming_close {
             self.draw_close_confirm(f);
         }
+        if let Some(job) = &self.job {
+            self.draw_job(f, job);
+        }
+    }
+
+    /// A spinner overlay shown while a background action runs.
+    fn draw_job(&self, f: &mut Frame, job: &Job) {
+        let spinner = SPINNER[self.tick % SPINNER.len()];
+        let area = centered_rect(50, 18, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" {} ", job.title))
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        f.render_widget(
+            Paragraph::new(vec![
+                TextLine::from(TextSpan::styled(
+                    format!("  {spinner}  {}", job.stage),
+                    Style::default().fg(Color::Cyan),
+                )),
+                TextLine::from(""),
+                TextLine::from(TextSpan::styled(
+                    "  q abandons and quits (the request keeps running)",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]),
+            inner,
+        );
+    }
+
+    /// The review-submission modal for a pull request.
+    fn draw_submit(&self, f: &mut Frame, modal: &SubmitModal) {
+        let area = centered_rect(70, 60, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Submit review ")
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let mut lines = vec![
+            TextLine::from(TextSpan::styled(
+                format!(
+                    "{} new comment(s), {} repl(y/ies) to send",
+                    modal.new_count, modal.reply_count
+                ),
+                Style::default().fg(Color::Gray),
+            )),
+            TextLine::from(""),
+            TextLine::from(TextSpan::styled(
+                "event:",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        for (i, (label, _)) in SUBMIT_EVENTS.iter().enumerate() {
+            let marker = if i == modal.selected { "●" } else { "○" };
+            let style = if i == modal.selected {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            lines.push(TextLine::from(TextSpan::styled(
+                format!("  {marker} {label}"),
+                style,
+            )));
+        }
+        lines.push(TextLine::from(""));
+        lines.push(TextLine::from(TextSpan::styled(
+            "summary (optional):",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(lines.len() as u16),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+        f.render_widget(Paragraph::new(lines), rows[0]);
+        f.render_widget(
+            Paragraph::new(modal.body.render(rows[1].width as usize, Style::default())),
+            rows[1],
+        );
+        f.render_widget(
+            Paragraph::new(TextLine::from(TextSpan::styled(
+                "↑↓ event · type summary · Ctrl-S submit · Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rows[2],
+        );
     }
 
     /// The full-screen spinner shown while a background load runs.
@@ -1542,6 +1942,12 @@ impl App {
                 "j/k move · n/p file · c comment · r reply · x resolve · v split · q quit"
             };
             spans.push(TextSpan::styled(help, bar.fg(Color::DarkGray)));
+            if self.pr.is_some() {
+                spans.push(TextSpan::styled(
+                    "  · ^r refresh · ^s submit",
+                    bar.fg(Color::Rgb(120, 160, 220)),
+                ));
+            }
         }
         f.render_widget(Paragraph::new(TextLine::from(spans)).style(bar), area);
     }
