@@ -242,6 +242,17 @@ enum JobOutcome {
     Resolved { index: usize, resolved: bool },
     /// A submitted review's id stamps.
     Submitted(crate::prsync::Submitted),
+    /// A published comment's body was edited on GitHub; apply it locally.
+    Edited {
+        thread_id: String,
+        comment_id: String,
+        body: String,
+    },
+    /// A published comment was deleted on GitHub; remove it locally.
+    Deleted {
+        thread_id: String,
+        comment_id: String,
+    },
 }
 
 /// A background action worker: reports progress, then yields an outcome.
@@ -449,6 +460,18 @@ enum ComposeKind {
     Reply(String),
     /// Editing an existing comment's body (thread id, comment id).
     Edit { thread: String, comment: String },
+}
+
+/// A pending removal awaiting `d` confirmation.
+struct DeleteTarget {
+    /// The thread's index in `review.threads`.
+    thread: usize,
+    /// The comment index to remove, or `None` to remove the whole draft thread
+    /// (a draft root takes its thread with it).
+    comment: Option<usize>,
+    /// For a published comment, its `(remote id, is-review-comment)` — the
+    /// removal goes to GitHub first. `None` for a purely-local removal.
+    published: Option<(u64, bool)>,
 }
 
 /// The review events offered in the submit modal.
@@ -703,10 +726,8 @@ struct App {
     split_min_width: usize,
     /// True while awaiting confirmation to close (delete) the review.
     confirming_close: bool,
-    /// The delete target awaiting confirmation when `d` is armed: a thread index
-    /// and the comment within it to remove (`None` removes the whole thread; a
-    /// reply removes just itself).
-    confirming_delete: Option<(usize, Option<usize>)>,
+    /// The delete target awaiting confirmation when `d` is armed.
+    confirming_delete: Option<DeleteTarget>,
     /// An in-progress background load (spinner), for `lr pr`.
     loading: Option<Loading>,
     /// A fatal load error to show instead of the diff.
@@ -959,8 +980,53 @@ impl App {
                 self.relayout();
             }
             Ok(JobOutcome::Submitted(submitted)) => self.apply_submitted(submitted),
+            Ok(JobOutcome::Edited {
+                thread_id,
+                comment_id,
+                body,
+            }) => {
+                if let Some(comment) = self
+                    .review
+                    .thread_mut(&thread_id)
+                    .and_then(|t| t.comments.iter_mut().find(|c| c.id == comment_id))
+                {
+                    comment.body = body;
+                }
+                self.status = Some("edited on GitHub".to_string());
+                self.relayout();
+            }
+            Ok(JobOutcome::Deleted {
+                thread_id,
+                comment_id,
+            }) => {
+                self.remove_comment_by_id(&thread_id, &comment_id);
+                self.status = Some("deleted from GitHub".to_string());
+                self.relayout();
+            }
             Err(reason) => self.status = Some(format!("failed: {reason}")),
         }
+    }
+
+    /// Remove one comment (by ids) from the in-memory review, dropping its thread
+    /// if it becomes empty. For a published comment already deleted on GitHub —
+    /// the local store holds only drafts, so no store write is needed.
+    fn remove_comment_by_id(&mut self, thread_id: &str, comment_id: &str) {
+        let Some(ti) = self.review.threads.iter().position(|t| t.id == thread_id) else {
+            return;
+        };
+        if let Some(ci) = self.review.threads[ti]
+            .comments
+            .iter()
+            .position(|c| c.id == comment_id)
+        {
+            self.review.threads[ti].comments.remove(ci);
+            if self.review.threads[ti].comments.is_empty() {
+                self.review.threads.remove(ti);
+            }
+        }
+        self.conv_cursor = self
+            .conv_cursor
+            .min(self.conv_order.len().saturating_sub(1));
     }
 
     /// Re-pull the PR's threads (keeping local drafts).
@@ -1430,20 +1496,10 @@ impl App {
             }
             return;
         }
-        // While confirming a draft delete: y/Enter removes, anything else cancels.
-        if let Some((ti, ci)) = self.confirming_delete.take() {
+        // While confirming a delete: y/Enter removes, anything else cancels.
+        if let Some(target) = self.confirming_delete.take() {
             if matches!(code, KeyCode::Char('y') | KeyCode::Enter) {
-                if ti < self.review.threads.len() {
-                    self.remove_draft(ti, ci);
-                    self.status = Some(
-                        if ci.is_some() {
-                            "reply removed"
-                        } else {
-                            "draft removed"
-                        }
-                        .to_string(),
-                    );
-                }
+                self.confirm_delete(target);
             } else {
                 self.status = Some("delete cancelled".to_string());
             }
@@ -1533,32 +1589,84 @@ impl App {
         }
     }
 
-    /// Arm the delete confirmation for the unpublished comment the selection
-    /// points at.
+    /// Arm the delete confirmation for the comment the selection points at.
     fn request_delete(&mut self) {
         match self.selected_delete_target() {
             Some(target) => self.confirming_delete = Some(target),
-            None => self.status = Some("nothing removable here (drafts only)".to_string()),
+            None => self.status = Some("nothing of yours to remove here".to_string()),
+        }
+    }
+
+    /// Carry out a confirmed delete: a published comment goes to GitHub in the
+    /// background (then removed locally on success); an unpublished draft/local
+    /// is removed in place.
+    fn confirm_delete(&mut self, target: DeleteTarget) {
+        match target.published {
+            Some((remote_id, review)) => {
+                let ids = self.review.threads.get(target.thread).and_then(|t| {
+                    let cid = target.comment.and_then(|ci| t.comments.get(ci))?;
+                    Some((t.id.clone(), cid.id.clone()))
+                });
+                if let (Some((thread_id, comment_id)), Some(pr)) = (ids, self.pr.clone()) {
+                    self.start_job(
+                        "Deleting on GitHub",
+                        Box::new(move |progress| {
+                            progress("deleting comment…");
+                            pr.delete_published(remote_id, review)?;
+                            Ok(JobOutcome::Deleted {
+                                thread_id,
+                                comment_id,
+                            })
+                        }),
+                    );
+                }
+            }
+            None => {
+                if target.thread < self.review.threads.len() {
+                    self.remove_draft(target.thread, target.comment);
+                    self.status = Some(
+                        if target.comment.is_some() {
+                            "reply removed"
+                        } else {
+                            "draft removed"
+                        }
+                        .to_string(),
+                    );
+                }
+            }
         }
     }
 
     /// What `d` removes: in the Conversation view the selected comment (a reply
-    /// removes just itself; the root takes its whole thread); in Files the thread
-    /// at the cursor. Only when the target is unpublished — GitHub comments stay.
-    fn selected_delete_target(&self) -> Option<(usize, Option<usize>)> {
-        if self.view == View::Conversation {
-            let (ti, ci) = self.selected_comment()?;
-            if self.review.threads[ti].comments.get(ci)?.is_published() {
+    /// removes just itself; a draft root takes its whole thread); in Files the
+    /// thread at the cursor. An unpublished draft/local is removed locally; your
+    /// own published comment is deleted from GitHub (single comment). Another
+    /// author's comment, published or not, is never a target.
+    fn selected_delete_target(&self) -> Option<DeleteTarget> {
+        let (ti, ci) = if self.view == View::Conversation {
+            self.selected_comment()?
+        } else {
+            (self.thread_at_cursor()?, 0)
+        };
+        let comment = self.review.threads[ti].comments.get(ci)?;
+        if comment.is_published() {
+            if !self.comment_is_mine(comment) {
                 return None;
             }
-            // Removing the root takes the thread with it; a reply removes itself.
-            Some((ti, if ci == 0 { None } else { Some(ci) }))
+            let (remote_id, review) =
+                self.published_comment_ref(&self.review.threads[ti].id, &comment.id)?;
+            // A published delete removes just that one comment.
+            Some(DeleteTarget {
+                thread: ti,
+                comment: Some(ci),
+                published: Some((remote_id, review)),
+            })
         } else {
-            let ti = self.thread_at_cursor()?;
-            self.review.threads[ti]
-                .root()
-                .is_some_and(|c| !c.is_published())
-                .then_some((ti, None))
+            Some(DeleteTarget {
+                thread: ti,
+                comment: if ci == 0 { None } else { Some(ci) },
+                published: None,
+            })
         }
     }
 
@@ -1626,10 +1734,22 @@ impl App {
         }
     }
 
+    /// Whether the reviewer may edit or delete `comment`: their own unpublished
+    /// comment (matched by the local author name), or — on a pull request — their
+    /// own published comment (matched by the GitHub viewer login, since a
+    /// published comment's author is a GitHub login). Editing another author's
+    /// comment would misattribute it, so it is never offered.
+    fn comment_is_mine(&self, comment: &Comment) -> bool {
+        if comment.is_published() {
+            self.pr.as_deref().and_then(|p| p.viewer()) == Some(comment.author.as_str())
+        } else {
+            comment.author == self.author
+        }
+    }
+
     /// Open the composer to edit the targeted comment, pre-filled with its body.
-    /// Only your own unpublished comment (a draft or a local note): a published
-    /// GitHub comment cannot be edited from here, and rewriting another author's
-    /// comment would misattribute it.
+    /// Your own comment only. A published comment is saved back to GitHub (see
+    /// [`Self::submit_compose`]); an unpublished one is edited locally.
     fn start_edit(&mut self) {
         let Some((ti, ci)) = self.edit_target() else {
             self.status = Some("no comment selected".to_string());
@@ -1638,12 +1758,15 @@ impl App {
         let Some(comment) = self.review.threads[ti].comments.get(ci) else {
             return;
         };
-        if comment.is_published() {
-            self.status = Some("a published comment can't be edited here".to_string());
-            return;
-        }
-        if comment.author != self.author {
-            self.status = Some("only your own comments can be edited".to_string());
+        if !self.comment_is_mine(comment) {
+            self.status = Some(
+                if comment.is_published() {
+                    "you can only edit your own published comment"
+                } else {
+                    "only your own comments can be edited"
+                }
+                .to_string(),
+            );
             return;
         }
         let compose = Compose {
@@ -2708,14 +2831,51 @@ impl App {
                 }
             }
             ComposeKind::Edit { thread, comment } => {
-                if self.edit_comment(&thread, &comment, &body) {
-                    self.persist("comment edited")
-                } else {
-                    Some("the comment can no longer be edited".to_string())
+                match self.published_comment_ref(&thread, &comment) {
+                    // A published comment: save the edit back to GitHub, then
+                    // apply it locally when the job reports success.
+                    Some((remote_id, review)) => match self.pr.clone() {
+                        Some(pr) => {
+                            self.start_job(
+                                "Editing on GitHub",
+                                Box::new(move |progress| {
+                                    progress("updating comment…");
+                                    pr.edit_published(remote_id, review, &body)?;
+                                    Ok(JobOutcome::Edited {
+                                        thread_id: thread,
+                                        comment_id: comment,
+                                        body,
+                                    })
+                                }),
+                            );
+                            None
+                        }
+                        None => Some("no pull request to save the edit to".to_string()),
+                    },
+                    // An unpublished draft or local note: edit in place.
+                    None => {
+                        if self.edit_comment(&thread, &comment, &body) {
+                            self.persist("comment edited")
+                        } else {
+                            Some("the comment can no longer be edited".to_string())
+                        }
+                    }
                 }
             }
         };
         self.relayout();
+    }
+
+    /// If `(thread_id, comment_id)` names a published comment with a numeric
+    /// remote id, returns `(remote id, is-review-comment)` — the inputs for a
+    /// GitHub edit or delete. A review comment is a line-anchored thread; a PR
+    /// conversation comment lives under a non-line anchor.
+    fn published_comment_ref(&self, thread_id: &str, comment_id: &str) -> Option<(u64, bool)> {
+        let thread = self.review.thread(thread_id)?;
+        let review = matches!(thread.anchor, Anchor::Line { .. });
+        let comment = thread.comments.iter().find(|c| c.id == comment_id)?;
+        let remote_id = comment.remote_id.as_deref()?.parse::<u64>().ok()?;
+        Some((remote_id, review))
     }
 
     /// Replace the body of an existing comment, re-checking it is still the
@@ -4117,26 +4277,35 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
-    /// The confirmation modal for withdrawing a draft comment or thread with `d`.
+    /// The confirmation modal for removing a comment with `d`.
     fn draw_delete_confirm(&self, f: &mut Frame) {
-        let Some((idx, ci)) = self.confirming_delete else {
+        let Some(target) = &self.confirming_delete else {
             return;
         };
         let area = centered_rect(60, 22, f.area());
         f.render_widget(Clear, area);
+        let published = target.published.is_some();
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Remove draft? ")
-            .border_style(Style::default().fg(Color::Yellow));
+            .title(if published {
+                " Delete from GitHub? "
+            } else {
+                " Remove draft? "
+            })
+            .border_style(Style::default().fg(if published { Color::Red } else { Color::Yellow }));
         let inner = block.inner(area);
         f.render_widget(block, area);
         let label = self
             .review
             .threads
-            .get(idx)
+            .get(target.thread)
             .map(|t| anchor_label(&t.anchor))
             .unwrap_or_default();
-        let what = if ci.is_some() {
+        let what = if published {
+            format!(
+                "Permanently delete your published comment on {label} from GitHub? This can't be undone."
+            )
+        } else if target.comment.is_some() {
             format!("Withdraw your reply on {label}?")
         } else {
             format!("Withdraw your draft thread on {label}?")
@@ -6924,6 +7093,73 @@ mod tests {
             "only the reply is gone"
         );
         assert_eq!(app.review.threads[0].comments[0].body, "root");
+    }
+
+    fn published_comment(id: &str, author: &str, remote: &str) -> Thread {
+        Thread {
+            id: "t".into(),
+            anchor: Anchor::line("a.rs", Side::New, 2),
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: id.into(),
+                author: author.into(),
+                body: "posted".into(),
+                created_at: 0,
+                remote_id: Some(remote.into()),
+                kind: loopreview_core::CommentKind::Draft,
+            }],
+        }
+    }
+
+    #[test]
+    fn e_opens_and_d_targets_your_own_published_comment() {
+        let mut app = pr_app(); // the viewer is "tester"
+        app.review
+            .threads
+            .push(published_comment("c", "tester", "555"));
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        // Editing your own published comment opens the composer (the save itself
+        // goes to GitHub in the background).
+        app.on_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(
+            app.input.is_some(),
+            "your own published comment is editable"
+        );
+        assert_eq!(app.input.as_ref().unwrap().area.text(), "posted");
+        app.input = None; // don't trigger the network save
+        // Deleting it targets that single published comment; a line-anchored
+        // thread is a review comment.
+        let target = app.selected_delete_target().expect("a deletable target");
+        assert_eq!(target.comment, Some(0));
+        assert_eq!(target.published, Some((555, true)));
+    }
+
+    #[test]
+    fn published_edit_and_delete_refuse_another_authors_comment() {
+        let mut app = pr_app(); // the viewer is "tester"
+        app.review
+            .threads
+            .push(published_comment("c", "someone-else", "555"));
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        app.on_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(
+            app.input.is_none(),
+            "another author's comment isn't editable"
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("your own published")
+        );
+        assert!(
+            app.selected_delete_target().is_none(),
+            "nor is it deletable"
+        );
     }
 
     #[test]

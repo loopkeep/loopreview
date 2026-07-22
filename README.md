@@ -116,8 +116,8 @@ files from a working-tree review.
 | `V` | Start / cancel a line-range selection (`j` / `k` to extend, then `c`) |
 | `r` | Reply to the thread on the cursor line |
 | `x` | Resolve / reopen that thread |
-| `e` | Edit your own unpublished comment (the thread's root; opens the composer pre-filled) |
-| `d` | Withdraw the unpublished thread at the cursor (a draft or a local note; never a published comment) |
+| `e` | Edit your own comment (the thread's root; opens the composer pre-filled — a published edit syncs to GitHub) |
+| `d` | Remove your own comment at the cursor (a draft locally; your own published comment is deleted from GitHub, with confirmation) |
 | `t` | Toggle that thread between a draft and a local note (pull requests) |
 | `o` | Fold: expand the current file if collapsed, else fold the thread at the cursor, else collapse the current file |
 | Wheel | Scroll the diff (or the sidebar, when the pointer is over it) |
@@ -149,8 +149,8 @@ move; `Enter` opens the file; `Esc` closes.
 | `Ctrl-D` / `Ctrl-U` (or `PageDown` / `PageUp`) | Scroll |
 | `r` | Reply to the selected thread |
 | `x` | Resolve / reopen |
-| `e` | Edit your own unpublished comment at the cursor (root or reply) |
-| `d` | Withdraw the comment at the cursor if unpublished (a reply removes just itself; the root removes the thread) |
+| `e` | Edit your own comment at the cursor (root or reply; a published edit syncs to GitHub) |
+| `d` | Remove your own comment at the cursor (a draft reply removes itself, a draft root its thread; your own published comment is deleted from GitHub, with confirmation) |
 | `t` | Toggle the selected thread between a draft and a local note (pull requests) |
 | `o` | Collapse / expand |
 | `X` | Close the review (asks to confirm) |
@@ -198,6 +198,12 @@ A comment also has a **kind**. Yours default to drafts; an agent's default to
 toggles the selected thread between the two, so you can adopt an agent's note as
 a draft to send, or drop one of your drafts to a local note. Only drafts are ever
 submitted; local notes stay off GitHub.
+
+You can also edit (`e`) or delete (`d`) your **own already-published** comment —
+matched against your GitHub login — and it syncs straight to GitHub: an edit via
+a PATCH, a delete via a DELETE (with a confirmation, since it is irreversible).
+Both run in the background and report failures. Someone else's comment is never
+editable or deletable, and an agent can only touch its own unpublished notes.
 
 ## Agent integration
 

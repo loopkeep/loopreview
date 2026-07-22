@@ -39,13 +39,19 @@ pub fn fetch(
     let diff = client.pr_source(&pr).load().map_err(|e| e.to_string())?;
     progress("fetching comments…");
     let threads = client.pull(&pr).map_err(|e| e.to_string())?;
-    Ok((PrHandle { client, pr }, label, diff, threads))
+    // The viewer's login gates editing/deleting their own published comments.
+    // Best-effort: a failure here just means those affordances stay off.
+    let viewer = client.viewer_login().ok();
+    Ok((PrHandle { client, pr, viewer }, label, diff, threads))
 }
 
 /// A resolved pull request plus a client, for syncing back to GitHub.
 pub struct PrHandle {
     client: GithubClient,
     pr: ResolvedPr,
+    /// The authenticated GitHub login, when known — for gating published-comment
+    /// edits/deletes to the viewer's own comments.
+    viewer: Option<String>,
 }
 
 impl PrHandle {
@@ -80,7 +86,13 @@ impl PrHandle {
                 state: "OPEN".into(),
                 url: String::new(),
             },
+            viewer: Some("tester".into()),
         }
+    }
+
+    /// The authenticated GitHub login, when known.
+    pub fn viewer(&self) -> Option<&str> {
+        self.viewer.as_deref()
     }
 
     /// Re-pull the PR's threads from GitHub.
@@ -97,6 +109,21 @@ impl PrHandle {
             self.client.unresolve_thread(node_id)
         };
         result.map_err(|e| e.to_string())
+    }
+
+    /// Edit a published comment's body on GitHub. `review` selects the inline
+    /// review-comment endpoint over the PR conversation one.
+    pub fn edit_published(&self, remote_id: u64, review: bool, body: &str) -> Result<(), String> {
+        self.client
+            .edit_comment(&self.pr, remote_id, review, body)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Delete a published comment on GitHub (irreversible — confirm first).
+    pub fn delete_published(&self, remote_id: u64, review: bool) -> Result<(), String> {
+        self.client
+            .delete_comment(&self.pr, remote_id, review)
+            .map_err(|e| e.to_string())
     }
 
     /// Submit a review (new inline drafts + optional summary/event) and post any
