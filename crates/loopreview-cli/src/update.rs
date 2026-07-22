@@ -476,8 +476,14 @@ fn extract_binaries(archive: &Path, dest: &Path) -> Result<()> {
             continue;
         };
         if BIN_NAMES.contains(&name.as_str()) {
+            let out = dest.join(&name);
+            // Remove any earlier entry of the same name before unpacking. A crafted
+            // archive can carry a name twice — first a symlink, then a regular file
+            // — and without this the second `unpack` would follow the symlink and
+            // write through it, escaping `dest`.
+            let _ = fs::remove_file(&out);
             entry
-                .unpack(dest.join(&name))
+                .unpack(&out)
                 .with_context(|| format!("extracting {name}"))?;
         }
     }
