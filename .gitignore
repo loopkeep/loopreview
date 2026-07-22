@@ -1,2 +1,15 @@
+# Rust build output
 /target
-.claude/
+**/*.rs.bk
+
+# Debug symbols and coverage artifacts
+*.pdb
+*.profraw
+
+# Agent worktrees only — leave room to track other .claude/ config later
+.claude/worktrees/
+
+# macOS
+.DS_Store
+
+# Note: Cargo.lock is committed (this repo ships binaries), so it is not ignored.
