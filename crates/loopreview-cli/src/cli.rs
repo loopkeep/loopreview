@@ -107,9 +107,11 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Review a GitHub pull request (by number, URL, or owner/repo#N).
+    /// Review a GitHub pull request (by number, URL, owner/repo#N, or #N).
     Pr {
-        /// The pull request; omit and pass --detect to use the current branch.
+        /// The pull request: a number (`123`), a URL, `owner/repo#N`, or `#N`.
+        /// Quote `#N` — most shells treat a bare `#` as a comment (`lr pr "#123"`,
+        /// or just `lr pr 123`).
         query: Option<String>,
         /// Detect the pull request for the current branch.
         #[arg(long)]

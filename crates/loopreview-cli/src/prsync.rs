@@ -17,10 +17,10 @@ pub fn query(text: Option<String>, detect: bool) -> Result<PrQuery, String> {
         return Ok(PrQuery::Detect);
     }
     let text = text.ok_or(
-        "give a pull request (number, URL, or owner/repo#N), or pass --detect".to_string(),
+        "give a pull request (number, URL, owner/repo#N, or #N), or pass --detect".to_string(),
     )?;
     PrQuery::parse(&text).ok_or_else(|| {
-        format!("`{text}` is not a pull request number, URL, or owner/repo#N reference")
+        format!("`{text}` is not a pull request number, URL, owner/repo#N, or #N reference")
     })
 }
 

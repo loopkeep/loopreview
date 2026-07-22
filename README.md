@@ -78,6 +78,7 @@ lr diff --staged      # review only the staged changes
 lr patch fix.patch    # review a saved patch...
 git diff | lr         # ...or one piped in
 lr pr 123             # review GitHub pull request #123 in the TUI
+lr pr "#123"          # quote #N — a bare # is a shell comment
 ```
 
 Useful global options: `--mode auto|unified|split` picks the layout,
@@ -172,7 +173,7 @@ history — you can still read and reply to it.
 
 ### Pull requests
 
-`lr pr <number | url | owner/repo#n>` (or `lr pr --detect` for the current
+`lr pr <number | url | owner/repo#n | #n>` (or `lr pr --detect` for the current
 branch) opens a pull request in the same TUI, fetching the diff and existing
 review threads without touching your working tree. Your comments and replies are
 kept as **drafts** — they persist across sessions — until you submit. `Ctrl-S`
