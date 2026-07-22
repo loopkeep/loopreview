@@ -2546,6 +2546,33 @@ impl App {
     }
 
     /// Move the reviewer's cursor and view (a control-plane `navigate`).
+    /// Reach a diff line if the model has it, doing the state transitions itself:
+    /// switch to the Files view, expand the file when it is collapsed, then place
+    /// the cursor. Validates against the diff model — not the rendered rows — so a
+    /// collapsed file or the Conversation view can't hide a line `comment add`
+    /// would accept. Returns whether the line was reached.
+    fn goto_diff_line(&mut self, file: &str, side: Side, line: u32) -> bool {
+        if !line_present(&self.diff, file, side, line) {
+            return false;
+        }
+        self.view = View::Files;
+        if self.collapsed_files.remove(file) {
+            self.relayout();
+        }
+        let target = CursorAnchor {
+            path: file.to_string(),
+            new_side: side == Side::New,
+            line,
+        };
+        match self.find_anchor(&target) {
+            Some(cursor) => {
+                self.set_cursor(cursor);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn control_navigate(&mut self, nav: protocol::Navigate) -> Result<NavigateResult, String> {
         if let Some(thread_id) = nav.thread {
             let idx = self
@@ -2558,23 +2585,15 @@ impl App {
             if let Anchor::Line {
                 file, side, end, ..
             } = anchor
+                && self.goto_diff_line(&file, side, end)
             {
-                let target = CursorAnchor {
-                    path: file.clone(),
-                    new_side: side == Side::New,
-                    line: end,
-                };
-                if let Some(cursor) = self.find_anchor(&target) {
-                    self.view = View::Files;
-                    self.set_cursor(cursor);
-                    self.conv_cursor = self.thread_display_pos(idx);
-                    self.status = Some(format!("agent → {file}:{end}"));
-                    return Ok(NavigateResult {
-                        moved: true,
-                        file: Some(file),
-                        line: Some(end),
-                    });
-                }
+                self.conv_cursor = self.thread_display_pos(idx);
+                self.status = Some(format!("agent → {file}:{end}"));
+                return Ok(NavigateResult {
+                    moved: true,
+                    file: Some(file),
+                    line: Some(end),
+                });
             }
             // A file/review anchor, or an outdated line: select it in the
             // Conversation view instead.
@@ -2592,27 +2611,19 @@ impl App {
         match (nav.file, nav.line) {
             (Some(file), Some(line)) => {
                 let side = nav.side.unwrap_or(Side::New);
-                let target = CursorAnchor {
-                    path: file.clone(),
-                    new_side: side == Side::New,
-                    line,
-                };
-                match self.find_anchor(&target) {
-                    Some(cursor) => {
-                        self.view = View::Files;
-                        self.set_cursor(cursor);
-                        self.status = Some(format!("agent → {file}:{line}"));
-                        Ok(NavigateResult {
-                            moved: true,
-                            file: Some(file),
-                            line: Some(line),
-                        })
-                    }
-                    None => Ok(NavigateResult {
+                if self.goto_diff_line(&file, side, line) {
+                    self.status = Some(format!("agent → {file}:{line}"));
+                    Ok(NavigateResult {
+                        moved: true,
+                        file: Some(file),
+                        line: Some(line),
+                    })
+                } else {
+                    Ok(NavigateResult {
                         moved: false,
                         file: Some(file),
                         line: Some(line),
-                    }),
+                    })
                 }
             }
             _ => Err("navigate needs --thread, or --file with --line".to_string()),
@@ -5740,6 +5751,40 @@ mod tests {
             Response::Ok(Reply::Navigate(result)) => assert!(!result.moved),
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn control_navigate_reaches_a_line_in_a_collapsed_file() {
+        let mut app = sample_app(); // a.rs: new 1 ("keep"), new 2 ("added")
+        // The file is collapsed and the Conversation view is showing — the
+        // states that used to hide the line from validation.
+        app.collapsed_files.insert("a.rs".into());
+        app.view = View::Conversation;
+        app.relayout();
+        let response = app.handle_control(Request::Navigate(protocol::Navigate {
+            thread: None,
+            file: Some("a.rs".into()),
+            side: Some(Side::New),
+            line: Some(2),
+        }));
+        match response {
+            Response::Ok(Reply::Navigate(result)) => {
+                assert!(result.moved, "navigate reaches a line in a collapsed file");
+                assert_eq!(result.line, Some(2));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        // It did the transitions itself: Files view, the file expanded.
+        assert_eq!(app.view, View::Files);
+        assert!(
+            !app.collapsed_files.contains("a.rs"),
+            "the file was expanded"
+        );
+        assert_eq!(
+            clicked_line(&app),
+            "added",
+            "the cursor landed on new line 2"
+        );
     }
 
     #[test]
