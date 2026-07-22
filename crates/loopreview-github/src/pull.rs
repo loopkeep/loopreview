@@ -408,6 +408,11 @@ fn parse_iso8601(s: &str) -> Option<i64> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
+    // Reject an out-of-range time so a malformed stamp degrades to `0` rather than
+    // silently skewing the ordering. A leap second (60) is tolerated.
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&min) || !(0..=60).contains(&sec) {
+        return None;
+    }
     Some(days_from_civil(year, month, day) * 86400 + hour * 3600 + min * 60 + sec)
 }
 
@@ -696,6 +701,12 @@ mod tests {
         assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
         assert!(parse_iso8601("not-a-date").is_none());
         assert!(parse_iso8601("2024-13-01T00:00:00Z").is_none());
+        // An out-of-range time component is rejected, not folded in.
+        assert!(parse_iso8601("2024-04-25T24:00:00Z").is_none());
+        assert!(parse_iso8601("2024-04-25T19:60:42Z").is_none());
+        assert!(parse_iso8601("2024-04-25T19:55:99Z").is_none());
+        // A leap second is accepted.
+        assert!(parse_iso8601("2024-06-30T23:59:60Z").is_some());
         // Pre-epoch times clamp to zero for the unsigned model field.
         assert_eq!(iso8601_to_epoch("1969-01-01T00:00:00Z"), 0);
     }
