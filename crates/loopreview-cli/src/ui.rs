@@ -66,6 +66,9 @@ const BAR_BG: Color = Color::Rgb(30, 33, 40);
 const SCROLLOFF: usize = 3;
 /// Columns moved per horizontal-scroll step.
 const HSCROLL_STEP: isize = 8;
+/// Trailing whitespace allowed past the longest line at the far-right scroll
+/// stop — a small reading margin so the tail is not glued to the edge.
+const HSCROLL_MARGIN: usize = 8;
 /// Sidebar width bounds (the minimum diff width kept beside it is configurable).
 const SIDEBAR_MIN: usize = 22;
 const SIDEBAR_MAX: usize = 44;
@@ -2556,8 +2559,36 @@ impl App {
     /// Scroll the diff content horizontally, clamped to the current file's widest
     /// line (the line-number gutter does not move).
     fn hscroll_by(&mut self, delta: isize) {
-        let max = self.max_content_width().saturating_sub(1) as isize;
+        let max = self.max_hscroll() as isize;
         self.hscroll = (self.hscroll as isize + delta).clamp(0, max) as usize;
+    }
+
+    /// The furthest right the content may scroll. Bounded so the viewport never
+    /// becomes whitespace-only: the longest line's overflow past the viewport,
+    /// plus a small reading margin, but never so far that its last column
+    /// scrolls off (which matters only for a very narrow viewport). Zero when
+    /// the widest line already fits.
+    fn max_hscroll(&self) -> usize {
+        let viewport = self.content_viewport_width();
+        let longest = self.max_content_width();
+        if viewport == 0 || longest <= viewport {
+            return 0;
+        }
+        (longest - viewport + HSCROLL_MARGIN).min(longest - 1)
+    }
+
+    /// Columns available for line content (the body width minus the fixed
+    /// gutter) in the current layout. In split view each pane has its own
+    /// gutter, and horizontal scroll windows both panes by the same offset, so
+    /// the narrower single-pane content width bounds the scroll.
+    fn content_viewport_width(&self) -> usize {
+        let body = self.body_width.get();
+        if self.sbs() {
+            let pane = body.saturating_sub(1) / 2; // a 1-col divider splits the body
+            pane.saturating_sub(self.num_width + 4)
+        } else {
+            body.saturating_sub(1 + (2 * self.num_width + 2) + 2)
+        }
     }
 
     /// The widest line content, in display columns, of the current file.
@@ -4720,10 +4751,51 @@ mod tests {
         );
     }
 
+    /// A file whose single context line is `width` columns of "x".
+    fn wide_file(path: &str, width: usize) -> FileDiff {
+        FileDiff {
+            old_path: Some(path.into()),
+            new_path: Some(path.into()),
+            status: ChangeStatus::Modified,
+            binary: false,
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                section: None,
+                lines: vec![Line {
+                    kind: LineKind::Context,
+                    content: "x".repeat(width),
+                    old_lineno: Some(1),
+                    new_lineno: Some(1),
+                }],
+            }],
+        }
+    }
+
+    fn wide_app(files: &[(&str, usize)]) -> App {
+        let files = files.iter().map(|(p, w)| wide_file(p, *w)).collect();
+        let diff = Diff {
+            files,
+            provenance: Provenance::default(),
+        };
+        let mut app = App::new(
+            "t".into(),
+            diff,
+            Review::default(),
+            None,
+            "me".into(),
+            Highlighter::new(),
+            None,
+        );
+        app.mode = Mode::Unified;
+        app
+    }
+
     #[test]
     fn horizontal_scroll_clamps_and_resets_on_jump() {
-        let mut app = multi_file_app(&["a.rs", "b.rs"]);
-        app.mode = Mode::Unified;
+        let mut app = wide_app(&[("a.rs", 200), ("b.rs", 200)]);
         app.cursor = 1; // a content line in file a
         app.hscroll_by(100);
         assert!(app.hscroll > 0);
@@ -4734,6 +4806,30 @@ mod tests {
         app.hscroll = 3;
         app.goto_file(1);
         assert_eq!(app.hscroll, 0);
+    }
+
+    #[test]
+    fn horizontal_scroll_stops_before_whitespace_only() {
+        let mut app = wide_app(&[("wide.rs", 200)]);
+        app.hscroll_by(100_000); // fling all the way right
+        let longest = app.max_content_width();
+        let gutter = 1 + (2 * app.num_width + 2) + 2; // unified gutter
+        let viewport = app.body_width.get() - gutter;
+        assert_eq!(longest, 200);
+        assert!(viewport < longest, "the long line overflows the viewport");
+        // Never scroll so far that the viewport is (almost) all whitespace: at
+        // the far-right stop at least (viewport - margin) columns are content.
+        let margin = 8;
+        assert!(
+            longest - app.hscroll >= viewport - margin,
+            "over-scrolled into whitespace: hscroll={}, longest={longest}, viewport={viewport}",
+            app.hscroll,
+        );
+        assert_eq!(
+            app.hscroll,
+            longest - viewport + margin,
+            "clamped to the line's overflow plus a small reading margin",
+        );
     }
 
     #[test]
