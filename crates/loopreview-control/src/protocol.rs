@@ -347,10 +347,9 @@ pub struct CommentInfo {
     pub body: String,
     /// Creation time, seconds since the Unix epoch.
     pub created_at: u64,
-    /// True while the comment is an unpublished draft.
-    pub draft: bool,
     /// The comment's disposition: `local` (a note, never sent), `draft` (queued
-    /// to submit), or `published` (already on GitHub).
+    /// to submit), or `published` (already on GitHub). Test `kind == "draft"` for
+    /// the former `draft` flag.
     pub kind: String,
 }
 
@@ -558,7 +557,6 @@ mod tests {
                 author: "agent".into(),
                 body: "hi".into(),
                 created_at: 1,
-                draft: true,
                 kind: "draft".into(),
             }],
         };

@@ -82,7 +82,10 @@ pub fn run(check_only: bool) -> Result<()> {
     }
 
     let asset = asset_name(&latest, target);
-    let work = TempDir::new()?;
+    // Stage under the install directory: same filesystem as the target (so the
+    // final rename never crosses a device) and a directory the user owns.
+    let install_dir = install_dir()?;
+    let work = TempDir::new_in(&install_dir)?;
     eprintln!("downloading v{latest} for {target}…");
     backend.download(&release, &asset, work.path())?;
 
@@ -104,7 +107,6 @@ pub fn run(check_only: bool) -> Result<()> {
     extract_binaries(&archive_path, work.path())
         .with_context(|| format!("extracting {}", archive_path.display()))?;
 
-    let install_dir = install_dir()?;
     install_all(work.path(), &install_dir)?;
 
     println!("updated v{current} → v{latest}");
@@ -476,8 +478,14 @@ fn extract_binaries(archive: &Path, dest: &Path) -> Result<()> {
             continue;
         };
         if BIN_NAMES.contains(&name.as_str()) {
+            let out = dest.join(&name);
+            // Remove any earlier entry of the same name before unpacking. A crafted
+            // archive can carry a name twice — first a symlink, then a regular file
+            // — and without this the second `unpack` would follow the symlink and
+            // write through it, escaping `dest`.
+            let _ = fs::remove_file(&out);
             entry
-                .unpack(dest.join(&name))
+                .unpack(&out)
                 .with_context(|| format!("extracting {name}"))?;
         }
     }
@@ -525,7 +533,15 @@ fn install_dir() -> Result<PathBuf> {
 /// Install each freshly extracted binary in `staging` over its counterpart in
 /// `install_dir`. A binary missing from either side is warned about and skipped
 /// (the other is still updated); at least one always exists — we are running it.
+///
+/// Each target is backed up before it is replaced, so a failure partway through
+/// (the second binary fails after the first was swapped) rolls the already-
+/// replaced binaries back to their previous version rather than leaving a mix of
+/// old and new. The rollback is best-effort and its outcome is named in the
+/// error.
 fn install_all(staging: &Path, install_dir: &Path) -> Result<()> {
+    // The binaries present on both sides — the ones actually replaced.
+    let mut pairs = Vec::new();
     for name in BIN_NAMES {
         let new = staging.join(name);
         let target = install_dir.join(name);
@@ -541,9 +557,62 @@ fn install_all(staging: &Path, install_dir: &Path) -> Result<()> {
             );
             continue;
         }
-        install_one(&new, &target)?;
+        pairs.push((name, new, target));
+    }
+
+    // Replace each in turn, keeping a backup of every one already swapped so a
+    // later failure can undo them.
+    let mut done: Vec<(PathBuf, PathBuf)> = Vec::new(); // (backup, target)
+    for (name, new, target) in &pairs {
+        let backup = backup_path(target);
+        let backed_up = fs::copy(target, &backup).is_ok();
+        match install_one(new, target) {
+            Ok(()) if backed_up => done.push((backup, target.clone())),
+            Ok(()) => {
+                let _ = fs::remove_file(&backup);
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&backup);
+                let restored = rollback(&done);
+                return Err(e.context(format!(
+                    "installing {name} failed; rolled back {restored} of {} already-replaced \
+                     binar{}",
+                    done.len(),
+                    if done.len() == 1 { "y" } else { "ies" }
+                )));
+            }
+        }
+    }
+    // Success: the backups are no longer needed.
+    for (backup, _) in &done {
+        let _ = fs::remove_file(backup);
     }
     Ok(())
+}
+
+/// The backup path for a target binary, a hidden sibling in the same directory.
+fn backup_path(target: &Path) -> PathBuf {
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("loopreview");
+    target.with_file_name(format!(".{name}.bak.{}", std::process::id()))
+}
+
+/// Restore each already-replaced binary from its backup, returning how many were
+/// put back. Best-effort: a rename is atomic on Unix (and keeps the running
+/// process's inode); on Windows an overwriting copy is the fallback.
+fn rollback(done: &[(PathBuf, PathBuf)]) -> usize {
+    let mut restored = 0;
+    for (backup, target) in done {
+        if fs::rename(backup, target).is_ok() {
+            restored += 1;
+        } else if fs::copy(backup, target).is_ok() {
+            let _ = fs::remove_file(backup);
+            restored += 1;
+        }
+    }
+    restored
 }
 
 /// Replace `target` with `new` via a temp file plus `rename` (a fresh inode, so
@@ -588,7 +657,10 @@ fn install_one(new: &Path, target: &Path) -> Result<()> {
     let _ = fs::remove_file(&old);
     fs::rename(target, &old).map_err(|e| write_error(dir, target, e))?;
     fs::copy(new, target).map_err(|e| {
-        // Roll back so the user is not left without a binary.
+        // Roll back so the user is not left without a binary. A failed copy can
+        // still leave a partial `target`; remove it first, or the rollback rename
+        // fails on Windows (rename will not overwrite an existing destination).
+        let _ = fs::remove_file(target);
         let _ = fs::rename(&old, target);
         write_error(dir, target, e)
     })?;
@@ -612,16 +684,34 @@ fn write_error(dir: &Path, target: &Path, source: io::Error) -> anyhow::Error {
 struct TempDir(PathBuf);
 
 impl TempDir {
-    /// Create a uniquely named temp directory under the system temp dir.
-    fn new() -> Result<TempDir> {
+    /// Create a uniquely named private working directory under `base`.
+    ///
+    /// Staging lives under the install directory rather than the system temp dir:
+    /// it shares the target's filesystem (so the final `rename` never crosses a
+    /// device) and sits in a directory the user already owns, avoiding the symlink
+    /// races a world-writable `/tmp` invites. It is restricted to the owner (0700)
+    /// on Unix and removed on drop.
+    fn new_in(base: &Path) -> Result<TempDir> {
         let nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir =
-            std::env::temp_dir().join(format!("loopreview-update-{}-{nanos}", std::process::id()));
+        let dir = base.join(format!(".loopreview-update-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("restricting {}", dir.display()))?;
+        }
         Ok(TempDir(dir))
+    }
+
+    /// Create a uniquely named temp directory under the system temp dir (tests
+    /// only; the update itself stages under the install directory).
+    #[cfg(test)]
+    fn new() -> Result<TempDir> {
+        TempDir::new_in(&std::env::temp_dir())
     }
 
     /// The directory's path.
@@ -850,6 +940,59 @@ mod tests {
             fs::metadata(&target).unwrap().permissions().mode() & 0o111,
             0
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_is_created_under_the_base_dir_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = TempDir::new().unwrap();
+        let work = TempDir::new_in(base.path()).unwrap();
+        assert!(
+            work.path().starts_with(base.path()),
+            "staging lives under the install directory"
+        );
+        let mode = fs::metadata(work.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "staging is restricted to its owner");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn install_all_rolls_back_when_a_later_binary_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let install = TempDir::new().unwrap();
+        let staging = TempDir::new().unwrap();
+        // Both binaries are installed at an old version.
+        for name in BIN_NAMES {
+            let target = install.path().join(name);
+            fs::write(&target, b"old binary").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // The first staged binary is a valid replacement; the second is a
+        // directory, so install_one fails on it after the first was swapped.
+        fs::write(staging.path().join(BIN_NAMES[0]), b"new binary").unwrap();
+        fs::create_dir(staging.path().join(BIN_NAMES[1])).unwrap();
+
+        let err = install_all(staging.path(), install.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("rolled back"),
+            "the error names the rollback: {err:#}"
+        );
+        // The first binary is back to its old version — no old/new mix remains.
+        assert_eq!(
+            fs::read(install.path().join(BIN_NAMES[0])).unwrap(),
+            b"old binary",
+            "the already-replaced binary was restored"
+        );
+        // No backup files are left behind.
+        let leftovers: Vec<_> = fs::read_dir(install.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak."))
+            .collect();
+        assert!(leftovers.is_empty(), "backups are cleaned up");
     }
 
     #[cfg(not(windows))]

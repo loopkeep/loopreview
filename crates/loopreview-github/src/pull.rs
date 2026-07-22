@@ -218,7 +218,8 @@ pub(crate) fn map_review_thread(thread: &ReviewThread) -> Thread {
         .comments
         .nodes
         .iter()
-        .map(map_thread_comment)
+        .enumerate()
+        .map(|(index, comment)| map_thread_comment(comment, &thread.id, index))
         .collect();
 
     let anchor = thread_anchor(thread);
@@ -306,16 +307,24 @@ fn snippet_lines(diff_hunk: &str) -> Vec<String> {
 }
 
 /// Map one review-thread comment onto a [`Comment`], preserving its remote id.
-fn map_thread_comment(comment: &ReviewThreadComment) -> Comment {
+///
+/// Every pulled comment is [`CommentKind::Published`]: it already lives on
+/// GitHub and must never be treated as a draft to re-post. GitHub occasionally
+/// reports a null `databaseId` (a comment with no addressable id); such a comment
+/// carries no `remote_id`, so it is keyed by a synthetic id unique within the
+/// thread (`{thread_id}#{index}`) rather than a shared `"unknown"` that would
+/// collide. Being `Published`, it is still never a send target.
+fn map_thread_comment(comment: &ReviewThreadComment, thread_id: &str, index: usize) -> Comment {
     let remote_id = comment.database_id.map(|id| id.to_string());
     Comment {
-        // Pulled comments are keyed by their remote id; drafts keep a local id.
-        id: remote_id.clone().unwrap_or_else(|| "unknown".to_string()),
+        id: remote_id
+            .clone()
+            .unwrap_or_else(|| format!("{thread_id}#{index}")),
         author: actor_login(&comment.author),
         body: comment.body.clone(),
         created_at: iso8601_to_epoch(&comment.created_at),
         remote_id,
-        kind: CommentKind::Draft,
+        kind: CommentKind::Published,
     }
 }
 
@@ -332,7 +341,7 @@ pub(crate) fn map_issue_comment(comment: &IssueComment) -> Thread {
             body: comment.body.clone(),
             created_at: iso8601_to_epoch(&comment.created_at),
             remote_id: Some(remote_id),
-            kind: CommentKind::Draft,
+            kind: CommentKind::Published,
         }],
     }
 }
@@ -360,7 +369,7 @@ pub(crate) fn map_review_summary(review: &SubmittedReview) -> Option<Thread> {
                 .map(iso8601_to_epoch)
                 .unwrap_or(0),
             remote_id: Some(remote_id),
-            kind: CommentKind::Draft,
+            kind: CommentKind::Published,
         }],
     })
 }
@@ -397,6 +406,11 @@ fn parse_iso8601(s: &str) -> Option<i64> {
     let min = num(14, 16)?;
     let sec = num(17, 19)?;
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Reject an out-of-range time so a malformed stamp degrades to `0` rather than
+    // silently skewing the ordering. A leap second (60) is tolerated.
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&min) || !(0..=60).contains(&sec) {
         return None;
     }
     Some(days_from_civil(year, month, day) * 86400 + hour * 3600 + min * 60 + sec)
@@ -636,11 +650,63 @@ mod tests {
     }
 
     #[test]
+    fn null_database_id_comments_are_published_not_drafts() {
+        // GitHub can report a null databaseId. Such comments must never look like
+        // a local draft (which would re-post them on the next submit) and must not
+        // collide on a shared "unknown" id.
+        let json = r#"{
+          "data": { "repository": { "pullRequest": { "reviewThreads": { "nodes": [
+            {
+              "id": "PRRT_nullids",
+              "isResolved": false,
+              "path": "src/lib.rs",
+              "line": 5,
+              "originalLine": 5,
+              "diffSide": "RIGHT",
+              "subjectType": "LINE",
+              "comments": { "nodes": [
+                { "databaseId": null, "body": "root without an id",
+                  "createdAt": "2026-07-21T15:24:08Z", "diffHunk": "@@ -5 +5 @@",
+                  "originalCommit": { "oid": "aaa" }, "author": { "login": "octocat" } },
+                { "databaseId": null, "body": "reply without an id",
+                  "createdAt": "2026-07-21T16:00:00Z", "diffHunk": "@@ -5 +5 @@",
+                  "originalCommit": { "oid": "aaa" }, "author": { "login": "hubber" } }
+              ]}
+            }
+          ]}}}}
+        }"#;
+        let threads = parse_review_threads(json).unwrap();
+        let thread = map_review_thread(&threads[0]);
+
+        // Neither comment is a draft, so nothing is ever queued to submit.
+        assert!(thread.comments.iter().all(|c| !c.is_draft()));
+        assert!(
+            thread
+                .comments
+                .iter()
+                .all(|c| c.disposition() == CommentKind::Published)
+        );
+        // Synthetic ids are unique within the thread, not a shared "unknown".
+        assert_ne!(thread.comments[0].id, thread.comments[1].id);
+        assert!(thread.comments[0].id.starts_with("PRRT_nullids#"));
+
+        // The plan is empty: no inline comment and no reply is produced for it.
+        assert!(crate::push::plan_inline_comments(std::slice::from_ref(&thread)).is_empty());
+        assert!(crate::push::plan_replies(std::slice::from_ref(&thread)).is_empty());
+    }
+
+    #[test]
     fn parses_iso8601_epoch() {
         assert_eq!(parse_iso8601("2024-04-25T19:55:42Z"), Some(1714074942));
         assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
         assert!(parse_iso8601("not-a-date").is_none());
         assert!(parse_iso8601("2024-13-01T00:00:00Z").is_none());
+        // An out-of-range time component is rejected, not folded in.
+        assert!(parse_iso8601("2024-04-25T24:00:00Z").is_none());
+        assert!(parse_iso8601("2024-04-25T19:60:42Z").is_none());
+        assert!(parse_iso8601("2024-04-25T19:55:99Z").is_none());
+        // A leap second is accepted.
+        assert!(parse_iso8601("2024-06-30T23:59:60Z").is_some());
         // Pre-epoch times clamp to zero for the unsigned model field.
         assert_eq!(iso8601_to_epoch("1969-01-01T00:00:00Z"), 0);
     }

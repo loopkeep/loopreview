@@ -38,15 +38,25 @@ pub use pr::{PrQuery, PrRef, ResolvedPr, parse_pr_query};
 pub use push::{ReviewCommentInput, ReviewEvent};
 pub use source::PrSource;
 
-/// The outcome of submitting a review: the drafts that were published, updated
-/// with the remote ids GitHub assigned.
+/// The outcome of submitting a review: the drafts that were published, each with
+/// the remote id GitHub assigned when it could be reconciled.
+///
+/// The review is created by a single atomic POST, so a returned [`review_id`]
+/// means every inline draft is on GitHub. Reading the created comments back to
+/// learn their ids is a *separate* request that can fail; when it does, the
+/// affected drafts are reported with `None` — "sent, id not yet known" — so the
+/// caller marks them published (never re-posting) and recovers the real ids on
+/// the next pull, rather than the whole submit failing and duplicating on retry.
+///
+/// [`review_id`]: SubmitOutcome::review_id
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmitOutcome {
     /// GitHub's id for the created review.
     pub review_id: u64,
     /// `(local thread id, remote comment id)` for each inline draft that was
-    /// published, so the caller can stamp `remote_id` onto its stored model.
-    pub published: Vec<(String, String)>,
+    /// submitted. `Some(id)` when the created comment was reconciled; `None` when
+    /// the review posted but its comment id could not be read back yet.
+    pub published: Vec<(String, Option<String>)>,
 }
 
 /// The outcome of posting one draft reply: which local comment was published,
@@ -262,10 +272,11 @@ impl GithubClient {
     /// `body` and `event`.
     ///
     /// After the POST the created comments are read back and matched to the
-    /// drafts that produced them, so the returned [`SubmitOutcome`] carries the
-    /// `(thread id, remote comment id)` pairs the caller stamps onto its store —
-    /// the model is updated by return value, never written here. Draft replies
-    /// and resolutions are handled by [`reply`](Self::reply) and
+    /// drafts that produced them, so the returned [`SubmitOutcome`] carries a
+    /// remote comment id per submitted draft (or `None` when the read-back failed
+    /// — see [`SubmitOutcome`]) for the caller to stamp onto its store; the model
+    /// is updated by return value, never written here. Draft replies and
+    /// resolutions are handled by [`reply`](Self::reply) and
     /// [`resolve_thread`](Self::resolve_thread) respectively.
     pub fn submit_review(
         &self,
@@ -293,13 +304,17 @@ impl GithubClient {
         )?;
         let review_id = parse_created_id(&out, "created review")?;
 
-        // Reconcile the created comment ids back onto the drafts. A pending
-        // review or one with no inline comments has nothing to read back.
+        // Reconcile the created comment ids back onto the drafts. Only a review
+        // with no inline comments has nothing to read back (a pending review still
+        // carries its comments, so it is reconciled too). The review is already
+        // created, so a failed read-back is not fatal: the affected drafts are
+        // reported id-pending (their ids arrive on the next pull) rather than
+        // failing the whole submit and re-posting a duplicate review on retry.
         let published = if inputs.is_empty() {
             Vec::new()
         } else {
-            let created = self.fetch_review_comments(pr, review_id)?;
-            push::match_created_comments(&planned, &created)
+            let created = self.fetch_review_comments(pr, review_id).ok();
+            push::reconcile_published(&planned, created.as_deref())
         };
 
         Ok(SubmitOutcome {
@@ -352,6 +367,58 @@ impl GithubClient {
             }
         }
         Ok((outcomes, failed))
+    }
+
+    /// Post every draft under a PR-conversation thread ([`Anchor::Review`]) as a
+    /// new conversation comment, returning one [`ReplyOutcome`] per posted comment
+    /// plus a count of any that failed.
+    ///
+    /// GitHub's conversation is a flat list with no threads, so a draft left under
+    /// an issue-comment or review-summary thread is sent as a fresh
+    /// `POST /issues/{n}/comments` — never with `in_reply_to`, which only works on
+    /// inline review comments. As with [`submit_replies`](Self::submit_replies), a
+    /// failed post leaves its draft untouched so it survives and can be re-sent.
+    pub fn submit_conversation_comments(
+        &self,
+        pr: &ResolvedPr,
+        threads: &[Thread],
+    ) -> Result<(Vec<ReplyOutcome>, usize), GithubError> {
+        let planned = push::plan_conversation_comments(threads);
+        let mut outcomes = Vec::with_capacity(planned.len());
+        let mut failed = 0usize;
+        for comment in planned {
+            match self.create_conversation_comment(pr, &comment.body) {
+                Ok(posted) => outcomes.push(ReplyOutcome {
+                    thread_id: comment.thread_id,
+                    comment_id: comment.comment_id,
+                    comment: posted,
+                }),
+                Err(_) => failed += 1,
+            }
+        }
+        Ok((outcomes, failed))
+    }
+
+    /// Post one new comment to the PR conversation (`POST /issues/{n}/comments`)
+    /// and return the created [`Comment`], its `remote_id` set.
+    pub fn create_conversation_comment(
+        &self,
+        pr: &ResolvedPr,
+        body: &str,
+    ) -> Result<Comment, GithubError> {
+        let payload = serde_json::to_string(&push::BodyPayload { body })
+            .map_err(|e| GithubError::parse("conversation comment payload", e))?;
+        let path = format!(
+            "repos/{}/{}/issues/{}/comments",
+            pr.owner, pr.repo, pr.number
+        );
+        let out = cmd::run_ok(
+            "gh",
+            &["api", "-X", "POST", &path, "--input", "-"],
+            &self.dir,
+            Some(&payload),
+        )?;
+        parse_created_comment(&out, body)
     }
 
     /// Post a threaded reply to an existing review thread and return the created
@@ -519,7 +586,7 @@ fn parse_created_comment(json: &str, fallback_body: &str) -> Result<Comment, Git
             .map(pull::iso8601_to_epoch)
             .unwrap_or(0),
         remote_id: Some(remote_id),
-        kind: CommentKind::Draft,
+        kind: CommentKind::Published,
     })
 }
 
