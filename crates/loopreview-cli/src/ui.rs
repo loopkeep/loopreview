@@ -10,7 +10,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
+use crossterm::execute;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span as TextSpan};
@@ -55,7 +59,10 @@ enum Mode {
 pub fn run(label: String, diff: Diff) -> Result<()> {
     let mut app = App::new(label, diff, Highlighter::new());
     let mut terminal = ratatui::init();
+    // Mouse capture is best-effort: the UI is fully usable without it.
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let result = app.event_loop(&mut terminal);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -105,6 +112,8 @@ struct App {
     line_srow: Vec<usize>,
     /// The `(file, flat)` of each diff line, in cursor order.
     clines: Vec<(usize, usize)>,
+    /// Reverse of `clines`: `(file, flat)` to its cursor index (for clicks).
+    cline_index: HashMap<(usize, usize), usize>,
 
     /// Cursor index of each file's first line, if any.
     file_first: Vec<Option<usize>>,
@@ -129,6 +138,12 @@ impl App {
         let layout = Layouts::build(&diff);
         let num_width = digits(layout.max_lineno).max(3);
         let file_count = diff.files.len();
+        let cline_index = layout
+            .clines
+            .iter()
+            .enumerate()
+            .map(|(i, &pair)| (pair, i))
+            .collect();
         App {
             label,
             diff,
@@ -138,6 +153,7 @@ impl App {
             srows: layout.srows,
             line_srow: layout.line_srow,
             clines: layout.clines,
+            cline_index,
             file_first: layout.file_first,
             hunk_first: layout.hunk_first,
             flats: layout.flats,
@@ -157,11 +173,14 @@ impl App {
     fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
             terminal.draw(|f| self.draw(f))?;
-            if event::poll(std::time::Duration::from_millis(POLL_MS))?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                self.on_key(key.code, key.modifiers);
+            if event::poll(std::time::Duration::from_millis(POLL_MS))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        self.on_key(key.code, key.modifiers);
+                    }
+                    Event::Mouse(mouse) => self.on_mouse(mouse),
+                    _ => {}
+                }
             }
         }
         Ok(())
@@ -191,6 +210,68 @@ impl App {
             (KeyCode::Char('v'), false) | (KeyCode::Tab, _) => self.toggle_mode(),
             _ => {}
         }
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => self.scroll_view(3),
+            MouseEventKind::ScrollUp => self.scroll_view(-3),
+            MouseEventKind::Down(MouseButton::Left) => self.click(mouse.column, mouse.row),
+            _ => {}
+        }
+    }
+
+    /// Scroll the viewport without moving the cursor (wheel scrolling).
+    fn scroll_view(&mut self, delta: isize) {
+        let height = self.body_height.get().max(1);
+        let max_scroll = self.rows_len().saturating_sub(height) as isize;
+        self.scroll = (self.scroll as isize + delta).clamp(0, max_scroll) as usize;
+    }
+
+    /// Move the cursor to the diff line under a click, if any.
+    fn click(&mut self, column: u16, row: u16) {
+        // Row 0 is the header; the body starts at row 1.
+        if row < 1 {
+            return;
+        }
+        let body_row = (row - 1) as usize;
+        if body_row >= self.body_height.get() {
+            return; // footer or below
+        }
+        let row_index = self.scroll + body_row;
+        if row_index >= self.rows_len() {
+            return;
+        }
+        let target = if self.sbs() {
+            self.sbs_click(row_index, column as usize)
+        } else {
+            self.unified_click(row_index)
+        };
+        if let Some(cursor) = target {
+            self.set_cursor(cursor);
+        }
+    }
+
+    fn unified_click(&self, row_index: usize) -> Option<usize> {
+        match self.urows[row_index] {
+            URow::Line { file, flat } => self.cline_index.get(&(file, flat)).copied(),
+            _ => None,
+        }
+    }
+
+    fn sbs_click(&self, row_index: usize, column: usize) -> Option<usize> {
+        let SRow::Pair { file, old, new } = self.srows[row_index] else {
+            return None;
+        };
+        let left_w = (self.body_width.get().saturating_sub(1)) / 2;
+        let flat = if column < left_w {
+            old
+        } else if column > left_w {
+            new
+        } else {
+            None
+        };
+        flat.and_then(|f| self.cline_index.get(&(file, f)).copied())
     }
 
     // -- navigation -------------------------------------------------------
