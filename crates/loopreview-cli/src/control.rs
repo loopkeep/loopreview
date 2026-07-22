@@ -275,14 +275,7 @@ pub fn thread_info(thread: &Thread, outdated: bool) -> ThreadInfo {
                 body: c.body.clone(),
                 created_at: c.created_at,
                 draft: c.is_draft(),
-                kind: if c.is_published() {
-                    "published"
-                } else if c.is_local() {
-                    "local"
-                } else {
-                    "draft"
-                }
-                .to_string(),
+                kind: c.disposition().as_str().to_string(),
             })
             .collect(),
     }

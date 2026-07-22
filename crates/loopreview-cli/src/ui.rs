@@ -1667,7 +1667,7 @@ impl App {
             let Some(root) = self.review.threads[idx].comments.first_mut() else {
                 return;
             };
-            if root.is_published() {
+            if root.disposition() == CommentKind::Published {
                 self.status = Some("a published comment can't change kind".to_string());
                 return;
             }
@@ -6097,26 +6097,23 @@ fn friendly_github_write_error(reason: String) -> String {
 }
 
 /// The disposition badge for a comment: `[local]` (subdued — never sent) or
-/// `[draft]` (attention — queued to submit). A published comment has none.
+/// `[draft]` (attention — queued to submit). A published comment (on GitHub, or
+/// pulled with no addressable id) has none.
 fn kind_badge(comment: &Comment) -> Option<(&'static str, Color)> {
-    if comment.is_published() {
-        None
-    } else if comment.is_local() {
-        Some(("[local]", BADGE_LOCAL))
-    } else {
-        Some(("[draft]", BADGE_DRAFT))
+    match comment.disposition() {
+        CommentKind::Published => None,
+        CommentKind::Local => Some(("[local]", BADGE_LOCAL)),
+        CommentKind::Draft => Some(("[draft]", BADGE_DRAFT)),
     }
 }
 
 /// The compact index form of [`kind_badge`]: `[l]`/`[d]` for the narrow
 /// sidebar, with the same colors. A published comment has none.
 fn kind_index_badge(comment: &Comment) -> Option<(&'static str, Color)> {
-    if comment.is_published() {
-        None
-    } else if comment.is_local() {
-        Some(("[l]", BADGE_LOCAL))
-    } else {
-        Some(("[d]", BADGE_DRAFT))
+    match comment.disposition() {
+        CommentKind::Published => None,
+        CommentKind::Local => Some(("[l]", BADGE_LOCAL)),
+        CommentKind::Draft => Some(("[d]", BADGE_DRAFT)),
     }
 }
 

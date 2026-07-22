@@ -80,9 +80,11 @@ pub enum ThreadState {
 
 /// What a comment is *for*, independent of whether it has been published. A
 /// `local` note is agent-conversation only and is never sent to GitHub; a
-/// `draft` is queued for the next `review submit`. Publication is orthogonal: a
-/// published comment carries a `remote_id`, and a draft becomes published on
-/// submit. Old stores (no `kind`) deserialize as `Draft`, preserving the
+/// `draft` is queued for the next `review submit`; a `published` comment came
+/// from GitHub and is never a send target. Publication is normally tracked by a
+/// `remote_id`, but a comment pulled from GitHub with no addressable id (a null
+/// `databaseId`) is marked `Published` so it can never be mistaken for a draft
+/// and re-posted. Old stores (no `kind`) deserialize as `Draft`, preserving the
 /// historical "everything is a draft" behavior; the store's loader downgrades a
 /// working-tree review to `Local` (a non-PR review sends nothing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -93,6 +95,21 @@ pub enum CommentKind {
     /// Queued for the next `review submit` (the historical default).
     #[default]
     Draft,
+    /// Pulled from GitHub (already on the remote) — never a send target, even
+    /// when it carries no addressable `remote_id`.
+    Published,
+}
+
+impl CommentKind {
+    /// The wire/display token for this disposition: `local`, `draft`, or
+    /// `published`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommentKind::Local => "local",
+            CommentKind::Draft => "draft",
+            CommentKind::Published => "published",
+        }
+    }
 }
 
 /// A single comment: the root of a thread, or a reply.
@@ -127,9 +144,24 @@ impl Comment {
     }
 
     /// True while this comment is an unpublished draft queued to submit — not a
-    /// local note, and not yet on the remote.
+    /// local note, not pulled from GitHub, and not yet on the remote.
     pub fn is_draft(&self) -> bool {
         self.remote_id.is_none() && self.kind == CommentKind::Draft
+    }
+
+    /// The comment's disposition — `Local`, `Draft`, or `Published` — as a single
+    /// source of truth for the badges and the control protocol. A comment is
+    /// published when it carries a `remote_id` or was pulled from GitHub with none
+    /// (`CommentKind::Published`); a local note stays local; anything else is a
+    /// draft queued to submit.
+    pub fn disposition(&self) -> CommentKind {
+        if self.kind == CommentKind::Local {
+            CommentKind::Local
+        } else if self.is_published() || self.kind == CommentKind::Published {
+            CommentKind::Published
+        } else {
+            CommentKind::Draft
+        }
     }
 }
 
@@ -255,6 +287,36 @@ mod tests {
         };
         let back: Comment = serde_json::from_str(&serde_json::to_string(&local).unwrap()).unwrap();
         assert!(back.is_local() && !back.is_draft());
+    }
+
+    #[test]
+    fn published_kind_is_never_a_draft() {
+        // A comment pulled from GitHub with no addressable id: marked Published so
+        // it is never a send target, even though it carries no remote_id.
+        let pulled = Comment {
+            kind: CommentKind::Published,
+            remote_id: None,
+            ..comment("c", "from github")
+        };
+        assert!(!pulled.is_draft(), "a pulled comment is never a draft");
+        assert!(!pulled.is_local());
+        assert_eq!(pulled.disposition(), CommentKind::Published);
+
+        // The ordinary dispositions.
+        let draft = comment("d", "queued");
+        assert_eq!(draft.disposition(), CommentKind::Draft);
+        let local = Comment {
+            kind: CommentKind::Local,
+            ..comment("l", "note")
+        };
+        assert_eq!(local.disposition(), CommentKind::Local);
+        // A remote_id alone (the common pulled case) reads as published too.
+        let remote = Comment {
+            remote_id: Some("123".into()),
+            ..comment("r", "on github")
+        };
+        assert_eq!(remote.disposition(), CommentKind::Published);
+        assert_eq!(CommentKind::Published.as_str(), "published");
     }
 
     #[test]

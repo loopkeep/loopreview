@@ -519,7 +519,7 @@ fn parse_created_comment(json: &str, fallback_body: &str) -> Result<Comment, Git
             .map(pull::iso8601_to_epoch)
             .unwrap_or(0),
         remote_id: Some(remote_id),
-        kind: CommentKind::Draft,
+        kind: CommentKind::Published,
     })
 }
 
