@@ -116,7 +116,7 @@ files from a working-tree review.
 | `x` | Resolve / reopen that thread |
 | `o` | Fold: expand the current file if collapsed, else fold the thread at the cursor, else collapse the current file |
 | Wheel | Scroll |
-| Click | Move the cursor; a file header folds/unfolds it; a sidebar row opens that file; a tab switches views |
+| Click | Move the cursor; a file header folds/unfolds it; a sidebar row opens that file; a tab switches views; the footer's layout indicator (`[unified]`/`[split]`) toggles the layout |
 | Drag | Select a line range (then `c` to comment) |
 
 **Sidebar** (focused after `b`)

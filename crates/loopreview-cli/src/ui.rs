@@ -462,6 +462,8 @@ enum Region {
     /// A diff cell: `col` is relative to the diff (past any sidebar), `row` is
     /// relative to the body top.
     Content { col: u16, row: usize },
+    /// The layout indicator in the footer (click to toggle unified/split).
+    LayoutToggle,
     /// Anything else (header, footer, divider column, outside the body).
     Outside,
 }
@@ -471,6 +473,9 @@ enum Region {
 fn hit_region(x: u16, y: u16, hit: HitLayout) -> Region {
     if hit.tabs_row == Some(y) {
         return Region::Tabs;
+    }
+    if y == hit.footer_row && x < hit.layout_end {
+        return Region::LayoutToggle;
     }
     if y < hit.body_top || y >= hit.body_top + hit.body_height {
         return Region::Outside;
@@ -506,6 +511,10 @@ struct HitLayout {
     tab_conv_end: u16,
     /// Sidebar column count (0 = hidden); the diff starts past `sidebar_w`.
     sidebar_w: u16,
+    /// The footer row.
+    footer_row: u16,
+    /// The layout indicator occupies `[0, layout_end)` on the footer row.
+    layout_end: u16,
 }
 
 /// Cached render data for one file, aligned to that file's flat line list.
@@ -2532,6 +2541,7 @@ impl App {
     /// fold; a diff line moves the cursor (and arms a drag-select).
     fn mouse_down(&mut self, column: u16, row: u16) {
         match hit_region(column, row, self.hit.get()) {
+            Region::LayoutToggle => self.toggle_mode(),
             Region::Tabs if self.has_review() => {
                 let hit = self.hit.get();
                 if column < hit.tab_files_end {
@@ -2877,6 +2887,8 @@ impl App {
             tab_files_end: files_w,
             tab_conv_end: files_w + 1 + conv_label.chars().count() as u16,
             sidebar_w: sidebar_cols,
+            footer_row: footer.y,
+            layout_end: self.layout_label().chars().count() as u16,
         });
 
         self.draw_header(f, header);
@@ -3240,6 +3252,15 @@ impl App {
         }
     }
 
+    /// The layout indicator shown (and clickable) in the footer.
+    fn layout_label(&self) -> String {
+        if self.sbs() {
+            "[split]".to_string()
+        } else {
+            "[unified]".to_string()
+        }
+    }
+
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let bar = Style::default().bg(BAR_BG);
         let position = if self.view == View::Conversation {
@@ -3256,7 +3277,16 @@ impl App {
                 self.cursor_anchor()
             )
         };
-        let mut spans = vec![TextSpan::styled(position, bar.fg(Color::Cyan))];
+        // A clickable layout indicator leads the footer (click toggles it).
+        let mut spans = vec![
+            TextSpan::styled(
+                self.layout_label(),
+                bar.fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            TextSpan::styled(position, bar.fg(Color::Cyan)),
+        ];
         if let Some(status) = &self.status {
             spans.push(TextSpan::styled(status.clone(), bar.fg(Color::Yellow)));
         } else {
@@ -5070,6 +5100,8 @@ mod tests {
             tab_files_end: 0,
             tab_conv_end: 0,
             sidebar_w: 0,
+            footer_row: 21,
+            layout_end: 0,
         };
         assert_eq!(hit_region(5, 0, h), Region::Outside); // header
         assert_eq!(hit_region(5, 1, h), Region::Content { col: 5, row: 0 });
@@ -5173,6 +5205,8 @@ mod tests {
             tab_files_end: files_end,
             tab_conv_end: files_end + 1 + 20,
             sidebar_w,
+            footer_row: body_top + 20,
+            layout_end: 0,
         }
     }
 
@@ -5186,6 +5220,25 @@ mod tests {
         assert!(app.collapsed_files.contains("a.rs"), "a header click folds");
         app.mouse_down(0, 1);
         assert!(!app.collapsed_files.contains("a.rs"), "and unfolds");
+    }
+
+    #[test]
+    fn clicking_the_layout_indicator_toggles_it() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = multi_file_app(&["a.rs"]);
+        app.mode = Mode::Unified;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let hit = app.hit.get();
+        assert!(hit.layout_end > 0);
+        let before = app.sbs();
+        app.mouse_down(0, hit.footer_row); // the layout indicator
+        assert_ne!(
+            app.sbs(),
+            before,
+            "clicking the indicator toggles the layout"
+        );
     }
 
     #[test]
