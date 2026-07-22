@@ -294,6 +294,16 @@ pub enum CommentAction {
         #[arg(long)]
         json: bool,
     },
+    /// Withdraw a draft comment or thread (drafts only; never published).
+    Rm {
+        #[command(flatten)]
+        target: Target,
+        /// A comment id (removes that draft) or a thread id (removes the thread).
+        id: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// How to select the session a verb acts on.

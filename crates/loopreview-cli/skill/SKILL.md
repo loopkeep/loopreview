@@ -84,12 +84,16 @@ lr session comment add --repo . --file src/app.rs --line 120 \
 lr session comment reply --repo . --thread <id> --body "Good point, updated." --author agent
 lr session comment resolve --repo . --thread <id> --author agent        # local reviews
 lr session comment resolve --repo . --thread <id> --reopen --author agent
+lr session comment rm --repo . <comment-or-thread-id>                    # withdraw a draft
 ```
 
 - `comment add` needs `--file`, `--line`, `--body`, and `--author`; `--side`
   defaults to `new`. The line must be one shown in the current diff.
 - `comment resolve` works on local-review threads (and your own drafts). It
   refuses a published pull-request thread — resolving that is the human's call.
+- `comment rm <id>` withdraws one of your own drafts — pass a comment id (removes
+  that draft, and its thread if it empties) or a thread id (removes the thread).
+  It refuses anything published to GitHub.
 
 ## Waiting for the human
 

@@ -190,6 +190,46 @@ impl Store {
             }
         })
     }
+
+    /// Remove a thread (or a single comment within it) from the working-tree
+    /// review — a targeted deletion, unlike the union [`save`], so a withdrawn
+    /// draft does not come back on the next merge. A thread emptied of comments
+    /// is dropped.
+    pub fn remove(&self, thread_id: &str, comment_id: Option<&str>) -> Result<()> {
+        self.locked_update(|doc| remove_from(&mut doc.review, thread_id, comment_id))
+    }
+
+    /// The same targeted deletion for a pull request's draft set; the key is
+    /// dropped when its last draft goes.
+    pub fn remove_pr_draft(
+        &self,
+        key: &str,
+        thread_id: &str,
+        comment_id: Option<&str>,
+    ) -> Result<()> {
+        self.locked_update(|doc| {
+            if let Some(review) = doc.pr_drafts.get_mut(key) {
+                remove_from(review, thread_id, comment_id);
+                if review.is_empty() {
+                    doc.pr_drafts.remove(key);
+                }
+            }
+        })
+    }
+}
+
+/// Remove `thread_id` (or just `comment_id` within it) from `review`; a thread
+/// left with no comments is dropped.
+fn remove_from(review: &mut Review, thread_id: &str, comment_id: Option<&str>) {
+    match comment_id {
+        Some(cid) => {
+            if let Some(thread) = review.threads.iter_mut().find(|t| t.id == thread_id) {
+                thread.comments.retain(|c| c.id != cid);
+            }
+            review.threads.retain(|t| !t.comments.is_empty());
+        }
+        None => review.threads.retain(|t| t.id != thread_id),
+    }
 }
 
 /// Merge `mine` into `into` by id: an incoming thread replaces the same-id thread

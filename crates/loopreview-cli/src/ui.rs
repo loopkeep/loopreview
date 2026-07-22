@@ -671,6 +671,8 @@ struct App {
     split_min_width: usize,
     /// True while awaiting confirmation to close (delete) the review.
     confirming_close: bool,
+    /// The draft thread index awaiting confirmation to remove, when `d` is armed.
+    confirming_delete: Option<usize>,
     /// An in-progress background load (spinner), for `lr pr`.
     loading: Option<Loading>,
     /// A fatal load error to show instead of the diff.
@@ -788,6 +790,7 @@ impl App {
             conv_scroll: 0,
             split_min_width: 160,
             confirming_close: false,
+            confirming_delete: None,
             loading: None,
             load_error: None,
             job: None,
@@ -1335,6 +1338,18 @@ impl App {
             }
             return;
         }
+        // While confirming a draft delete: y/Enter removes, anything else cancels.
+        if let Some(idx) = self.confirming_delete.take() {
+            if matches!(code, KeyCode::Char('y') | KeyCode::Enter) {
+                if idx < self.review.threads.len() {
+                    self.remove_draft(idx, None);
+                    self.status = Some("draft removed".to_string());
+                }
+            } else {
+                self.status = Some("delete cancelled".to_string());
+            }
+            return;
+        }
         let in_sidebar =
             self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some();
         // Esc cancels a selection, or leaves the sidebar, before it can quit.
@@ -1412,8 +1427,31 @@ impl App {
             Action::ScrollLeft => self.hscroll_by(-HSCROLL_STEP),
             Action::ScrollRight => self.hscroll_by(HSCROLL_STEP),
             Action::Select => self.start_selection(),
+            Action::Delete => self.request_delete(),
             _ => {}
         }
+    }
+
+    /// Arm the delete confirmation for the draft thread the selection points at.
+    fn request_delete(&mut self) {
+        match self.selected_draft_thread() {
+            Some(idx) => self.confirming_delete = Some(idx),
+            None => self.status = Some("no draft thread here to remove".to_string()),
+        }
+    }
+
+    /// The draft thread the selection points at (Conversation: the selected
+    /// thread; Files: the thread at the cursor line), if its root is a draft.
+    fn selected_draft_thread(&self) -> Option<usize> {
+        let idx = if self.view == View::Conversation {
+            self.selected_thread()?
+        } else {
+            self.thread_at_cursor()?
+        };
+        self.review.threads[idx]
+            .root()
+            .is_some_and(|c| c.is_draft())
+            .then_some(idx)
     }
 
     /// Route a key while the comment composer is open.
@@ -2146,6 +2184,7 @@ impl App {
                 }
             }
             Action::CloseReview if self.has_review() => self.confirming_close = true,
+            Action::Delete => self.request_delete(),
             Action::Fold => self.toggle_collapse_conv(),
             // l: a collapsed thread expands; an open one scrolls to its top.
             Action::NavIn => {
@@ -2484,6 +2523,10 @@ impl App {
                 Ok(result) => Reply::Resolve(result),
                 Err(message) => return Response::Error(message),
             },
+            Request::CommentRm(rm) => match self.control_comment_rm(rm) {
+                Ok(result) => Reply::Removed(result),
+                Err(message) => return Response::Error(message),
+            },
         };
         Response::Ok(reply)
     }
@@ -2793,6 +2836,91 @@ impl App {
             thread: resolve.thread,
             resolved,
         })
+    }
+
+    /// Withdraw a draft comment or thread by id (drafts only). A comment id
+    /// removes that draft (and its thread when it empties); a thread id removes
+    /// the whole draft thread. Published comments are refused.
+    fn control_comment_rm(
+        &mut self,
+        rm: protocol::CommentRm,
+    ) -> Result<protocol::RemoveResult, String> {
+        let id = &rm.id;
+        // Resolve the id to a thread, and optionally a comment within it.
+        let (ti, ci) = if let Some(ti) = self.review.threads.iter().position(|t| t.id == *id) {
+            (ti, None)
+        } else if let Some(found) = self.review.threads.iter().enumerate().find_map(|(ti, t)| {
+            t.comments
+                .iter()
+                .position(|c| c.id == *id)
+                .map(|ci| (ti, ci))
+        }) {
+            (found.0, Some(found.1))
+        } else {
+            return Err(format!("no comment or thread {id}"));
+        };
+        // Drafts only — never delete anything published to GitHub.
+        let published = match ci {
+            Some(ci) => self.review.threads[ti].comments[ci].remote_id.is_some(),
+            None => self.review.threads[ti]
+                .comments
+                .iter()
+                .any(|c| c.remote_id.is_some()),
+        };
+        if published {
+            return Err(
+                "only drafts can be removed — published comments stay on GitHub".to_string(),
+            );
+        }
+        let (thread_id, removed_thread) = self.remove_draft(ti, ci);
+        self.status = Some("agent: draft removed".to_string());
+        Ok(protocol::RemoveResult {
+            thread: thread_id,
+            removed_thread,
+        })
+    }
+
+    /// Remove a draft comment `ci` (or the whole thread when `ci` is `None`) from
+    /// memory and the store; returns the thread id and whether the thread went.
+    /// Callers must have checked the target is a draft.
+    fn remove_draft(&mut self, ti: usize, ci: Option<usize>) -> (String, bool) {
+        let thread_id = self.review.threads[ti].id.clone();
+        let comment_id = ci.map(|ci| self.review.threads[ti].comments[ci].id.clone());
+        let removed_thread = match ci {
+            Some(ci) => {
+                self.review.threads[ti].comments.remove(ci);
+                let empty = self.review.threads[ti].comments.is_empty();
+                if empty {
+                    self.review.threads.remove(ti);
+                }
+                empty
+            }
+            None => {
+                self.review.threads.remove(ti);
+                true
+            }
+        };
+        self.store_remove(&thread_id, comment_id.as_deref());
+        self.conv_cursor = self
+            .conv_cursor
+            .min(self.review.threads.len().saturating_sub(1));
+        self.relayout();
+        (thread_id, removed_thread)
+    }
+
+    /// A targeted store deletion (not the union `save`), routed to the working
+    /// tree or the PR draft set.
+    fn store_remove(&self, thread_id: &str, comment_id: Option<&str>) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        if self.pr.is_some() {
+            if let Some(key) = &self.pr_key {
+                let _ = store.remove_pr_draft(key, thread_id, comment_id);
+            }
+        } else {
+            let _ = store.remove(thread_id, comment_id);
+        }
     }
 
     /// Re-clamp the cursor and scroll after a terminal resize. A resize can flip
@@ -3357,6 +3485,9 @@ impl App {
         if self.confirming_close {
             self.draw_close_confirm(f);
         }
+        if self.confirming_delete.is_some() {
+            self.draw_delete_confirm(f);
+        }
         if let Some(job) = &self.job {
             self.draw_job(f, job);
         }
@@ -3523,6 +3654,39 @@ impl App {
         };
         let lines = vec![
             TextLine::from(TextSpan::styled(prompt, Style::default().fg(Color::White))),
+            TextLine::from(""),
+            TextLine::from(TextSpan::styled(
+                "y / Enter confirm · any other key cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// The confirmation modal for withdrawing a draft thread with `d`.
+    fn draw_delete_confirm(&self, f: &mut Frame) {
+        let Some(idx) = self.confirming_delete else {
+            return;
+        };
+        let area = centered_rect(60, 22, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Remove draft? ")
+            .border_style(Style::default().fg(Color::Yellow));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let label = self
+            .review
+            .threads
+            .get(idx)
+            .map(|t| anchor_label(&t.anchor))
+            .unwrap_or_default();
+        let lines = vec![
+            TextLine::from(TextSpan::styled(
+                format!("Withdraw your draft thread on {label}?"),
+                Style::default().fg(Color::White),
+            )),
             TextLine::from(""),
             TextLine::from(TextSpan::styled(
                 "y / Enter confirm · any other key cancel",
@@ -5728,6 +5892,76 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
         assert_eq!(app.events.latest_seq(), before + 1, "a Comment event fired");
+    }
+
+    #[test]
+    fn control_comment_rm_removes_a_draft_thread() {
+        let mut app = sample_app();
+        let add = app.handle_control(Request::CommentAdd(protocol::CommentAdd {
+            file: "a.rs".into(),
+            side: Side::New,
+            line: 2,
+            body: "note".into(),
+            author: "agent".into(),
+        }));
+        let thread_id = match add {
+            Response::Ok(Reply::Comment(r)) => r.thread,
+            other => panic!("unexpected: {other:?}"),
+        };
+        assert_eq!(app.review.threads.len(), 1);
+        match app.handle_control(Request::CommentRm(protocol::CommentRm {
+            id: thread_id.clone(),
+        })) {
+            Response::Ok(Reply::Removed(r)) => {
+                assert!(r.removed_thread);
+                assert_eq!(r.thread, thread_id);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(app.review.threads.len(), 0, "the draft thread is gone");
+    }
+
+    #[test]
+    fn control_comment_rm_refuses_a_published_comment() {
+        let mut app = sample_app();
+        app.review.threads.push(Thread {
+            id: "t".into(),
+            anchor: Anchor::line("a.rs", Side::New, 1),
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: "c".into(),
+                author: "reviewer".into(),
+                body: "b".into(),
+                created_at: 0,
+                remote_id: Some("PRRC_1".into()),
+            }],
+        });
+        app.relayout();
+        match app.handle_control(Request::CommentRm(protocol::CommentRm { id: "t".into() })) {
+            Response::Error(msg) => assert!(msg.contains("drafts"), "friendly refusal: {msg}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert_eq!(app.review.threads.len(), 1, "a published thread stays");
+    }
+
+    #[test]
+    fn tui_d_removes_a_draft_thread_after_confirm() {
+        let mut app = sample_app();
+        let _ = app.handle_control(Request::CommentAdd(protocol::CommentAdd {
+            file: "a.rs".into(),
+            side: Side::New,
+            line: 2,
+            body: "note".into(),
+            author: "me".into(),
+        }));
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        // d arms the confirmation; y removes.
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(app.confirming_delete.is_some(), "d arms the delete confirm");
+        app.on_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.confirming_delete.is_none());
+        assert_eq!(app.review.threads.len(), 0, "the draft was removed");
     }
 
     #[test]

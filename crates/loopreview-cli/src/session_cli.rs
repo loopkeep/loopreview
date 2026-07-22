@@ -261,6 +261,26 @@ fn comment(action: CommentAction) -> Result<()> {
                 Ok(())
             }
         }
+        CommentAction::Rm { target, id, json } => {
+            let request = Request::CommentRm(protocol::CommentRm { id });
+            let Reply::Removed(result) = call(&target, request)? else {
+                bail!("unexpected reply");
+            };
+            if json {
+                emit(&result)
+            } else {
+                println!(
+                    "removed {} from thread {}",
+                    if result.removed_thread {
+                        "the thread"
+                    } else {
+                        "the comment"
+                    },
+                    result.thread
+                );
+                Ok(())
+            }
+        }
         CommentAction::List { target, json } => {
             let Reply::Threads { threads } = call(&target, Request::CommentList)? else {
                 bail!("unexpected reply");

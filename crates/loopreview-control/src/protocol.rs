@@ -45,6 +45,8 @@ pub enum Request {
     CommentReply(CommentReply),
     /// Resolve or reopen a thread (local reviews only).
     CommentResolve(CommentResolve),
+    /// Withdraw a draft comment or thread (drafts only, never published).
+    CommentRm(CommentRm),
     /// List the review's threads.
     CommentList,
     /// Block until a matching event occurs, or a timeout elapses.
@@ -105,6 +107,14 @@ pub struct CommentResolve {
     pub author: String,
 }
 
+/// Withdraw a draft comment or thread by id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommentRm {
+    /// A comment id (removes that draft, and its thread if it becomes empty) or a
+    /// thread id (removes the whole draft thread).
+    pub id: String,
+}
+
 /// Wait for review events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Wait {
@@ -150,6 +160,8 @@ pub enum Reply {
     Comment(CommentResult),
     /// Answer to [`Request::CommentResolve`].
     Resolve(ResolveResult),
+    /// Answer to [`Request::CommentRm`].
+    Removed(RemoveResult),
     /// Answer to [`Request::CommentList`]. A struct variant (not a newtype over
     /// the `Vec`) because an internally-tagged enum cannot serialize a newtype
     /// variant wrapping a sequence.
@@ -354,6 +366,15 @@ pub struct ResolveResult {
     pub resolved: bool,
 }
 
+/// The outcome of a [`Request::CommentRm`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveResult {
+    /// The thread the removed item belonged to.
+    pub thread: String,
+    /// True when the whole thread was removed (not just one comment).
+    pub removed_thread: bool,
+}
+
 /// The outcome of a [`Request::Wait`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitResult {
@@ -452,6 +473,7 @@ mod tests {
                 resolved: true,
                 author: "agent".into(),
             }),
+            Request::CommentRm(CommentRm { id: "c1".into() }),
             Request::CommentList,
             Request::Wait(Wait {
                 events: vec![EventKind::Reply, EventKind::Resolve],
@@ -566,6 +588,10 @@ mod tests {
             Reply::Resolve(ResolveResult {
                 thread: "t1".into(),
                 resolved: true,
+            }),
+            Reply::Removed(RemoveResult {
+                thread: "t1".into(),
+                removed_thread: true,
             }),
             Reply::Threads {
                 threads: vec![thread],
