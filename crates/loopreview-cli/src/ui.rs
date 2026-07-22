@@ -60,6 +60,9 @@ const CURSOR_BG: Color = Color::Rgb(38, 43, 56);
 /// The line cursor when the body is the inactive pane (sidebar focused): a
 /// faint fill so it reads as "not the active target".
 const CURSOR_DIM_BG: Color = Color::Rgb(30, 33, 42);
+/// Faint full-width band behind every file header (even without the cursor), so
+/// headers read as list dividers and inter-file blank lines can be dropped.
+const HEADER_BG: Color = Color::Rgb(28, 31, 40);
 /// Background of the file header the cursor rests on — brighter than a content
 /// line's cursor, since headers are the diff's few anchors and must stand out.
 const HEADER_CURSOR_BG: Color = Color::Rgb(54, 64, 92);
@@ -3729,7 +3732,8 @@ impl App {
             };
             Style::default().bg(bg).add_modifier(Modifier::BOLD)
         } else {
-            Style::default()
+            // A faint band on every header (right_aligned_row fills it full width).
+            Style::default().bg(HEADER_BG)
         };
         let marker = if is_cursor { "▎" } else { " " };
         let marker_fg = if is_cursor && dim {
@@ -4835,8 +4839,13 @@ impl Layouts {
         let mut cursor_of: Vec<Vec<usize>> = Vec::with_capacity(diff.files.len());
         let mut max_lineno = 0u32;
 
+        // A blank line separates a file's content from the next header, but
+        // collapsed headers (no content below them) stack directly — the band
+        // on each header carries the separation. So a spacer is inserted only
+        // after a file that showed content.
+        let mut prev_had_content = false;
         for (fi, file) in diff.files.iter().enumerate() {
-            if fi > 0 {
+            if fi > 0 && prev_had_content {
                 urows.push(URow::Spacer);
             }
             let header_row = urows.len();
@@ -4852,6 +4861,9 @@ impl Layouts {
             line_urow.push(header_row);
             clines.push((fi, HEADER));
 
+            // Whether this file shows any rows below its header (drives the
+            // spacer before the next one); only a collapsed file shows none.
+            prev_had_content = true;
             if file.binary {
                 urows.push(URow::Note("binary file — contents not shown".to_string()));
             } else if file.hunks.is_empty() {
@@ -4862,6 +4874,7 @@ impl Layouts {
             } else if collapsed {
                 // A collapsed file shows only its header — no content rows (so
                 // highlighting is skipped) and no line cursor stops.
+                prev_had_content = false;
                 for (hi, hunk) in file.hunks.iter().enumerate() {
                     for li in 0..hunk.lines.len() {
                         flat.push((hi, li));
@@ -4910,11 +4923,14 @@ impl Layouts {
             cursor_of.push(cof);
         }
 
-        // Side-by-side pass, using cursor_of to point each line at its row.
+        // Side-by-side pass, using cursor_of to point each line at its row. The
+        // same spacer rule as the unified pass: a blank line only after a file
+        // that showed content, so collapsed headers stack.
         let mut srows = Vec::new();
         let mut line_srow = vec![0usize; clines.len()];
+        let mut prev_had_content = false;
         for (fi, file) in diff.files.iter().enumerate() {
-            if fi > 0 {
+            if fi > 0 && prev_had_content {
                 srows.push(SRow::Spacer);
             }
             let header_srow = srows.len();
@@ -4924,6 +4940,7 @@ impl Layouts {
                 line_srow[header_cline] = header_srow;
             }
             let collapsed = collapsed_files.contains(file.display_path());
+            prev_had_content = true;
             if file.binary {
                 srows.push(SRow::Note("binary file — contents not shown".to_string()));
             } else if file.hunks.is_empty() {
@@ -4933,6 +4950,7 @@ impl Layouts {
                 )));
             } else if collapsed {
                 // Header only (already mapped above).
+                prev_had_content = false;
             } else {
                 let file_threads = thread_at.get(file.display_path());
                 let mut flat_counter = 0usize;
@@ -5524,6 +5542,111 @@ mod tests {
                 .count(),
             2,
             "content rows return when expanded"
+        );
+    }
+
+    #[test]
+    fn collapsed_headers_stack_without_blank_lines() {
+        let mut app = multi_file_app(&["a.rs", "b.rs", "c.rs"]);
+        app.mode = Mode::Unified;
+        for p in ["a.rs", "b.rs", "c.rs"] {
+            app.collapsed_files.insert(p.into());
+        }
+        app.relayout();
+        let spacers = app
+            .urows
+            .iter()
+            .filter(|r| matches!(r, URow::Spacer))
+            .count();
+        assert_eq!(
+            spacers, 0,
+            "collapsed headers stack directly, no blank lines"
+        );
+        assert_eq!(app.urows.len(), 3, "exactly the three header rows");
+    }
+
+    #[test]
+    fn a_blank_line_only_follows_a_file_with_content() {
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        app.mode = Mode::Unified;
+        // a expanded, b collapsed: one spacer after a's content, before b.
+        app.collapsed_files.insert("b.rs".into());
+        app.relayout();
+        assert_eq!(
+            app.urows
+                .iter()
+                .filter(|r| matches!(r, URow::Spacer))
+                .count(),
+            1,
+            "a blank line separates the expanded file from the next header"
+        );
+        // Collapse a too: now no spacer between the two stacked headers.
+        app.collapsed_files.insert("a.rs".into());
+        app.relayout();
+        assert_eq!(
+            app.urows
+                .iter()
+                .filter(|r| matches!(r, URow::Spacer))
+                .count(),
+            0,
+        );
+    }
+
+    #[test]
+    fn file_headers_render_as_full_width_bands() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        app.mode = Mode::Unified;
+        app.sidebar_override = Some(false); // no frame; the header spans col 0..width
+        app.cursor = 0; // a.rs header is the cursor; b.rs header is not
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let row_of = |needle: &str| -> u16 {
+            for y in 0..24u16 {
+                let text: String = (0..80u16).map(|x| buf[(x, y)].symbol()).collect();
+                if text.contains(needle) {
+                    return y;
+                }
+            }
+            panic!("row with {needle:?} rendered");
+        };
+        let a_row = row_of("a.rs");
+        let b_row = row_of("b.rs");
+        // The cursored header is a strong band spanning the full width.
+        assert_eq!(buf[(0, a_row)].bg, HEADER_CURSOR_BG);
+        assert_eq!(
+            buf[(79, a_row)].bg,
+            HEADER_CURSOR_BG,
+            "band spans full width"
+        );
+        // The non-cursor header still gets a faint full-width band.
+        assert_eq!(buf[(0, b_row)].bg, HEADER_BG);
+        assert_eq!(
+            buf[(79, b_row)].bg,
+            HEADER_BG,
+            "faint band spans full width"
+        );
+        assert_ne!(HEADER_BG, HEADER_CURSOR_BG);
+    }
+
+    #[test]
+    fn clicking_a_stacked_header_maps_to_its_file() {
+        let mut app = multi_file_app(&["a.rs", "b.rs", "c.rs"]);
+        app.mode = Mode::Unified;
+        app.sidebar_override = Some(false);
+        for p in ["a.rs", "b.rs", "c.rs"] {
+            app.collapsed_files.insert(p.into());
+        }
+        app.relayout();
+        // Headers stack at body rows 0,1,2 (no spacers). Click the third.
+        app.hit.set(hit(1, 0, None, 0)); // body starts at screen row 1, no sidebar
+        app.mouse_down(0, 3); // screen row 3 = body row 2 = c.rs header
+        assert_eq!(
+            app.current_file(),
+            2,
+            "the compressed layout keeps click-to-row correct"
         );
     }
 
