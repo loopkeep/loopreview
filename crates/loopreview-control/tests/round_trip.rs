@@ -40,9 +40,8 @@ fn serve_one(socket: String, session_id: String) {
 
 #[test]
 fn client_handshake_and_get_over_a_socket() {
-    let dir = std::env::temp_dir();
     let id = format!("it-{}", std::process::id());
-    let socket = transport::socket_id(&dir, &id);
+    let socket = transport::socket_id(&id);
     serve_one(socket.clone(), id.clone());
 
     // The listener thread may need a beat to bind before we connect.

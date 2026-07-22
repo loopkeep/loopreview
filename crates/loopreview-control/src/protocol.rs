@@ -150,8 +150,13 @@ pub enum Reply {
     Comment(CommentResult),
     /// Answer to [`Request::CommentResolve`].
     Resolve(ResolveResult),
-    /// Answer to [`Request::CommentList`].
-    Threads(Vec<ThreadInfo>),
+    /// Answer to [`Request::CommentList`]. A struct variant (not a newtype over
+    /// the `Vec`) because an internally-tagged enum cannot serialize a newtype
+    /// variant wrapping a sequence.
+    Threads {
+        /// The review's threads.
+        threads: Vec<ThreadInfo>,
+    },
     /// Answer to [`Request::Wait`].
     Wait(WaitResult),
 }
@@ -470,6 +475,106 @@ mod tests {
         assert_eq!(round_trip(&ok), ok);
         let err = Response::Error("no such thread".into());
         assert_eq!(round_trip(&err), err);
+    }
+
+    /// Every `Reply` variant must serialize: the internal `reply` tag rules out
+    /// newtype variants wrapping a sequence, so each is exercised here.
+    #[test]
+    fn every_reply_variant_serializes() {
+        let anchor = AnchorInfo {
+            kind: "line".into(),
+            file: Some("a.rs".into()),
+            side: Some(Side::New),
+            start: Some(1),
+            end: Some(1),
+        };
+        let thread = ThreadInfo {
+            id: "t1".into(),
+            anchor: anchor.clone(),
+            state: "open".into(),
+            outdated: false,
+            comments: vec![CommentInfo {
+                id: "c1".into(),
+                author: "agent".into(),
+                body: "hi".into(),
+                created_at: 1,
+                draft: true,
+            }],
+        };
+        let replies = [
+            Reply::Hello(Hello {
+                protocol: 1,
+                session: "s".into(),
+            }),
+            Reply::Session(SessionInfo {
+                id: "s".into(),
+                pid: 1,
+                repo: None,
+                source: "working tree".into(),
+            }),
+            Reply::Context(ContextInfo {
+                view: "files".into(),
+                file: Some("a.rs".into()),
+                side: Some(Side::New),
+                line: Some(1),
+                thread: None,
+                event_seq: 0,
+            }),
+            Reply::Review(ReviewInfo {
+                source: "working tree".into(),
+                base: None,
+                head: None,
+                files: vec![FileInfo {
+                    path: "a.rs".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    binary: false,
+                    added: 1,
+                    removed: 0,
+                    hunks: vec![HunkInfo {
+                        header: "@@ -1 +1 @@".into(),
+                        old_start: 1,
+                        old_lines: 1,
+                        new_start: 1,
+                        new_lines: 1,
+                        section: None,
+                        lines: Some(vec![LineInfo {
+                            kind: "addition".into(),
+                            old: None,
+                            new: Some(1),
+                            text: "x".into(),
+                        }]),
+                    }],
+                }],
+                threads: vec![thread.clone()],
+            }),
+            Reply::Navigate(NavigateResult {
+                moved: true,
+                file: Some("a.rs".into()),
+                line: Some(1),
+            }),
+            Reply::Reload(ReloadResult { started: false }),
+            Reply::Comment(CommentResult {
+                thread: "t1".into(),
+                comment: "c2".into(),
+                draft: true,
+            }),
+            Reply::Resolve(ResolveResult {
+                thread: "t1".into(),
+                resolved: true,
+            }),
+            Reply::Threads {
+                threads: vec![thread],
+            },
+            Reply::Wait(WaitResult {
+                event: None,
+                event_seq: 0,
+            }),
+        ];
+        for reply in replies {
+            let response = Response::Ok(reply);
+            assert_eq!(round_trip(&response), response);
+        }
     }
 
     #[test]

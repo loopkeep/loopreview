@@ -9,7 +9,6 @@
 //! [`Connection`].
 
 use std::io::{self, BufRead, BufReader};
-use std::path::Path;
 
 use interprocess::local_socket::traits::{ListenerExt, Stream as _};
 #[cfg(not(windows))]
@@ -25,21 +24,32 @@ use crate::error::{ControlError, Result};
 /// A local-socket listener that accepts control connections.
 pub type Listener = interprocess::local_socket::Listener;
 
-/// The socket identifier to store for a session with `id`, resolved under
-/// `sessions_dir`. On Unix this is a filesystem path; on Windows a namespaced
-/// pipe name (the directory only scopes the Unix path).
-pub fn socket_id(sessions_dir: &Path, id: &str) -> String {
+/// The socket identifier to store for a session with `id`.
+///
+/// On Windows this is a namespaced pipe name. On Unix it is a filesystem path,
+/// placed in the temp directory rather than the (possibly deeply nested) config
+/// directory: a Unix domain socket path must fit in `sun_path` (about 104 bytes
+/// on macOS, 108 on Linux), which a long `$HOME`/`$XDG_CONFIG_HOME` would blow
+/// past. The registry record carries this path, so the socket's location is
+/// independent of where the record lives. A pathologically long temp dir falls
+/// back to `/tmp`.
+pub fn socket_id(id: &str) -> String {
     #[cfg(windows)]
     {
-        let _ = sessions_dir;
         format!("loopreview-{id}.sock")
     }
     #[cfg(not(windows))]
     {
-        sessions_dir
-            .join(format!("{id}.sock"))
-            .to_string_lossy()
-            .into_owned()
+        let name = format!("loopreview-{id}.sock");
+        let path = std::env::temp_dir().join(&name);
+        if path.as_os_str().len() < 100 {
+            path.to_string_lossy().into_owned()
+        } else {
+            std::path::Path::new("/tmp")
+                .join(&name)
+                .to_string_lossy()
+                .into_owned()
+        }
     }
 }
 
