@@ -11,6 +11,7 @@ mod ui;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
@@ -20,6 +21,9 @@ use loopreview_core::{
 };
 
 use cli::{Action, Cli};
+
+/// A diff source usable from the watch thread.
+type SharedSource = Arc<dyn DiffSource + Send + Sync>;
 
 /// Entry point shared by both binaries: run loopreview, mapping any error to a
 /// non-zero exit code after printing it.
@@ -35,7 +39,7 @@ pub fn run() -> ExitCode {
 
 fn try_run() -> Result<()> {
     // clap handles `--help` / `--version` (printing and exiting) before this.
-    let action = Cli::parse().action();
+    let (action, no_watch) = Cli::parse().resolve();
 
     // A reserved verb is a usage error; report it regardless of the terminal.
     if let Action::NotYet(message) = action {
@@ -51,46 +55,48 @@ fn try_run() -> Result<()> {
         );
     }
 
-    let source = build_source(action)?;
+    let (source, live) = build_source(action)?;
     let label = source.describe();
     let diff = source
         .load()
         .with_context(|| format!("loading diff ({label})"))?;
 
-    if diff.is_empty() {
+    // Live sources (working tree, ref) auto-refresh unless disabled. A watched
+    // session opens even when currently empty so changes appear as they land.
+    let watch = live && !no_watch;
+    if !watch && diff.is_empty() {
         println!("No changes to review.");
         return Ok(());
     }
 
-    ui::run(label, diff)
+    ui::run(label, diff, source, watch)
 }
 
-/// Choose the diff source from the resolved action and the environment.
-fn build_source(action: Action) -> Result<Box<dyn DiffSource>> {
+/// Choose the diff source from the resolved action and the environment, and
+/// report whether it is a live source (one worth watching).
+fn build_source(action: Action) -> Result<(SharedSource, bool)> {
     match action {
         // Bare `lr`: a piped patch when stdin is redirected, else the worktree.
         Action::Dispatch => {
             if io::stdin().is_terminal() {
-                Ok(Box::new(WorktreeSource::new(repo_root()?)))
+                Ok((Arc::new(WorktreeSource::new(repo_root()?)), true))
             } else {
-                Ok(Box::new(StdinPatchSource::new()))
+                Ok((Arc::new(StdinPatchSource::new()), false))
             }
         }
         Action::Worktree { staged, pathspec } => {
             reject_piped_stdin_for_diff()?;
-            Ok(Box::new(
-                WorktreeSource::new(repo_root()?)
-                    .staged(staged)
-                    .pathspec(pathspec),
-            ))
+            let source = WorktreeSource::new(repo_root()?)
+                .staged(staged)
+                .pathspec(pathspec);
+            Ok((Arc::new(source), true))
         }
         Action::Ref { target, pathspec } => {
             reject_piped_stdin_for_diff()?;
-            Ok(Box::new(
-                RefSource::new(repo_root()?, target).pathspec(pathspec),
-            ))
+            let source = RefSource::new(repo_root()?, target).pathspec(pathspec);
+            Ok((Arc::new(source), true))
         }
-        Action::PatchFile(path) => Ok(Box::new(FilePatchSource::new(path))),
+        Action::PatchFile(path) => Ok((Arc::new(FilePatchSource::new(path)), false)),
         Action::PatchStdin => {
             if io::stdin().is_terminal() {
                 bail!(
@@ -98,7 +104,7 @@ fn build_source(action: Action) -> Result<Box<dyn DiffSource>> {
                      (`git diff | lr patch`)."
                 );
             }
-            Ok(Box::new(StdinPatchSource::new()))
+            Ok((Arc::new(StdinPatchSource::new()), false))
         }
         // Handled in try_run before the terminal is touched.
         Action::NotYet(_) => unreachable!("reserved verbs are reported earlier"),

@@ -24,6 +24,9 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Do not auto-refresh a live diff as the working tree changes.
+    #[arg(long, global = true)]
+    no_watch: bool,
 }
 
 /// The subcommands loopreview accepts.
@@ -99,6 +102,12 @@ pub enum Action {
 }
 
 impl Cli {
+    /// Resolve into an [`Action`] and whether watching is disabled.
+    pub fn resolve(self) -> (Action, bool) {
+        let no_watch = self.no_watch;
+        (self.action(), no_watch)
+    }
+
     /// Resolve the parsed command line into an [`Action`].
     pub fn action(self) -> Action {
         match self.command {
@@ -185,6 +194,17 @@ mod tests {
             Action::PatchFile(PathBuf::from("changes.diff"))
         );
         assert_eq!(action_of(&["lr", "patch"]), Action::PatchStdin);
+    }
+
+    #[test]
+    fn no_watch_is_a_global_flag() {
+        let (action, no_watch) = Cli::parse_from(["lr", "--no-watch"]).resolve();
+        assert_eq!(action, Action::Dispatch);
+        assert!(no_watch);
+        let (_, no_watch) = Cli::parse_from(["lr", "diff", "--no-watch"]).resolve();
+        assert!(no_watch);
+        let (_, no_watch) = Cli::parse_from(["lr", "diff"]).resolve();
+        assert!(!no_watch);
     }
 
     #[test]

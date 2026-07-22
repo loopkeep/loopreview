@@ -8,6 +8,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
@@ -21,7 +25,7 @@ use ratatui::text::{Line as TextLine, Span as TextSpan};
 use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 
-use loopreview_core::{Diff, LineKind, Segment, word_diff};
+use loopreview_core::{Diff, DiffSource, LineKind, Segment, word_diff};
 
 use crate::highlight::{Highlighter, Span as HlSpan};
 
@@ -42,6 +46,8 @@ const BAR_BG: Color = Color::Rgb(30, 33, 40);
 const SCROLLOFF: usize = 3;
 /// How often the event loop wakes to repaint when idle.
 const POLL_MS: u64 = 200;
+/// How often a watched source is reloaded to pick up changes.
+const WATCH_POLL_MS: u64 = 500;
 /// At or above this body width, `auto` layout chooses side-by-side.
 const AUTO_SBS_MIN_WIDTH: usize = 160;
 
@@ -55,16 +61,42 @@ enum Mode {
 }
 
 /// Enter the alternate screen, run the review UI over `diff`, then restore the
-/// terminal. `label` describes the diff's source (shown in the header).
-pub fn run(label: String, diff: Diff) -> Result<()> {
+/// terminal. `label` describes the diff's source (shown in the header). When
+/// `watch`, `source` is reloaded in the background so the view tracks changes.
+pub fn run(
+    label: String,
+    diff: Diff,
+    source: Arc<dyn DiffSource + Send + Sync>,
+    watch: bool,
+) -> Result<()> {
     let mut app = App::new(label, diff, Highlighter::new());
+    let updates = watch.then(|| spawn_watcher(source));
+
     let mut terminal = ratatui::init();
     // Mouse capture is best-effort: the UI is fully usable without it.
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
-    let result = app.event_loop(&mut terminal);
+    let result = app.event_loop(&mut terminal, updates);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
+}
+
+/// Spawn a thread that reloads `source` on an interval and streams fresh diffs.
+/// It stops when the receiver is dropped (the UI exits). Load errors are
+/// ignored so a transient failure keeps the last good view.
+fn spawn_watcher(source: Arc<dyn DiffSource + Send + Sync>) -> Receiver<Diff> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_millis(WATCH_POLL_MS));
+            if let Ok(diff) = source.load()
+                && tx.send(diff).is_err()
+            {
+                break;
+            }
+        }
+    });
+    rx
 }
 
 /// A row in the unified layout.
@@ -88,6 +120,14 @@ enum SRow {
         new: Option<usize>,
     },
     Spacer,
+}
+
+/// A relocatable cursor position: a file path and a line number on one side.
+/// Used to keep the cursor on the same line across a watch reload.
+struct Anchor {
+    path: String,
+    new_side: bool,
+    line: u32,
 }
 
 /// Cached render data for one file, aligned to that file's flat line list.
@@ -170,10 +210,27 @@ impl App {
 
     // -- event loop -------------------------------------------------------
 
-    fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+    fn event_loop(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        updates: Option<Receiver<Diff>>,
+    ) -> Result<()> {
         while !self.quit {
+            // Apply the newest watched diff, if it differs from what we show.
+            if let Some(rx) = &updates {
+                let mut latest = None;
+                while let Ok(diff) = rx.try_recv() {
+                    latest = Some(diff);
+                }
+                if let Some(diff) = latest
+                    && diff != self.diff
+                {
+                    self.reload(diff);
+                }
+            }
+
             terminal.draw(|f| self.draw(f))?;
-            if event::poll(std::time::Duration::from_millis(POLL_MS))? {
+            if event::poll(Duration::from_millis(POLL_MS))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         self.on_key(key.code, key.modifiers);
@@ -184,6 +241,75 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Replace the diff with a freshly-loaded one, rebuilding the layout and
+    /// keeping the cursor on the same line when it still exists.
+    fn reload(&mut self, diff: Diff) {
+        let anchor = self.current_anchor();
+        let layout = Layouts::build(&diff);
+        self.num_width = digits(layout.max_lineno).max(3);
+        self.cline_index = layout
+            .clines
+            .iter()
+            .enumerate()
+            .map(|(i, &pair)| (pair, i))
+            .collect();
+        self.render = RefCell::new(Vec::from_iter((0..diff.files.len()).map(|_| None)));
+        self.urows = layout.urows;
+        self.line_urow = layout.line_urow;
+        self.srows = layout.srows;
+        self.line_srow = layout.line_srow;
+        self.clines = layout.clines;
+        self.file_first = layout.file_first;
+        self.hunk_first = layout.hunk_first;
+        self.flats = layout.flats;
+        self.diff = diff;
+
+        self.cursor = anchor
+            .and_then(|a| self.find_anchor(&a))
+            .unwrap_or(0)
+            .min(self.clines.len().saturating_sub(1));
+        self.scroll = self.scroll.min(self.rows_len().saturating_sub(1));
+        self.follow_cursor();
+    }
+
+    /// The cursor's current line as a relocatable anchor.
+    fn current_anchor(&self) -> Option<Anchor> {
+        if self.clines.is_empty() {
+            return None;
+        }
+        let (file, flat) = self.clines[self.cursor];
+        let (hi, li) = self.flats[file][flat];
+        let line = &self.diff.files[file].hunks[hi].lines[li];
+        let new_side = line.kind != LineKind::Deletion;
+        let number = if new_side {
+            line.new_lineno
+        } else {
+            line.old_lineno
+        }?;
+        Some(Anchor {
+            path: self.diff.files[file].display_path().to_string(),
+            new_side,
+            line: number,
+        })
+    }
+
+    /// Find the cursor index of `anchor` in the current diff, if present.
+    fn find_anchor(&self, anchor: &Anchor) -> Option<usize> {
+        self.clines.iter().position(|&(file, flat)| {
+            let (hi, li) = self.flats[file][flat];
+            let line = &self.diff.files[file].hunks[hi].lines[li];
+            let new_side = line.kind != LineKind::Deletion;
+            let number = if new_side {
+                line.new_lineno
+            } else {
+                line.old_lineno
+            };
+            new_side == anchor.new_side
+                && number == Some(anchor.line)
+                && self.diff.files[file].display_path() == anchor.path
+        })
     }
 
     fn on_key(&mut self, code: KeyCode, mods: KeyModifiers) {
