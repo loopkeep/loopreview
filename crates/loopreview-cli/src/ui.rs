@@ -2243,6 +2243,44 @@ impl App {
         self.conv_blocks.iter().map(|b| b.len() + 1).sum()
     }
 
+    /// Map a Conversation body row to the thread there and whether the row is the
+    /// thread's header line (its block's first line) — for click routing.
+    fn conv_hit(&self, body_row: usize) -> Option<(usize, bool)> {
+        if body_row >= self.body_height.get() {
+            return None;
+        }
+        let line = self.conv_scroll + body_row;
+        let mut start = 0;
+        for (pos, &ti) in self.conv_order.iter().enumerate() {
+            let len = self.conv_blocks[ti].len();
+            if line >= start && line < start + len {
+                return Some((pos, line == start));
+            }
+            start += len + 1; // the block plus its trailing spacer
+        }
+        None
+    }
+
+    /// The thread whose inline comment header sits at Files body `row` (the first
+    /// line of its comment block), for a fold-toggle click.
+    fn comment_header_at(&self, body_row: usize) -> Option<usize> {
+        if body_row >= self.body_height.get() {
+            return None;
+        }
+        let i = self.scroll + body_row;
+        if self.sbs() {
+            match self.srows.get(i) {
+                Some(SRow::Comment(t, 0)) => Some(*t),
+                _ => None,
+            }
+        } else {
+            match self.urows.get(i) {
+                Some(URow::Comment(t, 0)) => Some(*t),
+                _ => None,
+            }
+        }
+    }
+
     fn conv_max_scroll(&self) -> usize {
         let height = self.body_height.get().max(1);
         self.conv_total_lines().saturating_sub(height)
@@ -2883,6 +2921,25 @@ impl App {
                 }
             }
             Region::Content { col, row } => {
+                // Conversation: a thread header toggles its fold (and selects);
+                // a body line just selects.
+                if self.view == View::Conversation {
+                    if let Some((pos, is_header)) = self.conv_hit(row) {
+                        self.set_conv(pos);
+                        if is_header && let Some(t) = self.selected_thread() {
+                            let id = self.review.threads[t].id.clone();
+                            self.toggle_collapse(id);
+                        }
+                    }
+                    return;
+                }
+                // Files: an inline comment header toggles that thread's fold,
+                // distinct from a diff-line click (which moves the cursor).
+                if let Some(t) = self.comment_header_at(row) {
+                    let id = self.review.threads[t].id.clone();
+                    self.toggle_collapse(id);
+                    return;
+                }
                 if let Some(cursor) = self.cline_at_body(col, row) {
                     if self.clines[cursor].1 == HEADER {
                         // A header click folds/unfolds the file.
@@ -6328,6 +6385,71 @@ mod tests {
             "a thread-index click selects that thread"
         );
         assert_eq!(app.focus, Focus::Body);
+    }
+
+    #[test]
+    fn conversation_clicks_toggle_headers_and_select_bodies() {
+        let mut app = app_with_threads();
+        app.view = View::Conversation;
+        app.body_height.set(40);
+        app.hit.set(hit(1, 0, None, 0)); // no sidebar; body starts at screen row 1
+        let id0 = app.review.threads[app.conv_order[0]].id.clone();
+        assert!(!app.collapsed.contains(&id0));
+
+        // A body-line click (conv line 1, inside the open first block) selects
+        // the thread but does not fold it.
+        app.conv_cursor = 1;
+        app.mouse_down(2, 2); // body row 1 = conv line 1
+        assert_eq!(app.conv_cursor, 0, "a body click selects the thread");
+        assert!(!app.collapsed.contains(&id0), "a body click does not fold");
+
+        // A header click (conv line 0) folds the thread; clicking again expands.
+        app.mouse_down(2, 1);
+        assert!(
+            app.collapsed.contains(&id0),
+            "a header click folds the thread"
+        );
+        app.mouse_down(2, 1);
+        assert!(
+            !app.collapsed.contains(&id0),
+            "a header click again expands"
+        );
+    }
+
+    #[test]
+    fn files_inline_comment_header_click_toggles_fold() {
+        let mut app = sample_app();
+        app.mode = Mode::Unified;
+        app.sidebar_override = Some(false);
+        app.review.threads.push(thread_on("a.rs", 2, "alice", 1));
+        app.relayout();
+        app.body_height.set(40);
+        app.scroll = 0;
+        app.hit.set(hit(1, 0, None, 0));
+        let hdr = app
+            .urows
+            .iter()
+            .position(|r| matches!(r, URow::Comment(0, 0)))
+            .expect("an inline comment header row");
+        // The header row hit-tests as a comment header; a diff line does not.
+        assert_eq!(app.comment_header_at(hdr), Some(0));
+        let line_row = app
+            .urows
+            .iter()
+            .position(|r| matches!(r, URow::Line { .. }))
+            .expect("a diff line row");
+        assert_eq!(
+            app.comment_header_at(line_row),
+            None,
+            "a diff line is not a header"
+        );
+        // Clicking the header folds the thread.
+        let id = app.review.threads[0].id.clone();
+        app.mouse_down(2, (1 + hdr) as u16);
+        assert!(
+            app.collapsed.contains(&id),
+            "clicking the inline comment header folds the thread"
+        );
     }
 
     #[test]
