@@ -1,41 +1,207 @@
 # loopreview
 
-loopreview (`lr`) is a review-first diff viewer for the terminal. It opens a
-diff in an interactive TUI so you can read changes hunk by hunk, with syntax
-highlighting, intra-line emphasis of exactly what changed, and unified or
-side-by-side layout (chosen automatically by width). With no arguments it shows
-the working tree; `lr diff <target>` compares git refs; `lr patch` reviews a
-saved or piped patch.
+**Preview the loop, review the change.**
+
+_A review-first diff TUI for the agent era._
+
+loopreview (`lr`) is where a human inspects, comments on, and signs off the
+output of an agent loop — a worktree full of changes, or a pull request. It opens
+a diff in an interactive terminal UI built for reading: hunk by hunk, with syntax
+highlighting, word-level emphasis of exactly what changed, and unified or
+side-by-side layout. Leave inline comments and threads on a local review, or pull
+a GitHub pull request into the same TUI — comments, replies, resolve, and submit
+included — without checking anything out. And because reviewing agent work means
+an agent is often on the other side, loopreview exposes a control plane so an
+agent can read the diff, steer your view, and leave draft comments while you
+watch.
+
+It ships as a single static binary (`loopreview`, with the short alias `lr`) for
+macOS, Linux, and Windows. Reading diffs needs only `git`; the pull-request
+features use the `gh` CLI.
+
+<!-- TODO: screenshot — unified review with an inline comment thread -->
+
+## Features
+
+- **Two layouts, responsive** — unified or side-by-side, chosen automatically by
+  terminal width, and toggled at any time.
+- **Built for reading** — syntect syntax highlighting, word-level intra-line
+  emphasis, a line cursor for precise navigation, and full mouse support.
+- **Live by default** — a `notify`-based watcher refreshes the diff the moment
+  files change on disk (event-driven, not polling); disable with `--no-watch`.
+- **Local review** — leave markdown comments and threads on any line, reply,
+  resolve, and mark outdated threads; everything renders inline and in a
+  GitHub-style Conversation view, and persists per repository.
+- **GitHub pull requests** — review a PR in the TUI without a checkout, with
+  two-way comment sync, drafts that persist across sessions, and a submit modal
+  (Comment / Approve / Request changes / Pending).
+- **Agent control plane** — a running review hosts a local socket so an agent can
+  read the diff structure, move your cursor, leave draft comments, and block on
+  review events (`lr session …`, `lr skill …`).
+- **Small dependency surface** — plain diff viewing needs only `git`; `gh` is
+  required only for the pull-request features.
+
+## Install
+
+### Prebuilt binaries
+
+Download the archive for your platform from the
+[Releases](https://github.com/loopkeep/loopreview/releases) page
+(`.tar.gz` for macOS/Linux, `.zip` for Windows), unpack it, and put the
+`loopreview` binary (and its `lr` alias) somewhere on your `PATH`:
 
 ```sh
-lr                 # review the working tree (staged + unstaged vs HEAD)
-lr diff main...    # review this branch's changes off main
-lr diff --staged   # review only the staged changes
-lr patch fix.diff  # review a saved patch (or: git diff | lr patch)
-git diff | lr      # review a patch piped in
+tar xzf loopreview-*.tar.gz
+install -m755 loopreview lr ~/.local/bin/
 ```
 
-Navigate with `j`/`k` (line cursor), `n`/`p` between files, `[`/`]` between
-hunks, `Ctrl-D`/`Ctrl-U` to page, `g`/`G` for the ends, `v` to toggle
-unified/side-by-side, and `q` to quit. The mouse wheel scrolls and a click moves
-the cursor. Working-tree and ref views refresh automatically as files change
-(pass `--no-watch` to disable).
+Homebrew and `cargo-binstall` support are coming soon.
+
+### From source
+
+Requires a recent Rust toolchain (edition 2024).
+
+```sh
+cargo build --release
+# binaries land in target/release/{loopreview,lr}
+```
+
+## Quickstart
+
+```sh
+lr                    # review the working tree (staged + unstaged vs HEAD)
+lr diff main...       # review this branch's changes off main
+lr diff --staged      # review only the staged changes
+lr patch fix.patch    # review a saved patch...
+git diff | lr         # ...or one piped in
+lr pr 123             # review GitHub pull request #123 in the TUI
+```
+
+Useful global options: `--mode auto|unified|split` picks the layout,
+`--no-watch` turns off auto-refresh, and `--exclude-untracked` drops untracked
+files from a working-tree review.
+
+## Keybindings
+
+**Anywhere**
+
+| Key | Action |
+| --- | --- |
+| `q` / `Esc` / `Ctrl-C` | Quit |
+| `Tab` | Switch between the Files and Conversation views (once the review has threads) |
+| `Ctrl-R` | Refresh from GitHub (pull requests) |
+| `Ctrl-S` | Open the submit modal (pull requests) |
+
+**Files (diff) view**
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` (or `↓` / `↑`) | Move the line cursor |
+| `Ctrl-D` / `Ctrl-U` | Half-page down / up |
+| `Space` / `PageDown`, `PageUp` | Page down / up |
+| `g` / `G` (or `Home` / `End`) | First / last line |
+| `n` / `p` | Next / previous file |
+| `]` `}` / `[` `{` | Next / previous hunk |
+| `v` | Toggle unified / side-by-side |
+| `c` | Comment on the cursor line |
+| `r` | Reply to the thread on the cursor line |
+| `x` | Resolve / reopen that thread |
+| `o` | Collapse / expand that thread |
+| Wheel / click | Scroll / move the cursor |
+
+**Conversation view**
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Select a thread |
+| `g` / `G` | First / last thread |
+| `Ctrl-D` / `Ctrl-U` (or `PageDown` / `PageUp`) | Scroll |
+| `r` | Reply to the selected thread |
+| `x` | Resolve / reopen |
+| `o` | Collapse / expand |
+| `X` | Close the review (asks to confirm) |
+
+**Comment composer** (after `c` or `r`): type or paste markdown (multi-line);
+`Ctrl-S` saves, `Esc` discards (confirming if the comment is non-empty).
 
 ## Reviewing
 
-Press `c` on any line to leave a comment (markdown, multi-line); `r` replies to a
-thread on the cursor's line and `x` resolves it. Comments show inline under their
-line and persist to a per-repository store under your config directory, shared
-across the repo's worktrees. Once a review has threads, `Tab` opens a
-Conversation view listing every thread — root comment, replies, and relative
-times — where `r`/`x` also work and `X` closes (deletes) the review. Comments are
-authored as your `git config user.name`.
+Press `c` on any line to open a markdown composer; the comment shows inline under
+its line and starts a thread. `r` replies to the thread on the cursor's line and
+`x` resolves or reopens it. Once a review has any threads, `Tab` opens a
+Conversation view — every thread as a root comment with its nested replies and
+relative timestamps, GitHub-style — where `r` and `x` also work and `X` closes
+(deletes) the review. Comments are authored as your `git config user.name`.
+
+A local review is stored per repository under your config directory and shared
+across that repo's worktrees (thread anchors carry the commit, so they stay
+unambiguous). When the line a thread was pinned to moves out of the current diff,
+the thread is marked **outdated** and its original context is reconstructed from
+history — you can still read and reply to it.
+
+<!-- TODO: screenshot — Conversation view with a resolved and an outdated thread -->
+
+### Pull requests
+
+`lr pr <number | url | owner/repo#n>` (or `lr pr --detect` for the current
+branch) opens a pull request in the same TUI, fetching the diff and existing
+review threads without touching your working tree. Your comments and replies are
+kept as **drafts** — they persist across sessions — until you submit. `Ctrl-S`
+opens the submit modal to choose the review event and an optional summary;
+`Ctrl-R` re-pulls from GitHub while keeping your drafts. Resolving a published
+thread syncs to GitHub. (The pull-request features use the `gh` CLI, which must
+be installed and authenticated.)
+
+## Agent integration
+
+Reviewing agent work usually means an agent is on the other side of the loop. A
+running loopreview hosts a per-session local socket (no central daemon) and
+registers itself, so an agent — or a second terminal — can drive the review you
+have open through `lr session`:
+
+```sh
+lr session list --json                       # find live sessions
+lr session review --json                     # diff structure + threads
+lr session review --patch --json             # ...including the raw lines
+lr session navigate --file src/app.rs --line 42
+lr session comment add --file src/app.rs --line 42 \
+  --body "Is this retry safe under load?" --author agent
+lr session wait --for reply                  # block until the human replies
+```
+
+The design keeps the human in charge: an agent reads, navigates (moving _your_
+cursor and view, for explanation), and leaves **draft** comments — it cannot
+publish a pull-request review (that stays your `Ctrl-S`) and cannot resolve a
+published thread. Its actions appear in your status line as they happen, and
+`wait` lets it hold a turn open until you reply, resolve, or submit.
+
+`lr skill path` writes a bundled `SKILL.md` — a full reference to the workflow and
+etiquette — and prints its path, so you can hand the manual straight to an agent.
+
+## Configuration
+
+Settings live in `<config-dir>/loopreview/config.json` (all keys optional):
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `split_min_width` | integer | `160` | Body width, in columns, at which `auto` layout switches to side-by-side |
+
+Data is stored under the same directory: local reviews in `reviews/`, live
+control-plane sessions in `sessions/`. `<config-dir>` is `$XDG_CONFIG_HOME` (or
+`~/.config`) on macOS/Linux and `%APPDATA%` on Windows.
 
 ## Development
 
-The workspace has two crates: `loopreview-core` (the diff model and source
-abstraction, UI-free) and `loopreview-cli` (the ratatui terminal UI, building
-the `loopreview` and `lr` binaries).
+The workspace has four crates:
+
+- **`loopreview-core`** — the diff model and source abstraction (worktree, ref,
+  patch), UI-free and publishable.
+- **`loopreview-control`** — the control-plane protocol, registry, and client,
+  also UI-free.
+- **`loopreview-github`** — GitHub pull-request sync (diff source + comment
+  threads) via the `gh` CLI.
+- **`loopreview-cli`** — the ratatui terminal UI, building the `loopreview` and
+  `lr` binaries.
 
 ```sh
 cargo run --bin lr             # run against the current repo's working tree
@@ -44,3 +210,13 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo build --release          # optimized binaries in target/release/
 ```
+
+## About the name
+
+_loopreview_ folds three words into one — **loop**, **preview**, and **review** —
+sharing the middle `p` (loo·**p**·review). It reviews the changes an agent
+**loop** produces, and lets you **preview** the change before it lands.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
