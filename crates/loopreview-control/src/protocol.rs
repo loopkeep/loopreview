@@ -314,8 +314,9 @@ pub struct ThreadInfo {
     pub state: String,
     /// True when the anchor line is not present in the current diff.
     pub outdated: bool,
-    /// True when the thread's root comment is an unpublished draft (a quick way
-    /// to tell an agent's own drafts from pulled/published threads).
+    /// True when the root comment's kind is `draft` (a quick way to tell an
+    /// agent's own queued drafts from pulled/published threads). Derived from
+    /// `comments[0].kind` — a convenience, not a second source of truth.
     pub draft: bool,
     /// The comments, oldest first.
     pub comments: Vec<CommentInfo>,
@@ -379,7 +380,10 @@ pub struct CommentResult {
     pub thread: String,
     /// The new comment id.
     pub comment: String,
-    /// True when the comment is a draft (a pull-request review).
+    /// True when the created comment's kind is `draft` (queued to submit on a
+    /// pull request); false for a local note. A convenience over re-reading the
+    /// comment's [`CommentInfo::kind`] — derived from the same kind, not a second
+    /// source of truth. (An agent mutation never yields a `published` comment.)
     pub draft: bool,
 }
 

@@ -754,6 +754,62 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn extract_drops_a_same_named_symlink_before_writing() {
+        // A crafted archive carries "lr" twice: first a symlink pointing outside
+        // the destination, then a regular file. Extraction must drop the symlink
+        // so the file lands inside `dest` and nothing is written through the link.
+        let base = std::env::temp_dir().join(format!("lr-tar-evil-{}", std::process::id()));
+        let dest = base.join("dest");
+        let outside = base.join("outside");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&dest).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let sentinel = outside.join("pwned"); // must NOT be created
+
+        let archive = base.join("evil.tar.gz");
+        {
+            let gz = flate2::write::GzEncoder::new(
+                File::create(&archive).unwrap(),
+                flate2::Compression::default(),
+            );
+            let mut builder = tar::Builder::new(gz);
+            // 1) a symlink `lr` -> ../outside/pwned (escapes dest if followed).
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_mode(0o777);
+            builder
+                .append_link(&mut link, "lr", Path::new("../outside/pwned"))
+                .unwrap();
+            // 2) a regular file `lr` with real contents.
+            let data = b"REAL BINARY";
+            let mut reg = tar::Header::new_gnu();
+            reg.set_entry_type(tar::EntryType::Regular);
+            reg.set_size(data.len() as u64);
+            reg.set_mode(0o755);
+            builder.append_data(&mut reg, "lr", &data[..]).unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+
+        extract_binaries(&archive, &dest).unwrap();
+
+        let out = dest.join("lr");
+        let meta = fs::symlink_metadata(&out).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "the extracted `lr` is a regular file, not a lingering symlink"
+        );
+        assert_eq!(fs::read(&out).unwrap(), b"REAL BINARY");
+        assert!(
+            !sentinel.exists(),
+            "the symlink was not followed to write outside dest"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn unsupported_platforms_have_no_target() {
         assert_eq!(resolve_target("aarch64", "windows"), None);
