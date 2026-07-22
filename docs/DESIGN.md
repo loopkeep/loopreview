@@ -139,6 +139,14 @@ Anchor =
 | **M2b** | GitHub シンク: PR ソース、コメント双方向(pull = スレッド注入 / push = review submit・返信)、resolve |
 | **M3** | 制御面: セッションデーモン + CLI(エージェントが読む・注釈する・操作するための API)。hunk の制約(root 固定・表示状態外部制御不可)を設計で回避 |
 
+### M3 アーキテクチャ(2026-07-22 確定)
+
+- **中央デーモンなし**: 各 TUI インスタンスが自前の制御ソケットをホストし、レジストリ(`~/.config/loopreview/sessions/<id>.json`: socket パス・pid・repo・source ラベル)に登録。`lr session list` はレジストリを読み(pid 死活で stale 掃除)、各 verb は対象セッションのソケットへ直接接続。`lr daemon` verb は v0.1.0 では未実装のまま予約に留める
+- **transport**: `interprocess` crate のローカルソケット(unix domain socket / Windows named pipe)。プロトコルは JSON Lines + hello バージョン交渉
+- **v0.1.0 の session verbs**: `list [--json]` / `get` / `context`(人間の現在位置)/ `review --json`(diff 構造 + スレッド)/ `navigate`(file+side+line or thread id へ視線誘導)/ `reload`(現ソース再読込)/ `comment add|reply|resolve|list`(エージェントの注釈。author 必須。PR モードでは draft になり publish は人間の Ctrl-S のみ)/ `wait --for <event> [--timeout]`(comment / reply / resolve / submit / reload のイベント購読 — hunk のポーリング体験を超える核)
+- **TUI 側**: 全モードで起動時にセッション登録、ソケットスレッド → mpsc で UI ループに ops を渡して live 反映。エージェント接続・操作はステータス行に表示
+- **`lr skill path`**: エージェント向け SKILL.md をバイナリに同梱し、パスを返す(hunk 方式の継承)
+
 ### M3 制御面の設計方針 — hunk の骨格を継承し、モデルを対応させる
 
 **継承**(hunk で実証済み): ローカルデーモン + セッションレジストリ(外部から live セッションを発見)/ CLI 動詞体系 list・get・context・review・**navigate(人間の視線誘導)**・reload・comment / 「共有成果物への相互書き込み」という非同期対話モデル / エージェント向けスキル文書をツール自身が同梱(`lr skill path` 相当)/ watch が対話の背景で live 反映。
