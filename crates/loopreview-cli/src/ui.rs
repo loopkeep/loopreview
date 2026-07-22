@@ -38,7 +38,7 @@ use loopreview_control::protocol::{
 };
 
 use loopreview_core::{
-    Anchor, Comment, Diff, DiffSource, LineKind, Review, Segment, Side, Thread, ThreadState,
+    Anchor, Comment, Diff, DiffSource, Line, LineKind, Review, Segment, Side, Thread, ThreadState,
     word_diff,
 };
 
@@ -720,6 +720,7 @@ impl App {
         let conv_order = conv_display_order(&review);
         let conv_blocks = build_conversation(
             &review,
+            &diff,
             CONV_DEFAULT_WIDTH,
             &highlighter,
             &outdated,
@@ -1177,6 +1178,7 @@ impl App {
         let conv_width = self.body_width.get().clamp(40, 120);
         self.conv_blocks = build_conversation(
             &self.review,
+            &diff,
             conv_width,
             &self.highlighter,
             &self.thread_outdated,
@@ -4626,6 +4628,10 @@ fn status_color(status: loopreview_core::ChangeStatus) -> Color {
 const COMMENT_BAR: Color = Color::Rgb(90, 130, 200);
 /// Width the inline comment body wraps to (before the gutter bar).
 const INLINE_COMMENT_WRAP: usize = 76;
+/// Max lines in a placed thread's code excerpt (clipped tail-first beyond it).
+const EXCERPT_MAX: usize = 8;
+/// Subtle background on the anchored line(s) within a thread's code excerpt.
+const EXCERPT_ANCHOR_BG: Color = Color::Rgb(46, 42, 30);
 
 /// Render each thread's inline block (index-aligned to `review.threads`): a
 /// header naming the author and state, then the root comment's body as markdown.
@@ -4689,6 +4695,7 @@ fn build_comment_blocks(
 #[allow(clippy::too_many_arguments)]
 fn build_conversation(
     review: &Review,
+    diff: &Diff,
     width: usize,
     highlighter: &Highlighter,
     outdated: &[bool],
@@ -4761,6 +4768,15 @@ fn build_conversation(
                         }
                     }
                 }
+            } else if matches!(thread.anchor, Anchor::Line { .. }) {
+                // A placed line-anchored thread shows the code it comments on,
+                // from the current diff (the same look as the reconstruction).
+                lines.extend(build_excerpt(
+                    diff,
+                    &thread.anchor,
+                    highlighter,
+                    EXCERPT_MAX,
+                ));
             }
 
             if let Some(root) = thread.root() {
@@ -4807,6 +4823,94 @@ fn comment_meta_line(author: &str, created_at: u64, now: u64, reply: bool) -> Te
             Style::default().fg(Color::DarkGray),
         ),
     ])
+}
+
+/// A code excerpt for a placed line-anchored thread: the anchored range plus a
+/// few preceding context lines from the current diff, syntax-highlighted with a
+/// line-number gutter and +/- markers (the diff view's pipeline), matching the
+/// outdated reconstruction's look. Empty when the file/line is not in the diff.
+/// Clipped tail-first (with a leading `…`) beyond `max` lines.
+fn build_excerpt(
+    diff: &Diff,
+    anchor: &Anchor,
+    highlighter: &Highlighter,
+    max: usize,
+) -> Vec<TextLine<'static>> {
+    let Anchor::Line {
+        file,
+        side,
+        start,
+        end,
+        ..
+    } = anchor
+    else {
+        return Vec::new();
+    };
+    let Some(fd) = diff.files.iter().find(|f| f.display_path() == file) else {
+        return Vec::new();
+    };
+    let flat: Vec<&Line> = fd.hunks.iter().flat_map(|h| h.lines.iter()).collect();
+    let lineno = |l: &Line| match side {
+        Side::New => l.new_lineno,
+        Side::Old => l.old_lineno,
+    };
+    let in_range = |l: &Line| lineno(l).is_some_and(|n| n >= *start && n <= *end);
+    let Some(first) = flat.iter().position(|l| in_range(l)) else {
+        return Vec::new(); // the anchored line is not in the current diff
+    };
+    let last = flat.iter().rposition(|l| in_range(l)).unwrap_or(first);
+    let to = last + 1;
+    let mut from = first.saturating_sub(3); // a few lines of leading context
+    let clipped = to - from > max;
+    if clipped {
+        from = to - max; // keep the tail (the anchored range) when too long
+    }
+    // Warm the highlighter from the file start so multi-line constructs (strings,
+    // comments) are correct at the excerpt, then emit the visible window.
+    let mut state = highlighter.line_highlighter(file);
+    let theme = highlighter.theme_highlighter();
+    for l in &flat[..from] {
+        let _ = highlighter.highlight_next(&mut state, &theme, &l.content);
+    }
+    let num_width = flat[from..to]
+        .iter()
+        .filter_map(|l| lineno(l))
+        .map(digits)
+        .max()
+        .unwrap_or(3)
+        .max(3);
+    let mut out = Vec::new();
+    if clipped {
+        out.push(TextLine::from(TextSpan::styled(
+            "  …",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for l in &flat[from..to] {
+        let spans = highlighter.highlight_next(&mut state, &theme, &l.content);
+        let (marker, mcolor) = match l.kind {
+            LineKind::Addition => ("+", Color::Green),
+            LineKind::Deletion => ("-", Color::Red),
+            LineKind::Context => (" ", Color::DarkGray),
+        };
+        let anchored = in_range(l);
+        let mut line_spans = vec![
+            TextSpan::styled(
+                format!("  {} ", optional_number(lineno(l), num_width)),
+                Style::default().fg(Color::DarkGray),
+            ),
+            TextSpan::styled(format!("{marker} "), Style::default().fg(mcolor)),
+        ];
+        for s in &spans {
+            let mut style = Style::default().fg(rgb(s.color));
+            if anchored {
+                style = style.bg(EXCERPT_ANCHOR_BG);
+            }
+            line_spans.push(TextSpan::styled(s.text.clone(), style));
+        }
+        out.push(TextLine::from(line_spans));
+    }
+    out
 }
 
 /// Reconstruct the lines around an outdated thread's anchor from history:
@@ -6449,6 +6553,97 @@ mod tests {
         assert!(
             app.collapsed.contains(&id),
             "clicking the inline comment header folds the thread"
+        );
+    }
+
+    /// A one-file diff with five context lines `line1`..`line5` (new 1..5).
+    fn excerpt_diff() -> Diff {
+        let lines: Vec<Line> = (1..=5u32)
+            .map(|n| Line {
+                kind: LineKind::Context,
+                content: format!("line{n}"),
+                old_lineno: Some(n),
+                new_lineno: Some(n),
+            })
+            .collect();
+        let file = FileDiff {
+            old_path: Some("a.rs".into()),
+            new_path: Some("a.rs".into()),
+            status: ChangeStatus::Modified,
+            binary: false,
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_lines: 5,
+                new_start: 1,
+                new_lines: 5,
+                section: None,
+                lines,
+            }],
+        };
+        Diff {
+            files: vec![file],
+            provenance: Provenance::default(),
+        }
+    }
+
+    fn excerpt_text(lines: &[TextLine]) -> String {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    #[test]
+    fn excerpt_shows_placed_code_and_skips_file_anchor() {
+        let h = Highlighter::new();
+        let diff = excerpt_diff();
+        // Single line: the anchored line plus preceding context.
+        let lines = build_excerpt(&diff, &Anchor::line("a.rs", Side::New, 3), &h, 8);
+        let text = excerpt_text(&lines);
+        assert!(text.contains("line3"), "shows the anchored line: {text}");
+        assert!(text.contains("line2"), "shows preceding context: {text}");
+        // A file anchor and a line not in the diff produce no excerpt.
+        assert!(
+            build_excerpt(
+                &diff,
+                &Anchor::File {
+                    file: "a.rs".into()
+                },
+                &h,
+                8
+            )
+            .is_empty(),
+            "a file anchor has no excerpt"
+        );
+        assert!(
+            build_excerpt(&diff, &Anchor::line("a.rs", Side::New, 99), &h, 8).is_empty(),
+            "an off-diff line has no excerpt"
+        );
+    }
+
+    #[test]
+    fn excerpt_clips_a_long_range_tail_first() {
+        let h = Highlighter::new();
+        let diff = excerpt_diff();
+        let anchor = Anchor::Line {
+            file: "a.rs".into(),
+            side: Side::New,
+            start: 1,
+            end: 5,
+            commit: None,
+            context: Vec::new(),
+        };
+        let lines = build_excerpt(&diff, &anchor, &h, 3);
+        let text = excerpt_text(&lines);
+        assert!(text.contains('…'), "clipped with an ellipsis: {text}");
+        assert!(
+            text.contains("line5"),
+            "keeps the tail (anchor end): {text}"
+        );
+        assert!(
+            !text.contains("line1"),
+            "drops the head when clipped: {text}"
         );
     }
 
