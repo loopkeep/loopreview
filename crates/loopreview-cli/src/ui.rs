@@ -3366,12 +3366,10 @@ impl App {
         };
         {
             let comment = &self.review.threads[ti].comments[ci];
-            if comment.is_published() {
-                return Err(
-                    "a published comment can't be edited by an agent — writing to GitHub is a human action"
-                        .to_string(),
-                );
-            }
+            guard_agent_write(
+                std::iter::once(comment),
+                "a published comment can't be edited by an agent — writing to GitHub is a human action",
+            )?;
             if comment.author != edit.author {
                 return Err(format!(
                     "only the author can edit their own comment ({} can't edit {}'s)",
@@ -3405,15 +3403,10 @@ impl App {
             .iter()
             .position(|t| t.id == resolve.thread)
             .ok_or_else(|| format!("no thread {}", resolve.thread))?;
-        let published = self.review.threads[idx]
-            .root()
-            .is_some_and(|c| c.remote_id.is_some());
-        if published {
-            return Err(
-                "resolving a published pull-request thread is a human action (press x in the TUI)"
-                    .to_string(),
-            );
-        }
+        guard_agent_write(
+            self.review.threads[idx].root(),
+            "resolving a published pull-request thread is a human action (press x in the TUI)",
+        )?;
         let thread = &mut self.review.threads[idx];
         thread.state = if resolve.resolved {
             ThreadState::Resolved
@@ -3455,18 +3448,14 @@ impl App {
             return Err(format!("no comment or thread {id}"));
         };
         // Drafts only — never delete anything published to GitHub.
-        let published = match ci {
-            Some(ci) => self.review.threads[ti].comments[ci].remote_id.is_some(),
-            None => self.review.threads[ti]
-                .comments
-                .iter()
-                .any(|c| c.remote_id.is_some()),
+        let targets: &[Comment] = match ci {
+            Some(ci) => std::slice::from_ref(&self.review.threads[ti].comments[ci]),
+            None => &self.review.threads[ti].comments,
         };
-        if published {
-            return Err(
-                "only drafts can be removed — published comments stay on GitHub".to_string(),
-            );
-        }
+        guard_agent_write(
+            targets,
+            "only drafts can be removed — published comments stay on GitHub",
+        )?;
         let (thread_id, removed_thread) = self.remove_draft(ti, ci);
         self.status = Some("agent: draft removed".to_string());
         Ok(protocol::RemoveResult {
@@ -6096,6 +6085,25 @@ fn friendly_github_write_error(reason: String) -> String {
     }
 }
 
+/// The single published-comment guard the agent control-plane writes share.
+///
+/// An agent may only touch what is not yet on GitHub: editing, resolving, or
+/// removing something already published is a human action. If any of `comments`
+/// is published (carries a remote id — see [`Comment::is_published`]), the write
+/// is refused with `refusal`; otherwise it is allowed. Centralizing the check
+/// keeps `comment edit` / `comment resolve` / `comment rm` agreeing on exactly
+/// what "published" means.
+fn guard_agent_write<'a>(
+    comments: impl IntoIterator<Item = &'a Comment>,
+    refusal: &str,
+) -> Result<(), String> {
+    if comments.into_iter().any(Comment::is_published) {
+        Err(refusal.to_string())
+    } else {
+        Ok(())
+    }
+}
+
 /// The disposition badge for a comment: `[local]` (subdued — never sent) or
 /// `[draft]` (attention — queued to submit). A published comment (on GitHub, or
 /// pulled with no addressable id) has none.
@@ -6806,6 +6814,32 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         assert_eq!(app.review.threads.len(), 0, "the draft thread is gone");
+    }
+
+    #[test]
+    fn guard_agent_write_refuses_only_when_something_is_published() {
+        let draft = Comment {
+            id: "d".into(),
+            author: "agent".into(),
+            body: "b".into(),
+            created_at: 0,
+            remote_id: None,
+            kind: loopreview_core::CommentKind::Draft,
+        };
+        let published = Comment {
+            remote_id: Some("PRRC_1".into()),
+            ..draft.clone()
+        };
+        // All-draft passes; the message is the caller's own.
+        assert!(guard_agent_write(std::iter::once(&draft), "nope").is_ok());
+        assert!(guard_agent_write([&draft, &draft], "nope").is_ok());
+        // Any published in the set refuses, verbatim.
+        assert_eq!(
+            guard_agent_write([&draft, &published], "refuse me"),
+            Err("refuse me".to_string())
+        );
+        // An empty set (e.g. a thread with no root) is not a published write.
+        assert!(guard_agent_write(std::iter::empty(), "nope").is_ok());
     }
 
     #[test]
