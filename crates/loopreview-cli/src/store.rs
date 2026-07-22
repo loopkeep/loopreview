@@ -196,6 +196,20 @@ impl Store {
         })
     }
 
+    /// Replace a pull request's stored draft set outright (not the union merge),
+    /// clearing the entry when empty. Used after a submit to drop the drafts that
+    /// were just published, so a repeat submit finds nothing and a re-pull won't
+    /// duplicate them.
+    pub fn replace_pr_drafts(&self, key: &str, drafts: &Review) -> Result<()> {
+        self.locked_update(|doc| {
+            if drafts.is_empty() {
+                doc.pr_drafts.remove(key);
+            } else {
+                doc.pr_drafts.insert(key.to_string(), drafts.clone());
+            }
+        })
+    }
+
     /// Remove a thread (or a single comment within it) from the working-tree
     /// review — a targeted deletion, unlike the union [`save`], so a withdrawn
     /// draft does not come back on the next merge. A thread emptied of comments

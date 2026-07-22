@@ -1033,11 +1033,41 @@ impl App {
                 comment.remote_id = Some(stamp.remote_id);
             }
         }
-        // Published drafts are now remote; drop them from the store.
-        let _ = self.save_pr_drafts();
+        // The just-published drafts are now remote: replace the store's draft set
+        // with only what remains unpublished, so a repeat Ctrl-S finds nothing and
+        // a re-pull won't duplicate them. Any reply that failed stays a draft here.
+        if let (Some(store), Some(key)) = (&self.store, &self.pr_key) {
+            let _ = store.replace_pr_drafts(key, &self.pr_drafts());
+        }
         self.emit(EventKind::Submit, None);
-        self.status = Some("review submitted".to_string());
+        self.status = Some(if submitted.failed_replies > 0 {
+            format!(
+                "review submitted — {} repl{} failed, still draft",
+                submitted.failed_replies,
+                if submitted.failed_replies == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            )
+        } else {
+            "review submitted".to_string()
+        });
         self.relayout();
+    }
+
+    /// The pull request's current draft threads — those still holding an
+    /// unpublished comment.
+    fn pr_drafts(&self) -> Review {
+        Review {
+            threads: self
+                .review
+                .threads
+                .iter()
+                .filter(|t| t.comments.iter().any(|c| c.remote_id.is_none()))
+                .cloned()
+                .collect(),
+        }
     }
 
     /// Drain the load channel, updating the stage or finishing the load.
@@ -2427,17 +2457,8 @@ impl App {
         let (Some(store), Some(key)) = (&self.store, &self.pr_key) else {
             return Ok(());
         };
-        let drafts = Review {
-            threads: self
-                .review
-                .threads
-                .iter()
-                .filter(|t| t.comments.iter().any(|c| c.remote_id.is_none()))
-                .cloned()
-                .collect(),
-        };
         store
-            .save_pr_drafts(key, &drafts)
+            .save_pr_drafts(key, &self.pr_drafts())
             .map_err(|e| format!("{e:#}"))
     }
 
@@ -5965,6 +5986,68 @@ mod tests {
         app.on_key(KeyCode::Char('y'), KeyModifiers::NONE);
         assert!(app.confirming_delete.is_none());
         assert_eq!(app.review.threads.len(), 0, "the draft was removed");
+    }
+
+    #[test]
+    fn submitting_clears_the_published_drafts_from_the_store() {
+        let mut app = sample_app();
+        app.pr = Some(Arc::new(crate::prsync::PrHandle::for_test(1, "t")));
+        app.pr_key = Some("owner/repo#1".into());
+        // A draft thread, saved into the PR draft store.
+        let (tid, _) = app.add_thread(Anchor::line("a.rs", Side::New, 2), "me", "note");
+        app.save_pr_drafts().unwrap();
+        let key = "owner/repo#1";
+        assert!(!app.pr_drafts().is_empty());
+        assert!(
+            !app.store
+                .as_ref()
+                .unwrap()
+                .load_pr_drafts(key)
+                .unwrap()
+                .is_empty(),
+            "the draft is stored before submit"
+        );
+        // Submitting stamps it published and clears it from the store; a repeat
+        // submit would now find nothing.
+        app.apply_submitted(crate::prsync::Submitted {
+            published: vec![(tid, "PRRC_1".into())],
+            replies: Vec::new(),
+            failed_replies: 0,
+        });
+        assert_eq!(
+            app.review.threads[0].root().unwrap().remote_id.as_deref(),
+            Some("PRRC_1"),
+            "the root is now published"
+        );
+        assert!(app.pr_drafts().is_empty(), "no drafts remain in memory");
+        assert!(
+            app.store
+                .as_ref()
+                .unwrap()
+                .load_pr_drafts(key)
+                .unwrap()
+                .is_empty(),
+            "the store's draft entry is cleared"
+        );
+    }
+
+    #[test]
+    fn a_failed_reply_is_reported_and_left_draft() {
+        let mut app = sample_app();
+        app.pr = Some(Arc::new(crate::prsync::PrHandle::for_test(1, "t")));
+        app.pr_key = Some("owner/repo#1".into());
+        let (tid, _) = app.add_thread(Anchor::line("a.rs", Side::New, 2), "me", "root");
+        // The root publishes, but one reply failed to post.
+        app.apply_submitted(crate::prsync::Submitted {
+            published: vec![(tid, "PRRC_1".into())],
+            replies: Vec::new(),
+            failed_replies: 1,
+        });
+        assert!(
+            app.status.as_deref().unwrap_or("").contains("failed"),
+            "a partial failure is surfaced: {:?}",
+            app.status
+        );
     }
 
     #[test]

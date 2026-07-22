@@ -330,22 +330,28 @@ impl GithubClient {
     /// `in_reply_to` (line info is not needed, so outdated and resolved threads
     /// take replies too). The model is updated by the returned values — the
     /// caller stamps each `remote_id` onto its store.
+    /// Returns the posted replies and a count of any that failed. A failed reply
+    /// is left un-posted (its draft is not stamped), so it survives as a draft
+    /// and can be re-sent — one bad reply never drops the rest.
     pub fn submit_replies(
         &self,
         pr: &ResolvedPr,
         threads: &[Thread],
-    ) -> Result<Vec<ReplyOutcome>, GithubError> {
+    ) -> Result<(Vec<ReplyOutcome>, usize), GithubError> {
         let planned = push::plan_replies(threads);
         let mut outcomes = Vec::with_capacity(planned.len());
+        let mut failed = 0usize;
         for reply in planned {
-            let comment = self.reply(pr, reply.in_reply_to, &reply.body)?;
-            outcomes.push(ReplyOutcome {
-                thread_id: reply.thread_id,
-                comment_id: reply.comment_id,
-                comment,
-            });
+            match self.reply(pr, reply.in_reply_to, &reply.body) {
+                Ok(comment) => outcomes.push(ReplyOutcome {
+                    thread_id: reply.thread_id,
+                    comment_id: reply.comment_id,
+                    comment,
+                }),
+                Err(_) => failed += 1,
+            }
         }
-        Ok(outcomes)
+        Ok((outcomes, failed))
     }
 
     /// Post a threaded reply to an existing review thread and return the created

@@ -111,9 +111,23 @@ impl PrHandle {
             .client
             .submit_review(&self.pr, event.into(), body, threads)
             .map_err(|e| e.to_string())?;
-        let replies = self
+        // Stamp the just-published roots onto a working copy before planning
+        // replies, so a draft reply under a newly-published root is recognized as
+        // a reply to an existing thread — not left behind (the roots publish in
+        // the review POST above; without this its children would be orphaned).
+        let mut threads = threads.to_vec();
+        for (thread_id, remote_id) in &outcome.published {
+            if let Some(root) = threads
+                .iter_mut()
+                .find(|t| t.id == *thread_id)
+                .and_then(|t| t.comments.first_mut())
+            {
+                root.remote_id = Some(remote_id.clone());
+            }
+        }
+        let (replies, failed_replies) = self
             .client
-            .submit_replies(&self.pr, threads)
+            .submit_replies(&self.pr, &threads)
             .map_err(|e| e.to_string())?;
         Ok(Submitted {
             published: outcome.published,
@@ -125,6 +139,7 @@ impl PrHandle {
                     remote_id: r.comment.remote_id.unwrap_or_default(),
                 })
                 .collect(),
+            failed_replies,
         })
     }
 }
@@ -155,6 +170,8 @@ pub struct Submitted {
     pub published: Vec<(String, String)>,
     /// Published draft replies.
     pub replies: Vec<ReplyStamp>,
+    /// How many draft replies failed to post (they stay draft, re-sendable).
+    pub failed_replies: usize,
 }
 
 /// One published reply's id stamp.

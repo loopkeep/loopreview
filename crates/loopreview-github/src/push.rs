@@ -371,6 +371,26 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_becomes_plannable_once_its_root_is_published() {
+        // A draft root plus a draft reply. Before publishing there is nothing to
+        // reply under, so the reply is not planned (and would be orphaned if the
+        // root published in the review POST without re-planning).
+        let mut thread = line_thread("t", Side::New, 4, draft_comment("root", "new root"));
+        thread.comments.push(draft_comment("reply", "under it"));
+        assert!(
+            plan_replies(&[thread.clone()]).is_empty(),
+            "a draft root's reply has nothing to attach to yet"
+        );
+        // Once submit() stamps the root's new remote id before planning replies,
+        // the reply attaches to it — not left behind.
+        thread.comments[0].remote_id = Some("777".to_string());
+        let planned = plan_replies(&[thread]);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].comment_id, "reply");
+        assert_eq!(planned[0].in_reply_to, 777);
+    }
+
+    #[test]
     fn matches_created_comments_back_to_drafts() {
         let planned = vec![
             PlannedComment {
