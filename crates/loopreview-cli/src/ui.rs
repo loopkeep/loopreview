@@ -1,8 +1,10 @@
-//! The ratatui review UI: a scrolling unified-diff pane with a line cursor that
-//! always points at a `(file, side, line)` anchor, plus file and hunk
-//! navigation. All diff data comes from [`loopreview_core`]; this module lays
-//! out rows, routes key events, and paints. Changed words within a modified
-//! line are emphasized using the core's intra-line diff.
+//! The ratatui review UI.
+//!
+//! A line cursor always points at a diff line's `(file, side, line)` anchor.
+//! The diff renders either unified or side-by-side; `auto` picks by width and a
+//! key toggles at runtime. Changed words within a modified line are emphasized
+//! using the core's intra-line diff. All diff data comes from
+//! [`loopreview_core`]; this module lays out rows, routes events, and paints.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -27,6 +29,8 @@ const ADD_EMPH_BG: Color = Color::Rgb(30, 84, 44);
 const DEL_EMPH_BG: Color = Color::Rgb(96, 40, 46);
 /// Background of the line the cursor is on (when it has no diff tint).
 const CURSOR_BG: Color = Color::Rgb(38, 43, 56);
+/// Background of a side-by-side cell with no line (the other side changed).
+const ABSENT_BG: Color = Color::Rgb(22, 24, 30);
 /// The bar background used for the header and footer.
 const BAR_BG: Color = Color::Rgb(30, 33, 40);
 
@@ -34,6 +38,17 @@ const BAR_BG: Color = Color::Rgb(30, 33, 40);
 const SCROLLOFF: usize = 3;
 /// How often the event loop wakes to repaint when idle.
 const POLL_MS: u64 = 200;
+/// At or above this body width, `auto` layout chooses side-by-side.
+const AUTO_SBS_MIN_WIDTH: usize = 160;
+
+/// The diff layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Pick unified or side-by-side by terminal width.
+    Auto,
+    Unified,
+    SideBySide,
+}
 
 /// Enter the alternate screen, run the review UI over `diff`, then restore the
 /// terminal. `label` describes the diff's source (shown in the header).
@@ -45,18 +60,26 @@ pub fn run(label: String, diff: Diff) -> Result<()> {
     result
 }
 
-/// One line of the flattened, scrollable layout.
-enum Row {
-    /// A file's header line (index into [`Diff::files`]).
+/// A row in the unified layout.
+enum URow {
     FileHeader(usize),
-    /// An informational note for a file (binary, or no content change).
     Note(String),
-    /// A hunk's `@@ … @@` header (file index, hunk index).
     HunkHeader(usize, usize),
-    /// A diff line: the file it belongs to and its index into that file's flat
-    /// line list (see [`App::flats`]).
     Line { file: usize, flat: usize },
-    /// A blank separator between files.
+    Spacer,
+}
+
+/// A row in the side-by-side layout. `Pair` holds the old and new flat line
+/// indices for one file, either of which may be absent.
+enum SRow {
+    FileHeader(usize),
+    Note(String),
+    HunkHeader(usize, usize),
+    Pair {
+        file: usize,
+        old: Option<usize>,
+        new: Option<usize>,
+    },
     Spacer,
 }
 
@@ -74,91 +97,57 @@ struct App {
     diff: Diff,
     highlighter: Highlighter,
 
-    /// The flattened display rows.
-    rows: Vec<Row>,
-    /// Row index of each diff line, in order; the cursor indexes into this.
-    line_rows: Vec<usize>,
-    /// Cursor index (into `line_rows`) of each file's first line, if any.
+    /// Unified rows and, per diff line (cursor index), its row within them.
+    urows: Vec<URow>,
+    line_urow: Vec<usize>,
+    /// Side-by-side rows and, per diff line, its row within them.
+    srows: Vec<SRow>,
+    line_srow: Vec<usize>,
+    /// The `(file, flat)` of each diff line, in cursor order.
+    clines: Vec<(usize, usize)>,
+
+    /// Cursor index of each file's first line, if any.
     file_first: Vec<Option<usize>>,
-    /// Cursor index (into `line_rows`) of every hunk's first line, in order.
+    /// Cursor index of every hunk's first line, in order.
     hunk_first: Vec<usize>,
     /// Per file: the `(hunk, line)` pairs in display order.
     flats: Vec<Vec<(usize, usize)>>,
     /// Lazily-computed render data per file.
     render: RefCell<Vec<Option<FileRender>>>,
 
-    /// Width reserved for each line-number column.
     num_width: usize,
-    /// Cursor position as an index into `line_rows`.
+    mode: Mode,
     cursor: usize,
-    /// Top visible row.
     scroll: usize,
-    /// Height of the body pane on the last frame (for paging and follow).
     body_height: Cell<usize>,
+    body_width: Cell<usize>,
     quit: bool,
 }
 
 impl App {
     fn new(label: String, diff: Diff, highlighter: Highlighter) -> App {
-        let mut rows = Vec::new();
-        let mut line_rows = Vec::new();
-        let mut file_first = vec![None; diff.files.len()];
-        let mut hunk_first = Vec::new();
-        let mut flats = Vec::with_capacity(diff.files.len());
-        let mut max_lineno = 0u32;
-
-        for (fi, file) in diff.files.iter().enumerate() {
-            if fi > 0 {
-                rows.push(Row::Spacer);
-            }
-            rows.push(Row::FileHeader(fi));
-
-            let mut flat = Vec::new();
-            if file.binary {
-                rows.push(Row::Note("binary file — contents not shown".to_string()));
-            } else if file.hunks.is_empty() {
-                rows.push(Row::Note(format!(
-                    "{}, no content changes",
-                    file.status.label()
-                )));
-            } else {
-                for (hi, hunk) in file.hunks.iter().enumerate() {
-                    rows.push(Row::HunkHeader(fi, hi));
-                    hunk_first.push(line_rows.len());
-                    max_lineno = max_lineno
-                        .max(hunk.old_start + hunk.old_lines)
-                        .max(hunk.new_start + hunk.new_lines);
-                    for li in 0..hunk.lines.len() {
-                        if file_first[fi].is_none() {
-                            file_first[fi] = Some(line_rows.len());
-                        }
-                        line_rows.push(rows.len());
-                        rows.push(Row::Line {
-                            file: fi,
-                            flat: flat.len(),
-                        });
-                        flat.push((hi, li));
-                    }
-                }
-            }
-            flats.push(flat);
-        }
-
-        let render = RefCell::new(Vec::from_iter((0..diff.files.len()).map(|_| None)));
+        let layout = Layouts::build(&diff);
+        let num_width = digits(layout.max_lineno).max(3);
+        let file_count = diff.files.len();
         App {
             label,
             diff,
             highlighter,
-            rows,
-            line_rows,
-            file_first,
-            hunk_first,
-            flats,
-            render,
-            num_width: digits(max_lineno).max(3),
+            urows: layout.urows,
+            line_urow: layout.line_urow,
+            srows: layout.srows,
+            line_srow: layout.line_srow,
+            clines: layout.clines,
+            file_first: layout.file_first,
+            hunk_first: layout.hunk_first,
+            flats: layout.flats,
+            render: RefCell::new(Vec::from_iter((0..file_count).map(|_| None))),
+            num_width,
+            mode: Mode::Auto,
             cursor: 0,
             scroll: 0,
             body_height: Cell::new(20),
+            body_width: Cell::new(80),
             quit: false,
         }
     }
@@ -193,48 +182,82 @@ impl App {
             (KeyCode::PageUp, _) => self.move_cursor(-(page - 1)),
             (KeyCode::Char('g'), false) | (KeyCode::Home, _) => self.set_cursor(0),
             (KeyCode::Char('G'), false) | (KeyCode::End, _) => {
-                self.set_cursor(self.line_rows.len().saturating_sub(1))
+                self.set_cursor(self.clines.len().saturating_sub(1))
             }
             (KeyCode::Char('n'), false) => self.goto_file(1),
             (KeyCode::Char('p'), false) => self.goto_file(-1),
             (KeyCode::Char('}'), false) | (KeyCode::Char(']'), false) => self.goto_hunk(1),
             (KeyCode::Char('{'), false) | (KeyCode::Char('['), false) => self.goto_hunk(-1),
+            (KeyCode::Char('v'), false) | (KeyCode::Tab, _) => self.toggle_mode(),
             _ => {}
         }
     }
 
     // -- navigation -------------------------------------------------------
 
+    fn sbs(&self) -> bool {
+        match self.mode {
+            Mode::Auto => self.body_width.get() >= AUTO_SBS_MIN_WIDTH,
+            Mode::Unified => false,
+            Mode::SideBySide => true,
+        }
+    }
+
+    /// Toggle between unified and side-by-side, pinning the choice (leaving auto).
+    fn toggle_mode(&mut self) {
+        self.mode = if self.sbs() {
+            Mode::Unified
+        } else {
+            Mode::SideBySide
+        };
+        self.follow_cursor();
+    }
+
+    fn cursor_row(&self) -> usize {
+        if self.clines.is_empty() {
+            return 0;
+        }
+        if self.sbs() {
+            self.line_srow[self.cursor]
+        } else {
+            self.line_urow[self.cursor]
+        }
+    }
+
+    fn rows_len(&self) -> usize {
+        if self.sbs() {
+            self.srows.len()
+        } else {
+            self.urows.len()
+        }
+    }
+
     fn move_cursor(&mut self, delta: isize) {
-        if self.line_rows.is_empty() {
+        if self.clines.is_empty() {
             return;
         }
-        let last = (self.line_rows.len() - 1) as isize;
+        let last = (self.clines.len() - 1) as isize;
         let next = (self.cursor as isize + delta).clamp(0, last);
         self.set_cursor(next as usize);
     }
 
     fn set_cursor(&mut self, index: usize) {
-        if self.line_rows.is_empty() {
+        if self.clines.is_empty() {
             return;
         }
-        self.cursor = index.min(self.line_rows.len() - 1);
+        self.cursor = index.min(self.clines.len() - 1);
         self.follow_cursor();
     }
 
-    /// The file the cursor is currently in.
     fn current_file(&self) -> usize {
-        if self.line_rows.is_empty() {
+        if self.clines.is_empty() {
             return 0;
         }
-        match self.rows[self.line_rows[self.cursor]] {
-            Row::Line { file, .. } => file,
-            _ => 0,
-        }
+        self.clines[self.cursor].0
     }
 
     fn goto_file(&mut self, dir: isize) {
-        if self.line_rows.is_empty() {
+        if self.clines.is_empty() {
             return;
         }
         let current = self.current_file();
@@ -245,7 +268,6 @@ impl App {
                 self.set_cursor(index);
             }
         } else {
-            // From mid-file, first jump to this file's top; then to the previous.
             if let Some(first) = self.file_first[current]
                 && self.cursor > first
             {
@@ -273,12 +295,11 @@ impl App {
         }
     }
 
-    /// Adjust the scroll so the cursor row stays visible with a little context.
     fn follow_cursor(&mut self) {
-        if self.line_rows.is_empty() {
+        if self.clines.is_empty() {
             return;
         }
-        let target = self.line_rows[self.cursor];
+        let target = self.cursor_row();
         let height = self.body_height.get().max(1);
         let margin = SCROLLOFF.min(height / 2);
         if target < self.scroll + margin {
@@ -286,14 +307,11 @@ impl App {
         } else if target + margin >= self.scroll + height {
             self.scroll = (target + margin + 1).saturating_sub(height);
         }
-        let max_scroll = self.rows.len().saturating_sub(height);
-        self.scroll = self.scroll.min(max_scroll);
+        self.scroll = self.scroll.min(self.rows_len().saturating_sub(height));
     }
 
     // -- render data ------------------------------------------------------
 
-    /// Ensure the render cache for `file` is populated, computing highlights and
-    /// intra-line change ranges on the first frame the file becomes visible.
     fn ensure_render(&self, file: usize) {
         if self.render.borrow()[file].is_some() {
             return;
@@ -306,8 +324,6 @@ impl App {
             .collect();
         let highlight = self.highlighter.highlight(f.display_path(), &texts);
 
-        // Map (hunk, line) back to a flat index so intra-line ranges land on the
-        // right rows.
         let flat_index: HashMap<(usize, usize), usize> = flat
             .iter()
             .enumerate()
@@ -326,7 +342,6 @@ impl App {
                 }
             }
         }
-
         self.render.borrow_mut()[file] = Some(FileRender {
             highlight,
             intraline,
@@ -345,15 +360,31 @@ impl App {
             ])
             .split(f.area());
         self.body_height.set(chunks[1].height as usize);
+        self.body_width.set(chunks[1].width as usize);
 
         self.draw_header(f, chunks[0]);
-        self.draw_body(f, chunks[1]);
+        if self.clines.is_empty() && self.diff.files.is_empty() {
+            self.draw_empty(f, chunks[1]);
+        } else if self.sbs() {
+            self.draw_body_sbs(f, chunks[1]);
+        } else {
+            self.draw_body_unified(f, chunks[1]);
+        }
         self.draw_footer(f, chunks[2]);
+    }
+
+    fn draw_empty(&self, f: &mut Frame, area: Rect) {
+        let hint = TextLine::from(TextSpan::styled(
+            "  no changes",
+            Style::default().fg(Color::DarkGray),
+        ));
+        f.render_widget(Paragraph::new(hint), area);
     }
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
         let stats = self.diff.stats();
         let bar = Style::default().bg(BAR_BG);
+        let layout_label = if self.sbs() { "split" } else { "unified" };
         let line = TextLine::from(vec![
             TextSpan::styled(
                 " loopreview ",
@@ -365,7 +396,8 @@ impl App {
                 bar.fg(Color::Gray),
             ),
             TextSpan::styled(format!("+{} ", stats.insertions), bar.fg(Color::Green)),
-            TextSpan::styled(format!("-{}", stats.deletions), bar.fg(Color::Red)),
+            TextSpan::styled(format!("-{} ", stats.deletions), bar.fg(Color::Red)),
+            TextSpan::styled(format!("· {layout_label}"), bar.fg(Color::DarkGray)),
         ]);
         f.render_widget(Paragraph::new(line).style(bar), area);
     }
@@ -375,10 +407,10 @@ impl App {
         let position = format!(
             " [{}/{}]{} ",
             self.current_file() + 1,
-            self.diff.files.len(),
+            self.diff.files.len().max(1),
             self.cursor_anchor()
         );
-        let help = "j/k move · n/p file · [ ] hunk · ^d/^u page · g/G ends · q quit";
+        let help = "j/k move · n/p file · [ ] hunk · v split · ^d/^u page · q quit";
         let line = TextLine::from(vec![
             TextSpan::styled(position, bar.fg(Color::Cyan)),
             TextSpan::styled(help, bar.fg(Color::DarkGray)),
@@ -386,14 +418,11 @@ impl App {
         f.render_widget(Paragraph::new(line).style(bar), area);
     }
 
-    /// A short description of the cursor's line, e.g. ` new:42`, for the footer.
     fn cursor_anchor(&self) -> String {
-        if self.line_rows.is_empty() {
+        if self.clines.is_empty() {
             return String::new();
         }
-        let Row::Line { file, flat } = self.rows[self.line_rows[self.cursor]] else {
-            return String::new();
-        };
+        let (file, flat) = self.clines[self.cursor];
         let (hi, li) = self.flats[file][flat];
         let line = &self.diff.files[file].hunks[hi].lines[li];
         match (line.new_lineno, line.old_lineno) {
@@ -403,46 +432,101 @@ impl App {
         }
     }
 
-    fn draw_body(&self, f: &mut Frame, area: Rect) {
+    fn draw_body_unified(&self, f: &mut Frame, area: Rect) {
         let start = self.scroll;
-        let end = (start + area.height as usize).min(self.rows.len());
+        let end = (start + area.height as usize).min(self.urows.len());
         let current = self.current_file();
-        let cursor_row = self.line_rows.get(self.cursor).copied();
+        let cursor_row = self.line_urow.get(self.cursor).copied();
         let lines: Vec<TextLine> = (start..end)
-            .map(|i| self.render_row(&self.rows[i], current, Some(i) == cursor_row))
+            .map(|i| match &self.urows[i] {
+                URow::Spacer => TextLine::from(""),
+                URow::FileHeader(fi) => self.file_header_line(*fi, *fi == current),
+                URow::Note(msg) => note_line(msg),
+                URow::HunkHeader(fi, hi) => self.hunk_header_line(*fi, *hi),
+                URow::Line { file, flat } => self.diff_line(*file, *flat, Some(i) == cursor_row),
+            })
             .collect();
         f.render_widget(Paragraph::new(lines), area);
     }
 
-    fn render_row(&self, row: &Row, current_file: usize, is_cursor: bool) -> TextLine<'static> {
-        match row {
-            Row::Spacer => TextLine::from(""),
-            Row::FileHeader(fi) => self.render_file_header(*fi, *fi == current_file),
-            Row::Note(msg) => TextLine::from(TextSpan::styled(
-                format!("  {msg}"),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            )),
-            Row::HunkHeader(fi, hi) => {
-                let hunk = &self.diff.files[*fi].hunks[*hi];
-                let mut spans = vec![TextSpan::styled(
-                    hunk.header(),
-                    Style::default().fg(Color::Cyan),
-                )];
-                if let Some(section) = &hunk.section {
-                    spans.push(TextSpan::styled(
-                        format!(" {section}"),
-                        Style::default().fg(Color::DarkGray),
-                    ));
+    fn draw_body_sbs(&self, f: &mut Frame, area: Rect) {
+        let divider = 1u16;
+        let left_w = area.width.saturating_sub(divider) / 2;
+        let right_w = area.width.saturating_sub(divider + left_w);
+        let (cursor_file, cursor_flat) = self.clines.get(self.cursor).copied().unwrap_or((0, 0));
+        let current = self.current_file();
+
+        let start = self.scroll;
+        let end = (start + area.height as usize).min(self.srows.len());
+        let mut lines = Vec::with_capacity(end - start);
+        for i in start..end {
+            let line = match &self.srows[i] {
+                SRow::Spacer => TextLine::from(""),
+                SRow::FileHeader(fi) => self.file_header_line(*fi, *fi == current),
+                SRow::Note(msg) => note_line(msg),
+                SRow::HunkHeader(fi, hi) => self.hunk_header_line(*fi, *hi),
+                SRow::Pair { file, old, new } => {
+                    let left_cursor = *file == cursor_file && *old == Some(cursor_flat);
+                    let right_cursor = *file == cursor_file && *new == Some(cursor_flat);
+                    let mut spans = self.sbs_cell(*file, *old, false, left_cursor, left_w as usize);
+                    spans.push(TextSpan::styled("│", Style::default().fg(Color::DarkGray)));
+                    spans.extend(self.sbs_cell(*file, *new, true, right_cursor, right_w as usize));
+                    TextLine::from(spans)
                 }
-                TextLine::from(spans)
-            }
-            Row::Line { file, flat } => self.render_diff_line(*file, *flat, is_cursor),
+            };
+            lines.push(line);
         }
+        f.render_widget(Paragraph::new(lines), area);
     }
 
-    fn render_file_header(&self, fi: usize, is_current: bool) -> TextLine<'static> {
+    /// One side-by-side cell, padded/truncated to `width`.
+    fn sbs_cell(
+        &self,
+        file: usize,
+        flat: Option<usize>,
+        new_side: bool,
+        is_cursor: bool,
+        width: usize,
+    ) -> Vec<TextSpan<'static>> {
+        let Some(flat) = flat else {
+            // Absent side: fill the column with the "not present" background.
+            return vec![TextSpan::styled(
+                " ".repeat(width),
+                Style::default().bg(ABSENT_BG),
+            )];
+        };
+        self.ensure_render(file);
+        let (hi, li) = self.flats[file][flat];
+        let line = &self.diff.files[file].hunks[hi].lines[li];
+        let (tint, emph_bg, sign, sign_color) = kind_style(line.kind);
+        let bg = if is_cursor {
+            Some(tint.unwrap_or(CURSOR_BG))
+        } else {
+            tint
+        };
+        let base = bg.map_or_else(Style::default, |c| Style::default().bg(c));
+        let marker = if is_cursor { "▎" } else { " " };
+        let number = if new_side {
+            line.new_lineno
+        } else {
+            line.old_lineno
+        };
+        let mut spans = vec![
+            TextSpan::styled(
+                marker.to_string(),
+                base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            TextSpan::styled(
+                format!("{} ", optional_number(number, self.num_width)),
+                base.fg(Color::DarkGray),
+            ),
+            TextSpan::styled(format!("{sign} "), base.fg(sign_color)),
+        ];
+        spans.extend(self.content_spans(file, flat, base, emph_bg));
+        fit(spans, width, base)
+    }
+
+    fn file_header_line(&self, fi: usize, is_current: bool) -> TextLine<'static> {
         let file = &self.diff.files[fi];
         let (added, removed) = file.line_stats();
         let path = match (&file.old_path, &file.new_path) {
@@ -471,24 +555,33 @@ impl App {
         ])
     }
 
-    fn render_diff_line(&self, file: usize, flat: usize, is_cursor: bool) -> TextLine<'static> {
+    fn hunk_header_line(&self, fi: usize, hi: usize) -> TextLine<'static> {
+        let hunk = &self.diff.files[fi].hunks[hi];
+        let mut spans = vec![TextSpan::styled(
+            hunk.header(),
+            Style::default().fg(Color::Cyan),
+        )];
+        if let Some(section) = &hunk.section {
+            spans.push(TextSpan::styled(
+                format!(" {section}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        TextLine::from(spans)
+    }
+
+    /// A full-width unified diff line.
+    fn diff_line(&self, file: usize, flat: usize, is_cursor: bool) -> TextLine<'static> {
         self.ensure_render(file);
         let (hi, li) = self.flats[file][flat];
         let line = &self.diff.files[file].hunks[hi].lines[li];
-
-        let (tint, emph_bg, sign, sign_color) = match line.kind {
-            LineKind::Addition => (Some(ADD_BG), ADD_EMPH_BG, '+', Color::Green),
-            LineKind::Deletion => (Some(DEL_BG), DEL_EMPH_BG, '-', Color::Red),
-            LineKind::Context => (None, CURSOR_BG, ' ', Color::DarkGray),
-        };
-        // The cursor line is tinted even where a context line otherwise is not.
+        let (tint, emph_bg, sign, sign_color) = kind_style(line.kind);
         let bg = if is_cursor {
             Some(tint.unwrap_or(CURSOR_BG))
         } else {
             tint
         };
         let base = bg.map_or_else(Style::default, |c| Style::default().bg(c));
-
         let marker = if is_cursor { "▎" } else { " " };
         let old = optional_number(line.old_lineno, self.num_width);
         let new = optional_number(line.new_lineno, self.num_width);
@@ -500,25 +593,74 @@ impl App {
             TextSpan::styled(format!("{old} {new} "), base.fg(Color::DarkGray)),
             TextSpan::styled(format!("{sign} "), base.fg(sign_color)),
         ];
+        spans.extend(self.content_spans(file, flat, base, emph_bg));
+        TextLine::from(spans)
+    }
 
+    /// The highlighted (and, where changed, emphasized) content of one line.
+    fn content_spans(
+        &self,
+        file: usize,
+        flat: usize,
+        base: Style,
+        emph_bg: Color,
+    ) -> Vec<TextSpan<'static>> {
         let render = self.render.borrow();
         let data = render[file].as_ref().expect("render populated");
         let highlight = &data.highlight[flat];
         match data.intraline[flat].as_deref() {
-            Some(ranges) if !ranges.is_empty() => {
-                spans.extend(emphasize(highlight, ranges, base, emph_bg));
-            }
-            _ => {
-                for span in highlight {
-                    spans.push(TextSpan::styled(
-                        span.text.clone(),
-                        base.fg(rgb(span.color)),
-                    ));
-                }
-            }
+            Some(ranges) if !ranges.is_empty() => emphasize(highlight, ranges, base, emph_bg),
+            _ => highlight
+                .iter()
+                .map(|span| TextSpan::styled(span.text.clone(), base.fg(rgb(span.color))))
+                .collect(),
         }
-        TextLine::from(spans)
     }
+}
+
+/// The tint, emphasis background, sign, and sign color for a line kind.
+fn kind_style(kind: LineKind) -> (Option<Color>, Color, char, Color) {
+    match kind {
+        LineKind::Addition => (Some(ADD_BG), ADD_EMPH_BG, '+', Color::Green),
+        LineKind::Deletion => (Some(DEL_BG), DEL_EMPH_BG, '-', Color::Red),
+        LineKind::Context => (None, CURSOR_BG, ' ', Color::DarkGray),
+    }
+}
+
+fn note_line(msg: &str) -> TextLine<'static> {
+    TextLine::from(TextSpan::styled(
+        format!("  {msg}"),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC),
+    ))
+}
+
+/// Truncate/pad styled `spans` to exactly `width` display columns (approximated
+/// by character count), filling any remainder with `fill`.
+fn fit(spans: Vec<TextSpan<'static>>, width: usize, fill: Style) -> Vec<TextSpan<'static>> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        if used >= width {
+            break;
+        }
+        let remaining = width - used;
+        let chars: Vec<char> = span.content.chars().collect();
+        if chars.len() <= remaining {
+            used += chars.len();
+            out.push(span);
+        } else {
+            let clipped: String = chars[..remaining].iter().collect();
+            used += remaining;
+            out.push(TextSpan::styled(clipped, span.style));
+            break;
+        }
+    }
+    if used < width {
+        out.push(TextSpan::styled(" ".repeat(width - used), fill));
+    }
+    out
 }
 
 /// Build content spans from highlighted runs, giving the byte `ranges` (the
@@ -538,7 +680,6 @@ fn emphasize(
         let mut pos = start;
         while pos < end {
             let inside = ranges.iter().any(|&(a, b)| pos >= a && pos < b);
-            // Next boundary within this run: the end of the current in/out span.
             let mut next = end;
             for &(a, b) in ranges {
                 if inside {
@@ -563,7 +704,6 @@ fn emphasize(
     spans
 }
 
-/// Byte ranges of the changed segments within a side of a word diff.
 fn changed_ranges(segments: &[Segment]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut offset = 0usize;
@@ -581,8 +721,6 @@ fn rgb(color: (u8, u8, u8)) -> Color {
     Color::Rgb(color.0, color.1, color.2)
 }
 
-/// Right-align a line number to `width`, or blank when the line is absent on
-/// that side.
 fn optional_number(number: Option<u32>, width: usize) -> String {
     match number {
         Some(n) => format!("{n:>width$}"),
@@ -590,7 +728,6 @@ fn optional_number(number: Option<u32>, width: usize) -> String {
     }
 }
 
-/// Number of decimal digits in `n` (at least 1).
 fn digits(n: u32) -> usize {
     if n == 0 { 1 } else { (n.ilog10() + 1) as usize }
 }
@@ -609,6 +746,171 @@ fn status_color(status: loopreview_core::ChangeStatus) -> Color {
     }
 }
 
+/// The precomputed layouts and navigation indices for a diff.
+struct Layouts {
+    urows: Vec<URow>,
+    line_urow: Vec<usize>,
+    srows: Vec<SRow>,
+    line_srow: Vec<usize>,
+    clines: Vec<(usize, usize)>,
+    file_first: Vec<Option<usize>>,
+    hunk_first: Vec<usize>,
+    flats: Vec<Vec<(usize, usize)>>,
+    max_lineno: u32,
+}
+
+impl Layouts {
+    fn build(diff: &Diff) -> Layouts {
+        let mut urows = Vec::new();
+        let mut clines = Vec::new();
+        let mut line_urow = Vec::new();
+        let mut file_first = vec![None; diff.files.len()];
+        let mut hunk_first = Vec::new();
+        let mut flats = Vec::with_capacity(diff.files.len());
+        // Per file, flat index -> cursor index (for the side-by-side pass).
+        let mut cursor_of: Vec<Vec<usize>> = Vec::with_capacity(diff.files.len());
+        let mut max_lineno = 0u32;
+
+        for (fi, file) in diff.files.iter().enumerate() {
+            if fi > 0 {
+                urows.push(URow::Spacer);
+            }
+            urows.push(URow::FileHeader(fi));
+            let mut flat = Vec::new();
+            let mut cof = Vec::new();
+            if file.binary {
+                urows.push(URow::Note("binary file — contents not shown".to_string()));
+            } else if file.hunks.is_empty() {
+                urows.push(URow::Note(format!(
+                    "{}, no content changes",
+                    file.status.label()
+                )));
+            } else {
+                for (hi, hunk) in file.hunks.iter().enumerate() {
+                    urows.push(URow::HunkHeader(fi, hi));
+                    hunk_first.push(clines.len());
+                    max_lineno = max_lineno
+                        .max(hunk.old_start + hunk.old_lines)
+                        .max(hunk.new_start + hunk.new_lines);
+                    for li in 0..hunk.lines.len() {
+                        let cursor = clines.len();
+                        if file_first[fi].is_none() {
+                            file_first[fi] = Some(cursor);
+                        }
+                        line_urow.push(urows.len());
+                        urows.push(URow::Line {
+                            file: fi,
+                            flat: flat.len(),
+                        });
+                        cof.push(cursor);
+                        clines.push((fi, flat.len()));
+                        flat.push((hi, li));
+                    }
+                }
+            }
+            flats.push(flat);
+            cursor_of.push(cof);
+        }
+
+        // Side-by-side pass, using cursor_of to point each line at its row.
+        let mut srows = Vec::new();
+        let mut line_srow = vec![0usize; clines.len()];
+        for (fi, file) in diff.files.iter().enumerate() {
+            if fi > 0 {
+                srows.push(SRow::Spacer);
+            }
+            srows.push(SRow::FileHeader(fi));
+            if file.binary {
+                srows.push(SRow::Note("binary file — contents not shown".to_string()));
+            } else if file.hunks.is_empty() {
+                srows.push(SRow::Note(format!(
+                    "{}, no content changes",
+                    file.status.label()
+                )));
+            } else {
+                let mut flat_counter = 0usize;
+                for (hi, hunk) in file.hunks.iter().enumerate() {
+                    srows.push(SRow::HunkHeader(fi, hi));
+                    let mut dels = Vec::new();
+                    let mut adds = Vec::new();
+                    for line in &hunk.lines {
+                        let flat = flat_counter;
+                        flat_counter += 1;
+                        match line.kind {
+                            LineKind::Context => {
+                                flush_block(
+                                    fi,
+                                    &mut dels,
+                                    &mut adds,
+                                    &mut srows,
+                                    &mut line_srow,
+                                    &cursor_of,
+                                );
+                                let row = srows.len();
+                                srows.push(SRow::Pair {
+                                    file: fi,
+                                    old: Some(flat),
+                                    new: Some(flat),
+                                });
+                                line_srow[cursor_of[fi][flat]] = row;
+                            }
+                            LineKind::Deletion => dels.push(flat),
+                            LineKind::Addition => adds.push(flat),
+                        }
+                    }
+                    flush_block(
+                        fi,
+                        &mut dels,
+                        &mut adds,
+                        &mut srows,
+                        &mut line_srow,
+                        &cursor_of,
+                    );
+                }
+            }
+        }
+
+        Layouts {
+            urows,
+            line_urow,
+            srows,
+            line_srow,
+            clines,
+            file_first,
+            hunk_first,
+            flats,
+            max_lineno,
+        }
+    }
+}
+
+/// Emit side-by-side rows for a change block, pairing deletions with additions
+/// positionally and recording each line's row.
+fn flush_block(
+    file: usize,
+    dels: &mut Vec<usize>,
+    adds: &mut Vec<usize>,
+    srows: &mut Vec<SRow>,
+    line_srow: &mut [usize],
+    cursor_of: &[Vec<usize>],
+) {
+    let n = dels.len().max(adds.len());
+    for k in 0..n {
+        let old = dels.get(k).copied();
+        let new = adds.get(k).copied();
+        let row = srows.len();
+        srows.push(SRow::Pair { file, old, new });
+        if let Some(of) = old {
+            line_srow[cursor_of[file][of]] = row;
+        }
+        if let Some(nf) = new {
+            line_srow[cursor_of[file][nf]] = row;
+        }
+    }
+    dels.clear();
+    adds.clear();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,7 +926,6 @@ mod tests {
     #[test]
     fn changed_ranges_are_byte_offsets_of_changed_segments() {
         let (_old, new) = word_diff("foo bar", "foo qux");
-        // "foo " unchanged (4 bytes), "qux" changed (3 bytes).
         assert_eq!(changed_ranges(&new), vec![(4, 7)]);
     }
 
@@ -635,10 +936,20 @@ mod tests {
             color: (200, 200, 200),
         };
         let spans = emphasize(&[run], &[(4, 7)], Style::default(), Color::Rgb(1, 2, 3));
-        // "foo " then "qux": two spans, the second carrying the emphasis bg.
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content, "foo ");
         assert_eq!(spans[1].content, "qux");
         assert_eq!(spans[1].style.bg, Some(Color::Rgb(1, 2, 3)));
+    }
+
+    #[test]
+    fn fit_pads_and_truncates_to_width() {
+        let short = fit(vec![TextSpan::raw("ab")], 5, Style::default());
+        let text: String = short.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "ab   ");
+
+        let long = fit(vec![TextSpan::raw("abcdef")], 3, Style::default());
+        let text: String = long.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "abc");
     }
 }
