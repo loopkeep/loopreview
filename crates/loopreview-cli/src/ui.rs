@@ -40,7 +40,7 @@ use loopreview_core::{
 };
 
 use crate::control::{self, UiRequest};
-use crate::highlight::{Highlighter, Span as HlSpan};
+use crate::highlight::{Highlighter, LineHighlighter, Span as HlSpan};
 use crate::prsync::PrHandle;
 use crate::store::Store;
 use crate::textarea::TextArea;
@@ -395,8 +395,16 @@ struct CursorAnchor {
 }
 
 /// Cached render data for one file, aligned to that file's flat line list.
+///
+/// Highlighting is incremental: `highlight` holds only the lines shown so far
+/// and `line_highlighter` carries the syntect state to extend it on demand, so
+/// opening a large file highlights a screenful rather than the whole file. The
+/// intra-line word ranges are cheap and computed up front.
 struct FileRender {
-    /// Syntax-highlighted runs per line.
+    /// Incremental syntect state, advanced as more lines are highlighted.
+    line_highlighter: LineHighlighter,
+    /// Syntax-highlighted runs for the flat lines highlighted so far (a prefix
+    /// of the file's flat line list).
     highlight: Vec<Vec<HlSpan>>,
     /// Byte ranges of the changed words per line (`None` when the whole line is
     /// the change, or it is context).
@@ -886,14 +894,23 @@ impl App {
 
             terminal.draw(|f| self.draw(f))?;
             if event::poll(Duration::from_millis(POLL_MS))? {
-                match event::read()? {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        self.on_key(key.code, key.modifiers);
+                // Coalesce a burst: apply every event already queued (a held key
+                // or a wheel spin can deliver many at once), then loop to draw
+                // once. Without this, each event forces its own draw and input
+                // backs up behind slow frames — the reported scroll lag.
+                loop {
+                    match event::read()? {
+                        Event::Key(key) if key.kind == KeyEventKind::Press => {
+                            self.on_key(key.code, key.modifiers);
+                        }
+                        Event::Mouse(mouse) => self.on_mouse(mouse),
+                        Event::Paste(text) => self.on_paste(&text),
+                        Event::Resize(cols, _) => self.on_resize(cols),
+                        _ => {}
                     }
-                    Event::Mouse(mouse) => self.on_mouse(mouse),
-                    Event::Paste(text) => self.on_paste(&text),
-                    Event::Resize(cols, _) => self.on_resize(cols),
-                    _ => {}
+                    if self.quit || !event::poll(Duration::ZERO)? {
+                        break;
+                    }
                 }
             }
         }
@@ -2051,17 +2068,15 @@ impl App {
 
     // -- render data ------------------------------------------------------
 
+    /// Initialise a file's render cache without highlighting any lines yet: the
+    /// (cheap) intra-line ranges are computed up front, but syntax highlighting
+    /// is deferred to [`App::ensure_highlight`] so only shown lines are processed.
     fn ensure_render(&self, file: usize) {
         if self.render.borrow()[file].is_some() {
             return;
         }
         let f = &self.diff.files[file];
         let flat = &self.flats[file];
-        let texts: Vec<&str> = flat
-            .iter()
-            .map(|&(h, l)| f.hunks[h].lines[l].content.as_str())
-            .collect();
-        let highlight = self.highlighter.highlight(f.display_path(), &texts);
 
         let flat_index: HashMap<(usize, usize), usize> = flat
             .iter()
@@ -2082,9 +2097,31 @@ impl App {
             }
         }
         self.render.borrow_mut()[file] = Some(FileRender {
-            highlight,
+            line_highlighter: self.highlighter.line_highlighter(f.display_path()),
+            highlight: Vec::with_capacity(flat.len()),
             intraline,
         });
+    }
+
+    /// Highlight (incrementally, in file order) up to and including flat line
+    /// `flat` of `file`, caching results. Cheap once a line is already done, so
+    /// it is safe to call for every drawn row.
+    fn ensure_highlight(&self, file: usize, flat: usize) {
+        self.ensure_render(file);
+        let mut render = self.render.borrow_mut();
+        let data = render[file].as_mut().expect("render populated");
+        let flats = &self.flats[file];
+        let f = &self.diff.files[file];
+        let theme = self.highlighter.theme_highlighter();
+        while data.highlight.len() <= flat && data.highlight.len() < flats.len() {
+            let (h, l) = flats[data.highlight.len()];
+            let spans = self.highlighter.highlight_next(
+                &mut data.line_highlighter,
+                &theme,
+                &f.hunks[h].lines[l].content,
+            );
+            data.highlight.push(spans);
+        }
     }
 
     // -- rendering --------------------------------------------------------
@@ -2597,7 +2634,6 @@ impl App {
                 Style::default().bg(ABSENT_BG),
             )];
         };
-        self.ensure_render(file);
         let (hi, li) = self.flats[file][flat];
         let line = &self.diff.files[file].hunks[hi].lines[li];
         let (tint, emph_bg, sign, sign_color) = kind_style(line.kind);
@@ -2682,7 +2718,6 @@ impl App {
 
     /// A full-width unified diff line.
     fn diff_line(&self, file: usize, flat: usize, is_cursor: bool) -> TextLine<'static> {
-        self.ensure_render(file);
         let (hi, li) = self.flats[file][flat];
         let line = &self.diff.files[file].hunks[hi].lines[li];
         let (tint, emph_bg, sign, sign_color) = kind_style(line.kind);
@@ -2715,6 +2750,7 @@ impl App {
         base: Style,
         emph_bg: Color,
     ) -> Vec<TextSpan<'static>> {
+        self.ensure_highlight(file, flat);
         let render = self.render.borrow();
         let data = render[file].as_ref().expect("render populated");
         let highlight = &data.highlight[flat];
@@ -3616,6 +3652,29 @@ mod tests {
             Response::Ok(Reply::Threads { threads }) => assert_eq!(threads.len(), 1),
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn highlighting_is_incremental_and_reset_on_reload() {
+        let mut app = sample_app();
+        app.mode = Mode::Unified;
+        // sample_app's file 0 has two flat lines; nothing is highlighted yet.
+        assert!(app.render.borrow()[0].is_none());
+
+        // Highlighting up to a line computes only that far, and extends on demand.
+        app.ensure_highlight(0, 0);
+        assert_eq!(app.render.borrow()[0].as_ref().unwrap().highlight.len(), 1);
+        assert!(!app.render.borrow()[0].as_ref().unwrap().highlight[0].is_empty());
+        app.ensure_highlight(0, 1);
+        assert_eq!(app.render.borrow()[0].as_ref().unwrap().highlight.len(), 2);
+        // Re-requesting an already-highlighted line is a no-op.
+        app.ensure_highlight(0, 0);
+        assert_eq!(app.render.borrow()[0].as_ref().unwrap().highlight.len(), 2);
+
+        // A reload drops the cache so no stale highlight survives a diff change.
+        let diff = app.diff.clone();
+        app.reload(diff);
+        assert!(app.render.borrow()[0].is_none());
     }
 
     // -- robustness (resize, hostile input, truncation) ---------------------
