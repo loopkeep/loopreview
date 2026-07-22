@@ -1,0 +1,13 @@
+[package]
+name = "loopreview-github"
+description = "GitHub pull-request sync (diff source + comment threads) for loopreview, a review-first diff TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+loopreview-core = { path = "../loopreview-core" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.19"

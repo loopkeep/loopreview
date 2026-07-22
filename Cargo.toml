@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/loopreview-core", "crates/loopreview-cli"]
+members = [
+    "crates/loopreview-core",
+    "crates/loopreview-cli",
+    "crates/loopreview-github",
+]
 
 [workspace.package]
 version = "0.1.0"
