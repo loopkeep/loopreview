@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use crossterm::event::{KeyCode, KeyModifiers};
 
 /// A remappable command, interpreted by whichever context is active.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     MoveDown,
     MoveUp,
@@ -56,6 +56,95 @@ pub enum Action {
     FileFinder,
     Refresh,
     Submit,
+    Palette,
+}
+
+impl Action {
+    /// Every action, for listing in the command palette.
+    pub const ALL: &'static [Action] = &[
+        Action::MoveDown,
+        Action::MoveUp,
+        Action::HalfPageDown,
+        Action::HalfPageUp,
+        Action::PageDown,
+        Action::PageUp,
+        Action::Top,
+        Action::Bottom,
+        Action::NextFile,
+        Action::PrevFile,
+        Action::NextHunk,
+        Action::PrevHunk,
+        Action::NavIn,
+        Action::NavOut,
+        Action::ScrollLeft,
+        Action::ScrollRight,
+        Action::ToggleLayout,
+        Action::Comment,
+        Action::Reply,
+        Action::Resolve,
+        Action::Fold,
+        Action::Select,
+        Action::CloseReview,
+        Action::Delete,
+        Action::Edit,
+        Action::ToggleKind,
+        Action::ToggleSidebar,
+        Action::FileFinder,
+        Action::Refresh,
+        Action::Submit,
+        Action::Palette,
+    ];
+
+    /// The config/`[keys]` name — the source of truth for remappable actions is
+    /// `DEFAULTS`; the fixed Page keys get a descriptive name.
+    pub fn config_name(self) -> &'static str {
+        DEFAULTS
+            .iter()
+            .find(|(a, _, _)| *a == self)
+            .map(|(_, name, _)| *name)
+            .unwrap_or(match self {
+                Action::PageDown => "page_down",
+                Action::PageUp => "page_up",
+                _ => "?",
+            })
+    }
+
+    /// A one-line description, for the command palette.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Action::MoveDown => "Move the cursor down",
+            Action::MoveUp => "Move the cursor up",
+            Action::HalfPageDown => "Scroll half a page down",
+            Action::HalfPageUp => "Scroll half a page up",
+            Action::PageDown => "Scroll a page down",
+            Action::PageUp => "Scroll a page up",
+            Action::Top => "Jump to the top",
+            Action::Bottom => "Jump to the bottom",
+            Action::NextFile => "Next file",
+            Action::PrevFile => "Previous file",
+            Action::NextHunk => "Next hunk",
+            Action::PrevHunk => "Previous hunk",
+            Action::NavIn => "Go in: expand, or move into",
+            Action::NavOut => "Go out: fold, or move to the header",
+            Action::ScrollLeft => "Scroll the diff left",
+            Action::ScrollRight => "Scroll the diff right",
+            Action::ToggleLayout => "Toggle unified / side-by-side",
+            Action::Comment => "Comment on the line or selection",
+            Action::Reply => "Reply to the thread",
+            Action::Resolve => "Resolve or reopen the thread",
+            Action::Fold => "Fold / unfold",
+            Action::Select => "Start / cancel a line selection",
+            Action::CloseReview => "Close (delete) the review",
+            Action::Delete => "Withdraw a draft/local comment, or delete your published one",
+            Action::Edit => "Edit your own comment",
+            Action::ToggleKind => "Toggle a comment between draft and local note",
+            Action::ToggleSidebar => "Toggle the file sidebar",
+            Action::FileFinder => "Open the fuzzy file finder",
+            Action::Refresh => "Refresh from GitHub",
+            Action::Submit => "Open the submit modal",
+            Action::Palette => "Open this command palette",
+        }
+    }
 }
 
 /// Each action's config name and its default (remappable) key. The Page keys are
@@ -89,6 +178,7 @@ const DEFAULTS: &[(Action, &str, &str)] = &[
     (Action::FileFinder, "file_finder", "ctrl+p"),
     (Action::Refresh, "refresh", "ctrl+r"),
     (Action::Submit, "submit", "ctrl+s"),
+    (Action::Palette, "palette", "?"),
 ];
 
 /// Fixed alternate keys, always mapped regardless of the config.
@@ -120,6 +210,9 @@ const STRUCTURAL: &[&str] = &["q", "esc", "ctrl+c", "tab", "y"];
 #[derive(Debug, Clone)]
 pub struct Keymap {
     map: HashMap<(KeyCode, KeyModifiers), Action>,
+    /// Each action's primary key as a display string (the override or default),
+    /// for showing "the key that runs this" in the command palette.
+    primary: HashMap<Action, String>,
 }
 
 impl Keymap {
@@ -130,6 +223,10 @@ impl Keymap {
     pub fn from_overrides(overrides: &HashMap<String, String>) -> Result<Keymap, Vec<String>> {
         let mut map = HashMap::new();
         let mut errors = Vec::new();
+        // The fixed Page keys are not remappable but still shown in the palette.
+        let mut primary: HashMap<Action, String> = HashMap::new();
+        primary.insert(Action::PageDown, "PgDn".to_string());
+        primary.insert(Action::PageUp, "PgUp".to_string());
 
         // Fixed alternates first (a config override can shadow them if it collides).
         for (key, action) in FIXED {
@@ -143,6 +240,7 @@ impl Keymap {
             match parse_key(key) {
                 Ok(binding) => {
                     map.insert(binding, *action);
+                    primary.insert(*action, key.to_string());
                 }
                 Err(reason) => errors.push(format!("keys.{name} = \"{key}\": {reason}")),
             }
@@ -155,10 +253,16 @@ impl Keymap {
         }
 
         if errors.is_empty() {
-            Ok(Keymap { map })
+            Ok(Keymap { map, primary })
         } else {
             Err(errors)
         }
+    }
+
+    /// The display string of the key that runs `action` (the override or default),
+    /// or `None` for an action with no bound key.
+    pub fn key_for(&self, action: Action) -> Option<&str> {
+        self.primary.get(&action).map(String::as_str)
     }
 
     /// The default keymap (no overrides). Cannot fail — the defaults are valid.

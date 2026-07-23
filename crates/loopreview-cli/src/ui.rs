@@ -109,6 +109,16 @@ struct Finder {
     selected: usize,
 }
 
+/// The `?` command palette: a searchable list of every action with its key.
+struct Palette {
+    /// The current search text.
+    query: String,
+    /// Ranked action indices (into [`Action::ALL`]), available-in-context first.
+    matches: Vec<usize>,
+    /// Index into `matches` of the highlighted row.
+    selected: usize,
+}
+
 /// Which top-level view is showing (tabs appear once a review has threads).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -682,6 +692,8 @@ struct App {
     sidebar_scroll: usize,
     /// The fuzzy file-finder overlay, when open.
     finder: Option<Finder>,
+    /// The `?` command-palette overlay, when open.
+    palette: Option<Palette>,
     /// The cursor line where a line-range selection began (`V` or a drag).
     selection: Option<usize>,
     /// The cursor line a mouse-drag started on (to distinguish a click).
@@ -821,6 +833,7 @@ impl App {
             sidebar_cursor: 0,
             sidebar_scroll: 0,
             finder: None,
+            palette: None,
             selection: None,
             drag_anchor: None,
             hit: Cell::new(HitLayout::default()),
@@ -1467,7 +1480,8 @@ impl App {
             }
             return;
         }
-        // Modals take keys next: the composer, the submit modal, the finder.
+        // Modals take keys next: the composer, the submit modal, the finder, the
+        // command palette (each prioritizes its own text input).
         if self.input.is_some() {
             self.on_key_compose(code, mods);
             return;
@@ -1478,6 +1492,10 @@ impl App {
         }
         if self.finder.is_some() {
             self.on_key_finder(code, mods);
+            return;
+        }
+        if self.palette.is_some() {
+            self.on_key_palette(code, mods);
             return;
         }
         // While confirming a close: y/Enter closes, anything else cancels.
@@ -1531,23 +1549,100 @@ impl App {
         }
         self.status = None;
 
-        // Resolve the remappable action; dispatch globals, then the active context.
+        // Resolve the remappable action and run it in the active context.
         let Some(action) = self.keymap.action(code, mods) else {
             return;
         };
+        self.run_action(action);
+    }
+
+    /// Dispatch a remappable action through the current context — the shared path
+    /// for a key press and for the command palette. Globals first, then the pane
+    /// that has focus.
+    fn run_action(&mut self, action: Action) {
         match action {
             Action::ToggleSidebar => return self.toggle_sidebar(),
             Action::FileFinder => return self.open_finder(),
+            Action::Palette => return self.open_palette(),
             Action::Refresh if self.pr.is_some() => return self.refresh(),
             Action::Submit if self.pr.is_some() => return self.open_submit(),
             _ => {}
         }
+        let in_sidebar =
+            self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some();
         if in_sidebar {
             self.sidebar_action(action);
         } else if self.view == View::Conversation {
             self.conversation_action(action);
         } else {
             self.files_action(action);
+        }
+    }
+
+    /// Whether `action` would be handled in the current context — the palette
+    /// lists these first and greys the rest. Mirrors [`Self::run_action`]'s
+    /// routing (which pane handles which action).
+    fn action_available(&self, action: Action) -> bool {
+        use Action::*;
+        match action {
+            ToggleSidebar | FileFinder | Palette => return true,
+            Refresh | Submit => return self.pr.is_some(),
+            _ => {}
+        }
+        let in_sidebar =
+            self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some();
+        if in_sidebar {
+            return matches!(action, MoveDown | MoveUp | Top | Bottom | NavIn | Fold);
+        }
+        match self.view {
+            View::Conversation => matches!(
+                action,
+                MoveDown
+                    | MoveUp
+                    | Top
+                    | Bottom
+                    | HalfPageDown
+                    | HalfPageUp
+                    | PageDown
+                    | PageUp
+                    | Reply
+                    | Resolve
+                    | CloseReview
+                    | Delete
+                    | Edit
+                    | ToggleKind
+                    | Fold
+                    | NavIn
+                    | NavOut
+            ),
+            View::Files => matches!(
+                action,
+                MoveDown
+                    | MoveUp
+                    | HalfPageDown
+                    | HalfPageUp
+                    | PageDown
+                    | PageUp
+                    | Top
+                    | Bottom
+                    | NextFile
+                    | PrevFile
+                    | NextHunk
+                    | PrevHunk
+                    | ToggleLayout
+                    | Comment
+                    | Reply
+                    | Resolve
+                    | Fold
+                    | NavIn
+                    | NavOut
+                    | ScrollLeft
+                    | ScrollRight
+                    | Select
+                    | Delete
+                    | Edit
+                    | ToggleKind
+            ),
         }
     }
 
@@ -2569,6 +2664,83 @@ impl App {
         if let Some(f) = self.finder.as_mut() {
             f.matches = fuzzy_files(&entries, &f.query);
             f.selected = f.selected.min(f.matches.len().saturating_sub(1));
+        }
+    }
+
+    /// Open the `?` command palette: every action, searchable, available-first.
+    fn open_palette(&mut self) {
+        let available = self.action_availability();
+        self.palette = Some(Palette {
+            query: String::new(),
+            matches: fuzzy_actions("", &available),
+            selected: 0,
+        });
+    }
+
+    /// The availability of every action (index-aligned to [`Action::ALL`]) in the
+    /// current context.
+    fn action_availability(&self) -> Vec<bool> {
+        Action::ALL
+            .iter()
+            .map(|&a| self.action_available(a))
+            .collect()
+    }
+
+    /// Route a key while the command palette is open.
+    fn on_key_palette(&mut self, code: KeyCode, mods: KeyModifiers) {
+        let ctrl = mods.contains(KeyModifiers::CONTROL);
+        match code {
+            KeyCode::Esc => self.palette = None,
+            KeyCode::Enter => {
+                let action = self
+                    .palette
+                    .as_ref()
+                    .and_then(|p| p.matches.get(p.selected).copied())
+                    .map(|i| Action::ALL[i]);
+                self.palette = None;
+                if let Some(action) = action {
+                    if self.action_available(action) {
+                        self.run_action(action);
+                    } else {
+                        self.status =
+                            Some(format!("{} isn't available here", action.config_name()));
+                    }
+                }
+            }
+            KeyCode::Down => self.move_palette(1),
+            KeyCode::Up => self.move_palette(-1),
+            KeyCode::Char('n') if ctrl => self.move_palette(1),
+            KeyCode::Char('p') if ctrl => self.move_palette(-1),
+            KeyCode::Backspace => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.query.pop();
+                }
+                self.refilter_palette();
+            }
+            KeyCode::Char(c) if !ctrl => {
+                if let Some(p) = self.palette.as_mut() {
+                    p.query.push(c);
+                }
+                self.refilter_palette();
+            }
+            _ => {}
+        }
+    }
+
+    /// Move the palette selection, clamped.
+    fn move_palette(&mut self, delta: isize) {
+        if let Some(p) = self.palette.as_mut() {
+            let last = p.matches.len().saturating_sub(1) as isize;
+            p.selected = (p.selected as isize + delta).clamp(0, last) as usize;
+        }
+    }
+
+    /// Recompute the palette's matches after the query changed.
+    fn refilter_palette(&mut self) {
+        let available = self.action_availability();
+        if let Some(p) = self.palette.as_mut() {
+            p.matches = fuzzy_actions(&p.query, &available);
+            p.selected = p.selected.min(p.matches.len().saturating_sub(1));
         }
     }
 
@@ -3616,6 +3788,7 @@ impl App {
         if self.input.is_some()
             || self.submit.is_some()
             || self.finder.is_some()
+            || self.palette.is_some()
             || self.job.is_some()
             || self.loading.is_some()
         {
@@ -4158,6 +4331,9 @@ impl App {
         if let Some(finder) = &self.finder {
             self.draw_finder(f, finder);
         }
+        if let Some(palette) = &self.palette {
+            self.draw_palette(f, palette);
+        }
         if self.confirming_close {
             self.draw_close_confirm(f);
         }
@@ -4677,32 +4853,34 @@ impl App {
         if let Some(status) = &self.status {
             spans.push(TextSpan::styled(status.clone(), bar.fg(Color::Yellow)));
         } else {
-            // The hint switches with focus and with what the cursor rests on, so
-            // the keys shown are always the ones that act right now.
-            let help = if self.focus == Focus::Sidebar {
-                "j/k move · l open · o fold · esc body · ^p find · q quit"
+            // A slim hint: the handful of keys most used in this exact context,
+            // then `? all` — everything else lives in the searchable palette.
+            let ops = if self.focus == Focus::Sidebar {
+                "j/k move · l open · o fold"
             } else if self.view == View::Conversation {
                 // `x` (resolve) only appears when the selected thread can resolve.
                 if self
                     .selected_thread()
                     .is_some_and(|i| self.is_resolvable(i))
                 {
-                    "j/k comment · l open · h fold · r reply · x resolve · e edit · d del · b index · tab diff · q quit"
+                    "j/k comment · r reply · x resolve · e edit"
                 } else {
-                    "j/k comment · l open · h fold · r reply · e edit · d del · b index · tab diff · q quit"
+                    "j/k comment · r reply · e edit · d del"
                 }
             } else if self.cursor_is_header() {
-                "h fold · l open · j/k move · b sidebar · ^p find · q quit"
+                "j/k move · l open · h fold"
             } else {
-                "j/k move · h header · c comment · r reply · o fold · b sidebar · q quit"
+                "j/k move · c comment · r reply · o fold"
             };
-            spans.push(TextSpan::styled(help, bar.fg(Color::DarkGray)));
+            spans.push(TextSpan::styled(ops, bar.fg(Color::DarkGray)));
             if self.pr.is_some() {
-                spans.push(TextSpan::styled(
-                    "  · t kind · ^r refresh · ^s submit",
-                    bar.fg(PR_ACCENT),
-                ));
+                spans.push(TextSpan::styled(" · ^s submit", bar.fg(PR_ACCENT)));
             }
+            let palette_key = self.keymap.key_for(Action::Palette).unwrap_or("?");
+            spans.push(TextSpan::styled(
+                format!(" · {palette_key} all"),
+                bar.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ));
         }
         f.render_widget(Paragraph::new(TextLine::from(spans)).style(bar), area);
     }
@@ -5210,6 +5388,71 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
+    /// Draw the `?` command palette: each action as `key · name — description`,
+    /// available actions bright and unavailable ones dimmed.
+    fn draw_palette(&self, f: &mut Frame, palette: &Palette) {
+        let area = centered_rect(70, 70, f.area());
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" commands (type to filter, Enter to run, Esc to close) ")
+            .style(Style::default().bg(FINDER_BG));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let mut lines = vec![
+            TextLine::from(vec![
+                TextSpan::styled("> ", Style::default().fg(Color::Cyan)),
+                TextSpan::styled(palette.query.clone(), Style::default().fg(Color::White)),
+                TextSpan::styled("▏", Style::default().fg(Color::Gray)),
+            ]),
+            TextLine::from(""),
+        ];
+        let key_col = 8usize;
+        let list_height = (inner.height as usize).saturating_sub(2);
+        let start = palette
+            .selected
+            .saturating_sub(list_height.saturating_sub(1));
+        for (row, &action_idx) in palette
+            .matches
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(list_height)
+        {
+            let action = Action::ALL[action_idx];
+            let available = self.action_available(action);
+            let selected = row == palette.selected;
+            let base = if selected {
+                Style::default().bg(SEL_BG)
+            } else {
+                Style::default().bg(FINDER_BG)
+            };
+            let (name_fg, desc_fg, key_fg) = if available {
+                (Color::White, Color::Gray, Color::Cyan)
+            } else {
+                (Color::DarkGray, Color::DarkGray, Color::DarkGray)
+            };
+            let key = self.keymap.key_for(action).unwrap_or("—");
+            let key_field = format!("{key:>w$} ", w = key_col.saturating_sub(1));
+            lines.push(TextLine::from(vec![
+                TextSpan::styled(key_field, base.fg(key_fg)),
+                TextSpan::styled(
+                    format!("{:<14}", action.config_name()),
+                    base.fg(name_fg).add_modifier(Modifier::BOLD),
+                ),
+                TextSpan::styled(format!(" {}", action.describe()), base.fg(desc_fg)),
+            ]));
+        }
+        if palette.matches.is_empty() {
+            lines.push(TextLine::from(TextSpan::styled(
+                "  no matching commands",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn hunk_header_line(&self, fi: usize, hi: usize) -> TextLine<'static> {
         let hunk = &self.diff.files[fi].hunks[hi];
         let mut spans = vec![TextSpan::styled(
@@ -5350,6 +5593,33 @@ struct FileEntry {
 /// keeps the diff's order (every file). Returns each match's index into
 /// `entries` together with the matched character positions in its path (for
 /// highlighting).
+/// Rank the actions for the command palette: an empty query lists them all in
+/// [`Action::ALL`] order, available ones first; a query fuzzy-matches each
+/// action's name and description, ranking available matches above unavailable.
+/// Returns indices into [`Action::ALL`]. `available` is index-aligned to it.
+fn fuzzy_actions(query: &str, available: &[bool]) -> Vec<usize> {
+    let all = Action::ALL;
+    if query.is_empty() {
+        let mut idx: Vec<usize> = (0..all.len()).collect();
+        idx.sort_by_key(|&i| !available[i]); // available (true) first, stable
+        return idx;
+    }
+    let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut buf = Vec::new();
+    let mut scored: Vec<(usize, bool, u32)> = Vec::new();
+    for (i, action) in all.iter().enumerate() {
+        let hay = format!("{} {}", action.config_name(), action.describe());
+        let haystack = Utf32Str::new(&hay, &mut buf);
+        if let Some(score) = pattern.score(haystack, &mut matcher) {
+            scored.push((i, available[i], score));
+        }
+    }
+    // Available first, then higher fuzzy score.
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+    scored.into_iter().map(|(i, _, _)| i).collect()
+}
+
 fn fuzzy_files(entries: &[FileEntry], query: &str) -> Vec<(usize, Vec<u32>)> {
     if query.is_empty() {
         return (0..entries.len()).map(|i| (i, Vec::new())).collect();
@@ -8953,10 +9223,9 @@ mod tests {
 
         app.focus = Focus::Sidebar;
         term.draw(|f| app.draw(f)).unwrap();
-        assert!(
-            footer_text(&term).contains("esc body"),
-            "the sidebar shows its own hint"
-        );
+        let sidebar = footer_text(&term);
+        assert!(sidebar.contains("l open"), "the sidebar shows its own hint");
+        assert!(sidebar.contains("? all"), "and the palette anchor");
 
         // Body focus, cursor on a file header (index 0).
         app.focus = Focus::Body;
@@ -9168,6 +9437,94 @@ mod tests {
         app.on_key_finder(KeyCode::Enter, KeyModifiers::NONE);
         assert!(app.finder.is_none());
         assert_eq!(app.current_file(), 1);
+    }
+
+    #[test]
+    fn palette_opens_filters_and_runs_an_action() {
+        let mut app = sample_app(); // has a store, so Comment can open the composer
+        app.mode = Mode::Unified;
+        app.cursor = 1; // a content line
+        // `?` opens the palette through the normal key path.
+        app.on_key(KeyCode::Char('?'), KeyModifiers::NONE);
+        assert!(app.palette.is_some(), "? opens the command palette");
+        assert_eq!(
+            app.palette.as_ref().unwrap().matches.len(),
+            Action::ALL.len(),
+            "every action is listed with no query"
+        );
+        // Type to filter down to the comment action, which tops the list.
+        for c in "comment".chars() {
+            app.on_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        let top = app.palette.as_ref().unwrap().matches[0];
+        assert_eq!(Action::ALL[top], Action::Comment);
+        // Enter runs it (opens the composer) and closes the palette.
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.palette.is_none());
+        assert!(app.input.is_some(), "running Comment opened the composer");
+    }
+
+    #[test]
+    fn palette_availability_reflects_context() {
+        let mut app = sample_app();
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "me",
+            "c",
+            CommentKind::Local,
+        );
+        app.relayout();
+        // Files view: Comment applies, the Conversation-only CloseReview does not.
+        app.view = View::Files;
+        assert!(app.action_available(Action::Comment));
+        assert!(!app.action_available(Action::CloseReview));
+        // Conversation view: Comment does not apply, Reply and CloseReview do.
+        app.view = View::Conversation;
+        assert!(!app.action_available(Action::Comment));
+        assert!(app.action_available(Action::CloseReview));
+        // Submit is available only on a pull request.
+        assert!(!app.action_available(Action::Submit));
+        app.pr = Some(std::sync::Arc::new(crate::prsync::PrHandle::for_test(
+            1, "t",
+        )));
+        assert!(app.action_available(Action::Submit));
+        // Running an unavailable action reports it instead of silently no-op'ing.
+        // `next_file` is Files-only, so in the Conversation view it tops the
+        // filter yet is greyed and refused.
+        app.view = View::Conversation;
+        app.open_palette();
+        for c in "next_file".chars() {
+            app.on_key_palette(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        let top = app.palette.as_ref().unwrap().matches[0];
+        assert_eq!(Action::ALL[top], Action::NextFile);
+        app.on_key_palette(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.palette.is_none());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("isn't available")
+        );
+    }
+
+    #[test]
+    fn drawing_the_palette_does_not_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = sample_app();
+        app.open_palette();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let mut text = String::new();
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                text.push_str(buf[(x, y)].symbol());
+            }
+        }
+        assert!(text.contains("commands"), "the palette title rendered");
+        assert!(text.contains("cursor_down"), "an action name rendered");
     }
 
     #[test]
