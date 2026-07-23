@@ -163,6 +163,75 @@ impl PrStatus {
     }
 }
 
+/// An issue's lifecycle status — the three states GitHub shows distinctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueStatus {
+    /// Open.
+    Open,
+    /// Closed as completed.
+    Closed,
+    /// Closed as not planned.
+    NotPlanned,
+}
+
+impl IssueStatus {
+    /// Derive the status from the raw issue fields. GitHub issue `state` is
+    /// `"open"`/`"closed"`; `state_reason` is `"completed"`/`"not_planned"`/
+    /// `"reopened"`/null. An open state wins regardless of reason; a closed
+    /// issue is [`NotPlanned`](IssueStatus::NotPlanned) only when explicitly
+    /// closed as not-planned, otherwise it defaults to
+    /// [`Closed`](IssueStatus::Closed) (completed).
+    pub fn derive(state: &str, state_reason: Option<&str>) -> IssueStatus {
+        if state.eq_ignore_ascii_case("open") {
+            IssueStatus::Open
+        } else if state_reason == Some("not_planned") {
+            IssueStatus::NotPlanned
+        } else {
+            IssueStatus::Closed
+        }
+    }
+
+    /// The badge text.
+    pub fn label(self) -> &'static str {
+        match self {
+            IssueStatus::Open => "Open",
+            IssueStatus::Closed => "Closed",
+            IssueStatus::NotPlanned => "Not planned",
+        }
+    }
+}
+
+/// Whether a `{owner}/{repo}/issues/{n}` reference resolves to a pull request or
+/// a plain issue. GitHub's issues API numbers PRs and issues in one sequence and
+/// serves a PR through the issues endpoint too, so the number alone is
+/// ambiguous — see [`subject_kind_from_issue_json`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectKind {
+    /// The number is a pull request.
+    Pr,
+    /// The number is a plain issue.
+    Issue,
+}
+
+/// Classify the JSON that `GET /repos/{owner}/{repo}/issues/{n}` returns as a PR
+/// or a plain issue.
+///
+/// GitHub includes a top-level `"pull_request"` object only when the number is a
+/// pull request, so its presence is the discriminator.
+pub fn subject_kind_from_issue_json(json: &str) -> Result<SubjectKind, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct IssuePayload {
+        #[serde(default)]
+        pull_request: Option<serde_json::Value>,
+    }
+    let payload: IssuePayload = serde_json::from_str(json)?;
+    Ok(if payload.pull_request.is_some() {
+        SubjectKind::Pr
+    } else {
+        SubjectKind::Issue
+    })
+}
+
 /// Parse a direct-entry query into a PR/issue reference, if it looks like one.
 ///
 /// Accepts:
@@ -273,6 +342,65 @@ mod tests {
         assert_eq!(PrStatus::derive("open", false, false), Open);
         assert_eq!(PrStatus::derive("closed", false, false), Closed);
         assert_eq!(PrStatus::derive("merged", false, false), Merged);
+    }
+
+    #[test]
+    fn issue_status_follows_github_precedence() {
+        use IssueStatus::*;
+        // Open wins regardless of any reason.
+        assert_eq!(IssueStatus::derive("open", None), Open);
+        // Closed as completed reads as Closed.
+        assert_eq!(IssueStatus::derive("closed", Some("completed")), Closed);
+        // Closed as not-planned is the one distinct closed case.
+        assert_eq!(
+            IssueStatus::derive("closed", Some("not_planned")),
+            NotPlanned
+        );
+        // A closed issue with no reason defaults to Closed (completed).
+        assert_eq!(IssueStatus::derive("closed", None), Closed);
+        // A `reopened` reason on a closed state is not not-planned — Closed.
+        assert_eq!(IssueStatus::derive("closed", Some("reopened")), Closed);
+        // The state string is matched case-insensitively (API casing varies).
+        assert_eq!(IssueStatus::derive("OPEN", Some("not_planned")), Open);
+        assert_eq!(
+            IssueStatus::derive("Closed", Some("not_planned")),
+            NotPlanned
+        );
+    }
+
+    #[test]
+    fn subject_kind_detects_pull_request() {
+        // The issues endpoint carries a `pull_request` object only for PRs.
+        let pr_json = r#"{
+            "number": 7,
+            "title": "A pull request",
+            "pull_request": { "url": "https://api.github.com/repos/o/r/pulls/7" }
+        }"#;
+        assert_eq!(
+            subject_kind_from_issue_json(pr_json).unwrap(),
+            SubjectKind::Pr
+        );
+
+        // A plain issue has no `pull_request` key.
+        let issue_json = r#"{ "number": 7, "title": "A plain issue" }"#;
+        assert_eq!(
+            subject_kind_from_issue_json(issue_json).unwrap(),
+            SubjectKind::Issue
+        );
+
+        // Other fields present, still no `pull_request` — an issue.
+        let rich_issue_json = r#"{
+            "number": 7,
+            "title": "A plain issue",
+            "state": "open",
+            "state_reason": null,
+            "body": "text",
+            "user": { "login": "octocat" }
+        }"#;
+        assert_eq!(
+            subject_kind_from_issue_json(rich_issue_json).unwrap(),
+            SubjectKind::Issue
+        );
     }
 
     #[test]

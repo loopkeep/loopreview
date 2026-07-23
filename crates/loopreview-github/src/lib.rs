@@ -34,7 +34,10 @@ use std::path::{Path, PathBuf};
 use loopreview_core::{Comment, CommentKind, Thread};
 
 pub use error::GithubError;
-pub use pr::{PrAuthor, PrQuery, PrRef, PrStatus, ResolvedPr, parse_pr_query};
+pub use pr::{
+    IssueStatus, PrAuthor, PrQuery, PrRef, PrStatus, ResolvedPr, SubjectKind, parse_pr_query,
+    subject_kind_from_issue_json,
+};
 pub use push::{CommentEndpoint, ReviewCommentInput, ReviewEvent};
 pub use source::PrSource;
 
@@ -226,6 +229,23 @@ impl GithubClient {
         fresh.owner = pr.owner.clone();
         fresh.repo = pr.repo.clone();
         Ok(fresh)
+    }
+
+    /// Classify a `{owner}/{repo}#{number}` reference as a pull request or a plain
+    /// issue, via `GET /repos/{owner}/{repo}/issues/{number}` — the issues
+    /// endpoint serves both, and carries a `pull_request` object only for PRs (see
+    /// [`subject_kind_from_issue_json`]). Groundwork for a future issue reader; the
+    /// number alone is ambiguous because GitHub shares one sequence across both.
+    pub fn resolve_subject_kind(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<SubjectKind, GithubError> {
+        let path = format!("repos/{owner}/{repo}/issues/{number}");
+        let out = cmd::run_ok("gh", &["api", &path], &self.dir, None)?;
+        subject_kind_from_issue_json(&out)
+            .map_err(|e| GithubError::parse("gh api issues (subject kind)", e))
     }
 
     // -- Pull ---------------------------------------------------------------
