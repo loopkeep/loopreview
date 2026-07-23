@@ -1614,15 +1614,18 @@ impl App {
         }
     }
 
-    /// Whether `action` would be handled in the current context — the palette
-    /// lists these first and greys the rest. Mirrors [`Self::run_action`]'s
-    /// routing (which pane handles which action).
+    /// Whether `action` applies to the *exact* spot the cursor rests on — the
+    /// single source the palette greys by and the footer is built from. Unlike a
+    /// view-level check this looks at the target under the cursor: `r` only over a
+    /// thread, `t` only over an unpublished comment, `e`/`d` only over your own
+    /// editable/deletable one, `c` only on a diff line. The key press itself stays
+    /// permissive (its handler reports the fine cases); this drives what is
+    /// *shown* as useful right now.
     fn action_available(&self, action: Action) -> bool {
         use Action::*;
         match action {
-            // OpenGithub always runs (it reports "no GitHub context" itself off a PR).
-            ToggleSidebar | FileFinder | Palette | OpenGithub => return true,
-            Refresh | Submit => return self.pr.is_some(),
+            ToggleSidebar | FileFinder | Palette => return true,
+            Refresh | Submit | OpenGithub => return self.pr.is_some(),
             _ => {}
         }
         let in_sidebar =
@@ -1630,56 +1633,76 @@ impl App {
         if in_sidebar {
             return matches!(action, MoveDown | MoveUp | Top | Bottom | NavIn | Fold);
         }
-        match self.view {
-            View::Conversation => matches!(
-                action,
-                MoveDown
-                    | MoveUp
-                    | Top
-                    | Bottom
-                    | HalfPageDown
-                    | HalfPageUp
-                    | PageDown
-                    | PageUp
-                    | Reply
-                    | Resolve
-                    | CloseReview
-                    | Delete
-                    | Edit
-                    | ToggleKind
-                    | Fold
-                    | NavIn
-                    | NavOut
-            ),
-            View::Files => matches!(
-                action,
-                MoveDown
-                    | MoveUp
-                    | HalfPageDown
-                    | HalfPageUp
-                    | PageDown
-                    | PageUp
-                    | Top
-                    | Bottom
-                    | NextFile
-                    | PrevFile
-                    | NextHunk
-                    | PrevHunk
-                    | ToggleLayout
-                    | Comment
-                    | Reply
-                    | Resolve
-                    | Fold
-                    | NavIn
-                    | NavOut
-                    | ScrollLeft
-                    | ScrollRight
-                    | Select
-                    | Delete
-                    | Edit
-                    | ToggleKind
-            ),
+        // Body movement and navigation always apply.
+        if matches!(
+            action,
+            MoveDown
+                | MoveUp
+                | HalfPageDown
+                | HalfPageUp
+                | PageDown
+                | PageUp
+                | Top
+                | Bottom
+                | NavIn
+                | NavOut
+        ) {
+            return true;
         }
+        // The thread/comment the cursor points at (Conversation: the selected
+        // comment; Files: the thread anchored at the cursor line's root).
+        let target = self.edit_target();
+        let target_unpublished_kind = || {
+            self.pr.is_some()
+                && target.is_some_and(|(ti, ci)| {
+                    self.review.threads[ti]
+                        .comments
+                        .get(ci)
+                        .is_some_and(|c| c.disposition() != CommentKind::Published)
+                })
+        };
+        let common = |action: Action| match action {
+            Reply => target.is_some(),
+            Resolve => target.is_some_and(|(ti, _)| self.is_resolvable(ti)),
+            Edit => self.can_edit_target(),
+            Delete => self.selected_delete_target().is_some(),
+            ToggleKind => target_unpublished_kind(),
+            _ => false,
+        };
+        match self.view {
+            View::Conversation => match action {
+                Fold => !self.review.threads.is_empty(),
+                CloseReview => self.has_review(),
+                _ => common(action),
+            },
+            View::Files => match action {
+                NextFile | PrevFile | NextHunk | PrevHunk | ScrollLeft | ScrollRight
+                | ToggleLayout | Fold => !self.diff.files.is_empty(),
+                Comment | Select => !self.clines.is_empty() && !self.cursor_is_header(),
+                _ => common(action),
+            },
+        }
+    }
+
+    /// Whether the comment the cursor targets is one the reviewer can edit — their
+    /// own comment, and (if already published) one with an addressable GitHub id.
+    /// The gate `start_edit` applies, factored out for `action_available`.
+    fn can_edit_target(&self) -> bool {
+        let Some((ti, ci)) = self.edit_target() else {
+            return false;
+        };
+        let Some(comment) = self.review.threads[ti].comments.get(ci) else {
+            return false;
+        };
+        if !self.comment_is_mine(comment) {
+            return false;
+        }
+        if comment.is_published() {
+            return self
+                .published_endpoint(&self.review.threads[ti].id, &comment.id)
+                .is_some();
+        }
+        true
     }
 
     fn files_action(&mut self, action: Action) {
@@ -4890,6 +4913,59 @@ impl App {
         }
     }
 
+    /// The footer's key hints: a movement prefix, then the top few actions that
+    /// [`Self::action_available`] reports for the cursor's spot, in priority
+    /// order and capped so the bar stays readable. Submit and `? all` are added
+    /// by the caller.
+    fn footer_ops(&self) -> String {
+        use Action::*;
+        let key = |a: Action| self.keymap.key_for(a).unwrap_or("?").to_string();
+        let in_sidebar =
+            self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some();
+        // j/k steps comments in the Conversation body, files/lines otherwise.
+        let move_label = if !in_sidebar && self.view == View::Conversation {
+            "comment"
+        } else {
+            "move"
+        };
+        let mut parts = vec![format!("{}/{} {move_label}", key(MoveDown), key(MoveUp))];
+        // Priority-ordered candidates per context; only the available ones show,
+        // capped so the bar stays readable. `reply` and `kind` rank high so they
+        // are never crowded out when they apply (the two the FB calls out).
+        let candidates: &[(Action, &str)] = if in_sidebar {
+            &[(NavIn, "open"), (Fold, "fold")]
+        } else if self.view == View::Conversation {
+            &[
+                (Reply, "reply"),
+                (ToggleKind, "kind"),
+                (Edit, "edit"),
+                (Delete, "del"),
+                (Resolve, "resolve"),
+                (Fold, "fold"),
+            ]
+        } else {
+            &[
+                (NavIn, "open"),
+                (Comment, "comment"),
+                (Reply, "reply"),
+                (ToggleKind, "kind"),
+                (Edit, "edit"),
+                (Delete, "del"),
+                (Resolve, "resolve"),
+                (Fold, "fold"),
+            ]
+        };
+        for (action, label) in candidates {
+            if parts.len() >= 6 {
+                break;
+            }
+            if self.action_available(*action) {
+                parts.push(format!("{} {label}", key(*action)));
+            }
+        }
+        parts.join(" · ")
+    }
+
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let bar = Style::default().bg(BAR_BG);
         let position = if self.view == View::Conversation {
@@ -4926,27 +5002,11 @@ impl App {
         if let Some(status) = &self.status {
             spans.push(TextSpan::styled(status.clone(), bar.fg(Color::Yellow)));
         } else {
-            // A slim hint: the handful of keys most used in this exact context,
-            // then `? all` — everything else lives in the searchable palette.
-            let ops = if self.focus == Focus::Sidebar {
-                "j/k move · l open · o fold"
-            } else if self.view == View::Conversation {
-                // `x` (resolve) only appears when the selected thread can resolve.
-                if self
-                    .selected_thread()
-                    .is_some_and(|i| self.is_resolvable(i))
-                {
-                    "j/k comment · r reply · x resolve · e edit"
-                } else {
-                    "j/k comment · r reply · e edit · d del"
-                }
-            } else if self.cursor_is_header() {
-                "j/k move · l open · h fold"
-            } else {
-                "j/k move · c comment · r reply · o fold"
-            };
-            spans.push(TextSpan::styled(ops, bar.fg(Color::DarkGray)));
-            if self.pr.is_some() {
+            // A slim hint built from `action_available`, so it shows only the keys
+            // useful at the cursor's exact spot (and stays in lockstep with the
+            // palette's grey-out). Everything else is one `? all` away.
+            spans.push(TextSpan::styled(self.footer_ops(), bar.fg(Color::DarkGray)));
+            if self.action_available(Action::Submit) {
                 spans.push(TextSpan::styled(" · ^s submit", bar.fg(PR_ACCENT)));
             }
             let palette_key = self.keymap.key_for(Action::Palette).unwrap_or("?");
@@ -9563,14 +9623,17 @@ mod tests {
         assert!(sidebar.contains("l open"), "the sidebar shows its own hint");
         assert!(sidebar.contains("? all"), "and the palette anchor");
 
-        // Body focus, cursor on a file header (index 0).
+        // Body focus, cursor on a file header (index 0): move/open/fold, but no
+        // `comment` (nothing on a header to comment on).
         app.focus = Focus::Body;
         app.cursor = 0;
         assert!(app.cursor_is_header());
         term.draw(|f| app.draw(f)).unwrap();
+        let header = footer_text(&term);
+        assert!(header.contains("o fold"), "the header shows the fold hint");
         assert!(
-            footer_text(&term).contains("h fold"),
-            "the body header shows the fold/open hint"
+            !header.contains("comment"),
+            "and no comment hint on a header"
         );
     }
 
@@ -9810,10 +9873,18 @@ mod tests {
             CommentKind::Local,
         );
         app.relayout();
-        // Files view: Comment applies, the Conversation-only CloseReview does not.
+        // Files view, cursor on a content line: Comment applies (it would not on a
+        // header), the Conversation-only CloseReview does not.
         app.view = View::Files;
+        app.cursor = 1; // a content line, not the file header
+        assert!(!app.cursor_is_header());
         assert!(app.action_available(Action::Comment));
         assert!(!app.action_available(Action::CloseReview));
+        // On the file header, Comment no longer applies (nothing to comment on).
+        app.cursor = 0;
+        assert!(app.cursor_is_header());
+        assert!(!app.action_available(Action::Comment));
+        app.cursor = 1;
         // Conversation view: Comment does not apply, Reply and CloseReview do.
         app.view = View::Conversation;
         assert!(!app.action_available(Action::Comment));
@@ -9842,6 +9913,82 @@ mod tests {
                 .unwrap_or("")
                 .contains("isn't available")
         );
+    }
+
+    #[test]
+    fn footer_reflects_the_cursor_target() {
+        // Files, a bare line (no thread): `comment` shows, `reply` does not.
+        let mut app = sample_app(); // author "tester"
+        app.mode = Mode::Unified;
+        app.view = View::Files;
+        app.cursor = 1; // a content line with no thread
+        let f = app.footer_ops();
+        assert!(f.contains("comment"), "a bare line can be commented: {f}");
+        assert!(!f.contains("reply"), "no thread here to reply to: {f}");
+
+        // A thread of my own on line 2: over it, `reply` and `edit` appear.
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "mine",
+            CommentKind::Local,
+        );
+        app.relayout();
+        app.cursor = 2; // the addition line, where the thread is anchored
+        let f = app.footer_ops();
+        assert!(f.contains("reply"), "a thread here can be replied to: {f}");
+        assert!(f.contains("edit"), "and my own comment edited: {f}");
+
+        // Conversation, my draft comment on a PR: `kind` and `edit` show.
+        let mut draft = pr_app(); // viewer "tester"
+        draft.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "d",
+            CommentKind::Draft,
+        );
+        draft.relayout();
+        draft.view = View::Conversation;
+        draft.conv_cursor = 0;
+        let f = draft.footer_ops();
+        assert!(
+            f.contains("kind"),
+            "an unpublished comment toggles kind: {f}"
+        );
+        assert!(f.contains("edit"), "and can be edited: {f}");
+
+        // My published comment: no `kind` (can't change), but `edit` remains.
+        let mut published = pr_app();
+        published
+            .review
+            .threads
+            .push(published_comment("c", "tester", "555"));
+        published.relayout();
+        published.view = View::Conversation;
+        published.conv_cursor = 0;
+        let f = published.footer_ops();
+        assert!(
+            !f.contains("kind"),
+            "a published comment can't toggle kind: {f}"
+        );
+        assert!(
+            f.contains("edit"),
+            "but I can edit my own published one: {f}"
+        );
+
+        // Someone else's comment: no `edit`/`del`, but `reply` still applies.
+        let mut other = pr_app();
+        other
+            .review
+            .threads
+            .push(published_comment("c", "someone-else", "555"));
+        other.relayout();
+        other.view = View::Conversation;
+        other.conv_cursor = 0;
+        let f = other.footer_ops();
+        assert!(!f.contains("edit"), "not my comment — no edit: {f}");
+        assert!(!f.contains("del"), "nor delete: {f}");
+        assert!(f.contains("reply"), "but there's a thread to reply to: {f}");
     }
 
     #[test]
