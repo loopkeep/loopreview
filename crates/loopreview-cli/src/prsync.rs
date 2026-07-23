@@ -47,6 +47,39 @@ pub fn fetch(
     Ok((PrHandle { client, pr, viewer }, label, diff, threads))
 }
 
+/// The PR facts the Overview tab shows: the lifecycle status, the header line
+/// facts, and the markdown description. A plain snapshot, refreshed on Ctrl-R.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrOverview {
+    pub number: u64,
+    pub status: PrStatus,
+    pub title: String,
+    /// The PR author's login (may be empty when unknown).
+    pub author: String,
+    pub base_ref: String,
+    pub head_ref: String,
+    pub created_at: Option<String>,
+    pub merged_at: Option<String>,
+    /// The PR description (markdown).
+    pub body: String,
+}
+
+impl PrOverview {
+    fn from_pr(pr: &ResolvedPr) -> PrOverview {
+        PrOverview {
+            number: pr.number,
+            status: pr.status(),
+            title: pr.title.clone(),
+            author: pr.author_login().to_string(),
+            base_ref: pr.base_ref.clone(),
+            head_ref: pr.head_ref.clone(),
+            created_at: pr.created_at.clone(),
+            merged_at: pr.merged_at.clone(),
+            body: pr.body.clone(),
+        }
+    }
+}
+
 /// A resolved pull request plus a client, for syncing back to GitHub.
 pub struct PrHandle {
     client: GithubClient,
@@ -94,6 +127,9 @@ impl PrHandle {
                 state: "OPEN".into(),
                 is_draft: false,
                 merged_at: None,
+                created_at: None,
+                author: None,
+                body: String::new(),
                 url: format!("https://github.com/owner/repo/pull/{number}"),
             },
             viewer: Some("tester".into()),
@@ -114,18 +150,21 @@ impl PrHandle {
         self.viewer.as_deref()
     }
 
-    /// The PR's lifecycle status (draft / open / merged / closed), for the header
-    /// badge — as resolved at load.
-    pub fn status(&self) -> PrStatus {
-        self.pr.status()
+    /// The PR overview (status + facts + description), for the header badge and
+    /// the Overview tab — as resolved at load.
+    pub fn overview(&self) -> PrOverview {
+        PrOverview::from_pr(&self.pr)
     }
 
-    /// Re-fetch the PR's status from GitHub — the refresh path, so the badge
-    /// follows a transition (open → merged, closed → …) on Ctrl-R.
-    pub fn fetch_status(&self) -> Result<PrStatus, String> {
-        self.client
-            .fetch_pr_status(&self.pr)
-            .map_err(|e| e.to_string())
+    /// Re-fetch the PR overview from GitHub — the refresh path, so the badge and
+    /// the Overview follow a transition (open → merged) or a description edit on
+    /// Ctrl-R.
+    pub fn fetch_overview(&self) -> Result<PrOverview, String> {
+        let fresh = self
+            .client
+            .refresh_pr(&self.pr)
+            .map_err(|e| e.to_string())?;
+        Ok(PrOverview::from_pr(&fresh))
     }
 
     /// Re-pull the PR's threads from GitHub.

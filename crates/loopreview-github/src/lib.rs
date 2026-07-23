@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use loopreview_core::{Comment, CommentKind, Thread};
 
 pub use error::GithubError;
-pub use pr::{PrQuery, PrRef, PrStatus, ResolvedPr, parse_pr_query};
+pub use pr::{PrAuthor, PrQuery, PrRef, PrStatus, ResolvedPr, parse_pr_query};
 pub use push::{CommentEndpoint, ReviewCommentInput, ReviewEvent};
 pub use source::PrSource;
 
@@ -199,19 +199,12 @@ impl GithubClient {
         PrSource::new(self.dir.clone(), pr.base_ref.clone(), pr.number)
     }
 
-    /// Re-fetch just `pr`'s lifecycle status (state / draft / merged) — a cheap
-    /// `gh pr view` so the header badge follows a transition (e.g. open → merged)
-    /// on refresh, without re-pulling the whole diff and comment set.
-    pub fn fetch_pr_status(&self, pr: &ResolvedPr) -> Result<PrStatus, GithubError> {
-        #[derive(serde::Deserialize)]
-        struct StatusFields {
-            #[serde(default)]
-            state: String,
-            #[serde(default, rename = "isDraft")]
-            is_draft: bool,
-            #[serde(default, rename = "mergedAt")]
-            merged_at: Option<String>,
-        }
+    /// Re-fetch `pr`'s metadata (state / draft / merged, title, author, body,
+    /// timestamps) with a single `gh pr view`, so the header badge and the
+    /// Overview follow a transition (e.g. open → merged) or a description edit on
+    /// refresh, without re-pulling the whole diff and comment set. The `owner` /
+    /// `repo` are carried over from `pr` (they are not part of the JSON).
+    pub fn refresh_pr(&self, pr: &ResolvedPr) -> Result<ResolvedPr, GithubError> {
         let number = pr.number.to_string();
         let slug = pr.slug();
         let out = cmd::run_ok(
@@ -223,18 +216,16 @@ impl GithubClient {
                 "--repo",
                 &slug,
                 "--json",
-                "state,isDraft,mergedAt",
+                &pr_view_fields(),
             ],
             &self.dir,
             None,
         )?;
-        let f: StatusFields =
-            serde_json::from_str(&out).map_err(|e| GithubError::parse("gh pr view (status)", e))?;
-        Ok(PrStatus::derive(
-            &f.state,
-            f.is_draft,
-            f.merged_at.is_some(),
-        ))
+        let mut fresh: ResolvedPr = serde_json::from_str(&out)
+            .map_err(|e| GithubError::parse("gh pr view (refresh)", e))?;
+        fresh.owner = pr.owner.clone();
+        fresh.repo = pr.repo.clone();
+        Ok(fresh)
     }
 
     // -- Pull ---------------------------------------------------------------
@@ -614,7 +605,8 @@ impl GithubClient {
 
 /// The `--json` field set requested from `gh pr view`.
 fn pr_view_fields() -> String {
-    "number,title,baseRefName,headRefName,state,isDraft,mergedAt,url".to_string()
+    "number,title,baseRefName,headRefName,state,isDraft,mergedAt,createdAt,author,body,url"
+        .to_string()
 }
 
 /// A human description of a PR reference, for a not-found message.
@@ -778,7 +770,7 @@ mod tests {
     fn pr_view_fields_are_stable() {
         assert_eq!(
             pr_view_fields(),
-            "number,title,baseRefName,headRefName,state,isDraft,mergedAt,url"
+            "number,title,baseRefName,headRefName,state,isDraft,mergedAt,createdAt,author,body,url"
         );
     }
 }

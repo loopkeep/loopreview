@@ -39,7 +39,9 @@ features use the `gh` CLI.
   two-way comment sync, drafts that persist across sessions, and a submit modal
   (Comment / Approve / Request changes / Pending). The header shows the PR's
   status (Draft / Open / Merged / Closed) beside its `#number`, and it follows a
-  transition on refresh.
+  transition on refresh. An **Overview** tab (PR only) shows the PR's facts —
+  number, status, title, author, `base ← head`, dates — and its rendered
+  description, read-only.
 - **Agent control plane** — a running review hosts a local socket so an agent can
   read the diff structure, move your cursor, leave local notes (or drafts to
   submit), and block on review events (`lr session …`).
@@ -116,7 +118,7 @@ files from a working-tree review.
 | Key | Action |
 | --- | --- |
 | `q` / `Esc` / `Ctrl-C` | Quit |
-| `Tab` / `Shift+Tab` | Cycle the views forward / back (Files ⇆ Conversation; always on a repo diff or PR, a plain patch has no tabs) |
+| `Tab` / `Shift+Tab` | Cycle the views forward / back (a repo diff has Files ⇆ Conversation; a pull request adds an **Overview** tab on the left, so Files → Shift+Tab reaches Overview and Tab reaches Conversation; a plain patch has no tabs) |
 | `?` | Open the command palette — a searchable list of every action with its current key; actions that apply right now are listed first, the rest greyed |
 | `b` | Toggle the file-explorer sidebar |
 | `Ctrl-P` | Open the fuzzy file finder |
@@ -211,6 +213,10 @@ key saves inside and submits outside; the composer's hint bar always names the
 key that saves. Prefer `Enter` to save? Set `composer_enter = "save"` (below) —
 worth it only where your terminal reports `Shift+Enter` (the Kitty protocol),
 which then becomes the newline (with `Alt+Enter` as a fallback).
+
+Comment bodies and the PR description render as markdown — headings, emphasis,
+inline and fenced (syntax-highlighted) code, lists, block quotes, GitHub alerts
+(`> [!NOTE]` / `[!WARNING]` …), task lists (`- [ ]` / `- [x]`), and tables.
 
 ## Reviewing
 

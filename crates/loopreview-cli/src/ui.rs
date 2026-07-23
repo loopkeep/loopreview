@@ -49,7 +49,7 @@ use crate::control::{self, UiRequest};
 use crate::highlight::{Highlighter, LineHighlighter, Span as HlSpan};
 use crate::keys::Action;
 use crate::palette::*;
-use crate::prsync::PrHandle;
+use crate::prsync::{PrHandle, PrOverview};
 use crate::store::Store;
 use crate::textarea::TextArea;
 
@@ -122,6 +122,8 @@ struct Palette {
 /// Which top-level view is showing (tabs appear for any comment-capable source).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
+    /// The pull request's facts and description — PR only, leftmost.
+    Overview,
     /// The diff, with comments inline.
     Files,
     /// The comment threads, chronological with replies.
@@ -129,18 +131,9 @@ enum View {
 }
 
 impl View {
-    /// The tab order, left to right — the cycle `Tab` / `Shift+Tab` walk. Adding
-    /// a tab here (e.g. PR metadata) makes both directions cycle through it.
-    const ORDER: &'static [View] = &[View::Files, View::Conversation];
-
-    /// The next (`forward`) or previous tab in the cycle, wrapping around.
-    fn cycle(self, forward: bool) -> View {
-        let order = View::ORDER;
-        let n = order.len();
-        let i = order.iter().position(|&v| v == self).unwrap_or(0);
-        let delta = if forward { 1 } else { n - 1 };
-        order[(i + delta) % n]
-    }
+    /// The full tab order, left to right. `Overview` is present only on a pull
+    /// request; the app filters this by availability when cycling and drawing.
+    const ORDER: &'static [View] = &[View::Overview, View::Files, View::Conversation];
 }
 
 /// Everything the review UI needs for one session.
@@ -238,10 +231,10 @@ enum JobMsg {
 /// The result a finished [`Job`] applies to the review.
 enum JobOutcome {
     /// A re-pulled thread list to merge with local drafts, plus the PR's fresh
-    /// lifecycle status (`None` when the status re-fetch failed — keep the old).
+    /// overview (`None` when the metadata re-fetch failed — keep the old).
     Refreshed {
         threads: Vec<Thread>,
-        status: Option<PrStatus>,
+        overview: Option<PrOverview>,
     },
     /// The thread (by id) had its resolution synced. Id, not index: the review
     /// can shift while the network job runs.
@@ -659,12 +652,9 @@ struct HitLayout {
     sidebar_x0: u16,
     /// Sidebar inner width in columns (0 = hidden).
     sidebar_w: u16,
-    /// The tab bar row, when the tabs are shown.
+    /// The tab bar row, when the tabs are shown. The tab a click lands on is
+    /// recomputed from the labels (`tab_at_column`), so no per-tab columns here.
     tabs_row: Option<u16>,
-    /// The Files tab occupies columns `[0, tab_files_end)`.
-    tab_files_end: u16,
-    /// The Conversation tab occupies `[tab_files_end + 1, tab_conv_end)`.
-    tab_conv_end: u16,
     /// The footer row.
     footer_row: u16,
     /// The layout indicator occupies `[0, layout_end)` on the footer row.
@@ -832,9 +822,12 @@ struct App {
     job: Option<Job>,
     /// The pull-request handle, when reviewing a PR (enables sync/submit).
     pr: Option<Arc<PrHandle>>,
-    /// The PR's lifecycle status for the header badge — resolved at load, and
-    /// re-fetched on refresh so a transition (open → merged) follows.
-    pr_status: Option<PrStatus>,
+    /// The PR overview (status + facts + description) for the header badge and the
+    /// Overview tab — resolved at load, re-fetched on refresh so a transition
+    /// (open → merged) or a description edit follows.
+    pr_overview: Option<PrOverview>,
+    /// The Overview tab's read-only scroll offset (in rendered lines).
+    overview_scroll: usize,
     /// The store key for the current PR's drafts (`owner/repo#number`).
     pr_key: Option<String>,
     /// The repo directory, for reconstructing outdated lines from history.
@@ -959,7 +952,8 @@ impl App {
             load_error: None,
             job: None,
             pr: None,
-            pr_status: None,
+            pr_overview: None,
+            overview_scroll: 0,
             pr_key: None,
             repo_dir,
             source: None,
@@ -999,7 +993,8 @@ impl App {
         self.normalize_resolved_drafts();
         self.normalize_conversation_reply_drafts();
         self.pr = loaded.pr.map(Arc::new);
-        self.pr_status = self.pr.as_deref().map(PrHandle::status);
+        self.pr_overview = self.pr.as_deref().map(PrHandle::overview);
+        self.overview_scroll = 0;
         self.pr_key = loaded.pr_key;
         self.apply_layout(loaded.diff);
         self.cursor = 0;
@@ -1064,13 +1059,13 @@ impl App {
     /// Apply a finished background action.
     fn apply_job(&mut self, result: Result<JobOutcome, String>) {
         match result {
-            Ok(JobOutcome::Refreshed { threads, status }) => {
+            Ok(JobOutcome::Refreshed { threads, overview }) => {
                 let (merged, cleaned, orphans) = crate::prsync::merge_drafts(&self.review, threads);
                 self.review.threads = merged;
-                // Follow a lifecycle transition (open → merged, …); a failed
-                // status re-fetch (`None`) leaves the badge as it was.
-                if let Some(status) = status {
-                    self.pr_status = Some(status);
+                // Follow a lifecycle transition (open → merged) or a description
+                // edit; a failed metadata re-fetch (`None`) leaves the old values.
+                if overview.is_some() {
+                    self.pr_overview = overview;
                 }
                 let mut notes = Vec::new();
                 if cleaned > 0 {
@@ -1185,9 +1180,9 @@ impl App {
             Box::new(move |progress| {
                 progress("fetching comments…");
                 let threads = pr.pull()?;
-                // Best-effort: a status re-fetch failure keeps the current badge.
-                let status = pr.fetch_status().ok();
-                Ok(JobOutcome::Refreshed { threads, status })
+                // Best-effort: a metadata re-fetch failure keeps the current facts.
+                let overview = pr.fetch_overview().ok();
+                Ok(JobOutcome::Refreshed { threads, overview })
             }),
         );
     }
@@ -1709,15 +1704,46 @@ impl App {
         self.comments_enabled() || self.has_review()
     }
 
+    /// Whether `view` is reachable right now — the Overview only on a pull request.
+    fn view_available(&self, view: View) -> bool {
+        match view {
+            View::Overview => self.pr.is_some(),
+            View::Files | View::Conversation => true,
+        }
+    }
+
+    /// The tabs currently shown, left to right (Overview only on a PR).
+    fn visible_views(&self) -> Vec<View> {
+        View::ORDER
+            .iter()
+            .copied()
+            .filter(|&v| self.view_available(v))
+            .collect()
+    }
+
+    /// The next (`forward`) or previous visible tab, wrapping around — what
+    /// `Tab` / `Shift+Tab` step through.
+    fn cycle_view(&self, forward: bool) -> View {
+        let order = self.visible_views();
+        if order.is_empty() {
+            return self.view;
+        }
+        let n = order.len();
+        let i = order.iter().position(|&v| v == self.view).unwrap_or(0);
+        let delta = if forward { 1 } else { n - 1 };
+        order[(i + delta) % n]
+    }
+
     /// Switch the top-level view, re-syncing the sidebar so its index scroll
     /// tracks the new view's selection (the current file, or the selected
-    /// thread).
+    /// thread). The Overview has no sidebar.
     fn set_view(&mut self, view: View) {
         self.view = view;
-        if view == View::Conversation {
-            self.reveal_in_sidebar(self.conv_cursor);
-        } else {
-            self.reveal_file_in_sidebar(self.current_file());
+        match view {
+            View::Conversation => self.reveal_in_sidebar(self.conv_cursor),
+            View::Files => self.reveal_file_in_sidebar(self.current_file()),
+            // The Overview has no sidebar; keep focus in the body pane.
+            View::Overview => self.focus = Focus::Body,
         }
     }
 
@@ -1798,11 +1824,11 @@ impl App {
             // as forward: inert when there are no tabs.
             (KeyCode::Tab, _) if self.shows_tabs() => {
                 let forward = !mods.contains(KeyModifiers::SHIFT);
-                self.set_view(self.view.cycle(forward));
+                self.set_view(self.cycle_view(forward));
                 return;
             }
             (KeyCode::BackTab, _) if self.shows_tabs() => {
-                self.set_view(self.view.cycle(false));
+                self.set_view(self.cycle_view(false));
                 return;
             }
             _ => {}
@@ -1850,11 +1876,41 @@ impl App {
             self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some();
         if in_sidebar {
             self.sidebar_action(action);
-        } else if self.view == View::Conversation {
-            self.conversation_action(action);
         } else {
-            self.files_action(action);
+            match self.view {
+                View::Overview => self.overview_action(action),
+                View::Conversation => self.conversation_action(action),
+                View::Files => self.files_action(action),
+            }
         }
+    }
+
+    /// Route an action in the Overview tab — a read-only scroll pane, so only the
+    /// movement keys do anything (comment actions are absent by design).
+    fn overview_action(&mut self, action: Action) {
+        let page = self.body_height.get().max(1);
+        let max = self.overview_max_scroll();
+        match action {
+            Action::MoveDown => self.overview_scroll = (self.overview_scroll + 1).min(max),
+            Action::MoveUp => self.overview_scroll = self.overview_scroll.saturating_sub(1),
+            Action::Top => self.overview_scroll = 0,
+            Action::Bottom => self.overview_scroll = max,
+            Action::HalfPageDown | Action::PageDown => {
+                self.overview_scroll = (self.overview_scroll + page / 2).min(max)
+            }
+            Action::HalfPageUp | Action::PageUp => {
+                self.overview_scroll = self.overview_scroll.saturating_sub(page / 2)
+            }
+            _ => {}
+        }
+    }
+
+    /// The Overview's maximum scroll offset (its rendered height past the pane).
+    fn overview_max_scroll(&self) -> usize {
+        let height = self.body_height.get().max(1);
+        self.overview_lines(self.body_width.get())
+            .len()
+            .saturating_sub(height)
     }
 
     /// Whether `action` applies to the *exact* spot the cursor rests on — the
@@ -1922,6 +1978,9 @@ impl App {
             _ => false,
         };
         match self.view {
+            // The Overview is read-only: only the movement keys (handled above)
+            // and the globals (Ctrl-O / Ctrl-R) apply — no comment actions.
+            View::Overview => false,
             View::Conversation => match action {
                 NavIn => true,
                 // `c` starts a new conversation comment (needs somewhere to keep it).
@@ -4129,12 +4188,15 @@ impl App {
     /// The human reviewer's current focus, for `lr session context`.
     fn context_info(&self) -> ContextInfo {
         let view = match self.view {
+            View::Overview => "overview",
             View::Files => "files",
             View::Conversation => "conversation",
         }
         .to_string();
         let cursor = self.current_anchor();
         let thread = match self.view {
+            // The Overview carries no comment cursor (read-only PR facts).
+            View::Overview => None,
             View::Conversation => self
                 .selected_thread()
                 .map(|t| self.review.threads[t].id.clone()),
@@ -4669,10 +4731,16 @@ impl App {
     fn scroll_wheel(&mut self, col: u16, row: u16, delta: isize) {
         if let Region::Sidebar(_) = hit_region(col, row, self.hit.get()) {
             self.scroll_sidebar(delta);
-        } else if self.view == View::Conversation {
-            self.scroll_conv(delta);
         } else {
-            self.scroll_view(delta);
+            match self.view {
+                View::Overview => {
+                    let max = self.overview_max_scroll() as isize;
+                    self.overview_scroll =
+                        (self.overview_scroll as isize + delta).clamp(0, max) as usize;
+                }
+                View::Conversation => self.scroll_conv(delta),
+                View::Files => self.scroll_view(delta),
+            }
         }
     }
 
@@ -4755,11 +4823,8 @@ impl App {
             Region::LayoutToggle => self.toggle_mode(),
             Region::PrLink => self.open_pr_page(),
             Region::Tabs if self.shows_tabs() => {
-                let hit = self.hit.get();
-                if column < hit.tab_files_end {
-                    self.set_view(View::Files);
-                } else if column > hit.tab_files_end && column < hit.tab_conv_end {
-                    self.set_view(View::Conversation);
+                if let Some(view) = self.tab_at_column(column) {
+                    self.set_view(view);
                 }
             }
             Region::Sidebar(row) => {
@@ -5118,7 +5183,10 @@ impl App {
         let mut content = body;
         let mut sidebar_x0 = 0u16;
         let mut sidebar_cols = 0u16;
-        if let Some(sidebar_w) = self.sidebar_width(body.width as usize) {
+        // The Overview tab is a single full-width pane — no file/thread sidebar.
+        if self.view != View::Overview
+            && let Some(sidebar_w) = self.sidebar_width(body.width as usize)
+        {
             let sidebar_focused = self.focus == Focus::Sidebar;
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
@@ -5153,8 +5221,6 @@ impl App {
         // Draw the header first so it records the PR-link columns, then capture
         // the geometry for mouse hit-testing (inner rects; frames map to Outside).
         self.draw_header(f, header);
-        let (files_label, conv_label) = self.tab_labels();
-        let files_w = files_label.chars().count() as u16;
         let (pr_link_x0, pr_link_x1) = self.header_pr_link.get().unwrap_or((0, 0));
         self.hit.set(HitLayout {
             body_top: content.y,
@@ -5164,8 +5230,6 @@ impl App {
             sidebar_x0,
             sidebar_w: sidebar_cols,
             tabs_row: tabs_area.map(|t| t.y),
-            tab_files_end: files_w,
-            tab_conv_end: files_w + 1 + conv_label.chars().count() as u16,
             footer_row: footer.y,
             layout_end: self.layout_label().chars().count() as u16,
             pr_link_row: self.header_pr_link.get().map(|_| header.y),
@@ -5176,7 +5240,9 @@ impl App {
         if let Some(tabs_area) = tabs_area {
             self.draw_tabs(f, tabs_area);
         }
-        if self.view == View::Conversation {
+        if self.view == View::Overview {
+            self.draw_overview(f, content);
+        } else if self.view == View::Conversation {
             self.draw_conversation(f, content);
         } else if self.clines.is_empty() && self.diff.files.is_empty() {
             self.draw_empty(f, content);
@@ -5537,13 +5603,37 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
-    /// The two tab labels (Files, Conversation), shared by drawing and mouse
-    /// hit-testing so their widths stay in sync.
-    fn tab_labels(&self) -> (String, String) {
-        (
-            format!(" Files ({}) ", self.diff.files.len()),
-            format!(" Conversation ({}) ", self.review.threads.len()),
-        )
+    /// The visible tab labels, left to right, each paired with its view — shared
+    /// by drawing and mouse hit-testing so their widths stay in sync. Overview is
+    /// present only on a pull request.
+    fn tab_labels(&self) -> Vec<(View, String)> {
+        self.visible_views()
+            .into_iter()
+            .map(|v| {
+                let label = match v {
+                    View::Overview => " Overview ".to_string(),
+                    View::Files => format!(" Files ({}) ", self.diff.files.len()),
+                    View::Conversation => {
+                        format!(" Conversation ({}) ", self.review.threads.len())
+                    }
+                };
+                (v, label)
+            })
+            .collect()
+    }
+
+    /// The tab whose label covers screen column `col` on the tab row (tabs are
+    /// separated by a single space, starting at column 0).
+    fn tab_at_column(&self, col: u16) -> Option<View> {
+        let mut x = 0u16;
+        for (v, label) in self.tab_labels() {
+            let w = label.chars().count() as u16;
+            if col >= x && col < x + w {
+                return Some(v);
+            }
+            x += w + 1; // the space between tabs
+        }
+        None
     }
 
     fn draw_tabs(&self, f: &mut Frame, area: Rect) {
@@ -5552,28 +5642,92 @@ impl App {
             .bg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
         let idle = Style::default().fg(Color::Gray);
-        let (files, conv) = self.tab_labels();
-        let line = TextLine::from(vec![
+        let mut spans = Vec::new();
+        for (i, (v, label)) in self.tab_labels().into_iter().enumerate() {
+            if i > 0 {
+                spans.push(TextSpan::raw(" "));
+            }
+            spans.push(TextSpan::styled(
+                label,
+                if self.view == v { active } else { idle },
+            ));
+        }
+        spans.push(TextSpan::styled(
+            "   tab to switch",
+            Style::default().fg(Color::DarkGray),
+        ));
+        f.render_widget(Paragraph::new(TextLine::from(spans)), area);
+    }
+
+    /// The Overview tab's rendered lines: a small facts block (number + status
+    /// badge, title, author, `base ← head`, timestamps) then the markdown body.
+    fn overview_lines(&self, width: usize) -> Vec<TextLine<'static>> {
+        let Some(ov) = &self.pr_overview else {
+            return vec![TextLine::from("")];
+        };
+        let mut lines: Vec<TextLine<'static>> = Vec::new();
+        // #N + the lifecycle badge.
+        lines.push(TextLine::from(vec![
             TextSpan::styled(
-                files,
-                if self.view == View::Files {
-                    active
-                } else {
-                    idle
-                },
+                format!("#{}", ov.number),
+                Style::default().fg(PR_ACCENT).add_modifier(Modifier::BOLD),
             ),
-            TextSpan::raw(" "),
+            TextSpan::raw("  "),
             TextSpan::styled(
-                conv,
-                if self.view == View::Conversation {
-                    active
-                } else {
-                    idle
-                },
+                ov.status.label(),
+                Style::default()
+                    .fg(pr_status_color(ov.status))
+                    .add_modifier(Modifier::BOLD),
             ),
-            TextSpan::styled("   tab to switch", Style::default().fg(Color::DarkGray)),
-        ]);
-        f.render_widget(Paragraph::new(line), area);
+        ]));
+        // Title.
+        lines.push(TextLine::from(TextSpan::styled(
+            ov.title.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )));
+        // Author · base ← head · opened [· merged].
+        let author = if ov.author.is_empty() {
+            "unknown".to_string()
+        } else {
+            format!("@{}", ov.author)
+        };
+        let mut facts = format!("{author}  ·  {} ← {}", ov.base_ref, ov.head_ref);
+        if let Some(created) = ov.created_at.as_deref() {
+            facts.push_str(&format!("  ·  opened {}", date_only(created)));
+        }
+        if let Some(merged) = ov.merged_at.as_deref() {
+            facts.push_str(&format!("  ·  merged {}", date_only(merged)));
+        }
+        lines.push(TextLine::from(TextSpan::styled(
+            facts,
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(TextLine::from(""));
+        // The description, or a placeholder when empty (still shown, so the tab
+        // is never a blank pane).
+        if ov.body.trim().is_empty() {
+            lines.push(TextLine::from(TextSpan::styled(
+                "No description provided.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            lines.extend(crate::markdown::render(
+                &ov.body,
+                Some(width.max(1)),
+                &self.highlighter,
+            ));
+        }
+        lines
+    }
+
+    fn draw_overview(&self, f: &mut Frame, area: Rect) {
+        let lines = self.overview_lines(area.width as usize);
+        let height = area.height as usize;
+        let start = self.overview_scroll.min(lines.len().saturating_sub(1));
+        let end = (start + height).min(lines.len());
+        f.render_widget(Paragraph::new(lines[start..end].to_vec()), area);
     }
 
     fn draw_conversation(&self, f: &mut Frame, area: Rect) {
@@ -5752,7 +5906,7 @@ impl App {
             ));
             // The lifecycle badge sits just after the #N link — a separate span,
             // so it is not underlined and not inside the recorded click columns.
-            if let Some(status) = self.pr_status {
+            if let Some(status) = self.pr_overview.as_ref().map(|o| o.status) {
                 spans.push(TextSpan::styled(
                     format!(" {}", status.label()),
                     bar.fg(pr_status_color(status)),
@@ -5839,6 +5993,16 @@ impl App {
     fn footer_ops(&self) -> String {
         use Action::*;
         let key = |a: Action| self.keymap.key_for(a).unwrap_or("?").to_string();
+        // The Overview is a read-only scroll pane — name only scrolling and the
+        // GitHub open (the submit / `? all` anchors are added by the caller).
+        if self.view == View::Overview {
+            return format!(
+                "{}/{} scroll · {} open on github",
+                key(MoveDown),
+                key(MoveUp),
+                key(OpenGithub),
+            );
+        }
         let in_sidebar =
             self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some();
         // A visual line selection has its own sub-mode: extend the range (a
@@ -5908,6 +6072,7 @@ impl App {
             && match self.view {
                 View::Files => self.cursor_is_header(),
                 View::Conversation => self.conv_on_thread_header(),
+                View::Overview => false,
             };
         let mut parts = Vec::new();
         for (action, label) in candidates {
@@ -7570,6 +7735,12 @@ fn pr_status_color(status: PrStatus) -> Color {
     }
 }
 
+/// The date portion (`YYYY-MM-DD`) of an ISO-8601 timestamp, for the Overview
+/// facts — no clock time, and no date-library dependency to parse it.
+fn date_only(iso: &str) -> &str {
+    iso.split('T').next().unwrap_or(iso)
+}
+
 fn anchor_label(anchor: &Anchor) -> String {
     match anchor {
         Anchor::Line {
@@ -8865,6 +9036,21 @@ mod tests {
         app.pr = Some(Arc::new(crate::prsync::PrHandle::for_test(1, "t")));
         app.pr_key = Some("owner/repo#1".into());
         app
+    }
+
+    /// A PR overview snapshot for header/Overview tests.
+    fn overview(status: PrStatus) -> PrOverview {
+        PrOverview {
+            number: 1,
+            status,
+            title: "Add the thing".into(),
+            author: "octocat".into(),
+            base_ref: "main".into(),
+            head_ref: "feature".into(),
+            created_at: Some("2026-07-20T10:00:00Z".into()),
+            merged_at: None,
+            body: String::new(),
+        }
     }
 
     fn add(app: &mut App, line: u32, draft: bool) {
@@ -10464,7 +10650,7 @@ mod tests {
         // The fresh pull no longer has the thread — it was deleted on GitHub.
         app.apply_job(Ok(JobOutcome::Refreshed {
             threads: Vec::new(),
-            status: None,
+            overview: None,
         }));
         assert!(
             app.status
@@ -11742,13 +11928,158 @@ mod tests {
     }
 
     #[test]
-    fn view_cycle_wraps_both_directions() {
-        // The reverse-cycle mechanism a future tab (e.g. PR metadata) extends;
-        // with two tabs each direction wraps to the other.
-        assert_eq!(View::Files.cycle(true), View::Conversation);
-        assert_eq!(View::Conversation.cycle(true), View::Files);
-        assert_eq!(View::Files.cycle(false), View::Conversation);
-        assert_eq!(View::Conversation.cycle(false), View::Files);
+    fn view_cycle_wraps_over_visible_tabs() {
+        // Off a PR: two tabs, each direction wraps to the other.
+        let mut app = multi_file_app(&["a.rs"]);
+        app.view = View::Files;
+        assert_eq!(app.cycle_view(true), View::Conversation);
+        assert_eq!(app.cycle_view(false), View::Conversation);
+        app.view = View::Conversation;
+        assert_eq!(app.cycle_view(true), View::Files);
+
+        // On a PR: three tabs, Overview leftmost. Files → forward Conversation,
+        // back Overview; the cycle wraps.
+        let mut pr = pr_app();
+        pr.view = View::Files;
+        assert_eq!(pr.cycle_view(true), View::Conversation);
+        assert_eq!(pr.cycle_view(false), View::Overview);
+        pr.view = View::Overview;
+        assert_eq!(
+            pr.cycle_view(false),
+            View::Conversation,
+            "wraps back to the end"
+        );
+        assert_eq!(pr.cycle_view(true), View::Files);
+    }
+
+    #[test]
+    fn overview_tab_exists_only_for_a_pr() {
+        let pr = pr_app();
+        assert_eq!(
+            pr.visible_views(),
+            vec![View::Overview, View::Files, View::Conversation]
+        );
+        assert!(pr.shows_tabs());
+        // A repo diff (store, no PR): two tabs, no Overview.
+        let repo = sample_app();
+        assert_eq!(repo.visible_views(), vec![View::Files, View::Conversation]);
+        // A patch (no store, no PR): no tabs drawn.
+        let patch = multi_file_app(&["a.rs"]);
+        assert!(!patch.shows_tabs());
+    }
+
+    #[test]
+    fn tab_and_shift_tab_reach_overview_and_conversation() {
+        let mut app = pr_app();
+        app.body_width.set(120);
+        assert_eq!(app.view, View::Files, "the session opens on Files");
+        // Shift+Tab (back) from Files → Overview; Tab forward wraps around.
+        app.on_key(KeyCode::BackTab, KeyModifiers::NONE);
+        assert_eq!(app.view, View::Overview);
+        app.on_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.view, View::Files);
+        app.on_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.view, View::Conversation);
+        app.on_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.view, View::Overview, "forward wraps back to Overview");
+    }
+
+    #[test]
+    fn the_overview_renders_facts_and_body() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = pr_app();
+        let mut ov = overview(PrStatus::Open);
+        ov.body = "## Summary\n\nDoes the thing.".into();
+        app.pr_overview = Some(ov);
+        app.set_view(View::Overview);
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("#1"), "the PR number: {screen:?}");
+        assert!(screen.contains("Open"), "the status badge");
+        assert!(screen.contains("Add the thing"), "the title");
+        assert!(screen.contains("@octocat"), "the author");
+        assert!(screen.contains("main ← feature"), "base ← head");
+        assert!(screen.contains("opened 2026-07-20"), "the opened date");
+        assert!(screen.contains("Summary"), "the markdown body heading");
+        assert!(screen.contains("Does the thing"), "the body text");
+    }
+
+    #[test]
+    fn the_overview_shows_a_placeholder_for_an_empty_body() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = pr_app();
+        app.pr_overview = Some(overview(PrStatus::Open)); // body empty
+        app.set_view(View::Overview);
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(screen_text(&term).contains("No description provided."));
+    }
+
+    #[test]
+    fn refresh_updates_the_overview_and_keeps_it_on_failure() {
+        let mut app = pr_app();
+        app.pr_overview = Some(overview(PrStatus::Open));
+        // A fresh overview (open → merged) is applied on refresh.
+        let mut merged = overview(PrStatus::Merged);
+        merged.merged_at = Some("2026-07-22T00:00:00Z".into());
+        app.apply_job(Ok(JobOutcome::Refreshed {
+            threads: Vec::new(),
+            overview: Some(merged),
+        }));
+        assert_eq!(app.pr_overview.as_ref().unwrap().status, PrStatus::Merged);
+        // A failed re-fetch (None) keeps the current overview.
+        app.apply_job(Ok(JobOutcome::Refreshed {
+            threads: Vec::new(),
+            overview: None,
+        }));
+        assert_eq!(
+            app.pr_overview.as_ref().unwrap().status,
+            PrStatus::Merged,
+            "a failed metadata re-fetch keeps the last overview"
+        );
+    }
+
+    #[test]
+    fn the_overview_is_read_only() {
+        let mut app = pr_app();
+        app.pr_overview = Some(overview(PrStatus::Open));
+        app.set_view(View::Overview);
+        // c opens no composer — the Overview carries no comment actions.
+        app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(app.input.is_none(), "c does nothing in the Overview");
+        let footer = app.footer_ops();
+        assert!(
+            footer.contains("scroll"),
+            "footer offers scroll: {footer:?}"
+        );
+        assert!(
+            !footer.contains("comment") && !footer.contains("reply"),
+            "no comment ops in the Overview footer: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn the_overview_scrolls_within_its_content() {
+        let mut app = pr_app();
+        let mut ov = overview(PrStatus::Open);
+        ov.body = (0..40).map(|i| format!("line {i}\n")).collect();
+        app.pr_overview = Some(ov);
+        app.set_view(View::Overview);
+        app.body_height.set(5);
+        app.body_width.set(60);
+        assert_eq!(app.overview_scroll, 0);
+        app.on_key(KeyCode::Char('j'), KeyModifiers::NONE);
+        assert_eq!(app.overview_scroll, 1);
+        app.on_key(KeyCode::Char('G'), KeyModifiers::NONE);
+        let bottom = app.overview_scroll;
+        assert!(bottom > 1, "G jumps toward the bottom");
+        app.on_key(KeyCode::Char('g'), KeyModifiers::NONE);
+        assert_eq!(app.overview_scroll, 0, "g returns to the top");
+        app.on_key(KeyCode::Char('G'), KeyModifiers::NONE);
+        assert_eq!(app.overview_scroll, bottom, "G stops at the last line");
     }
 
     #[test]
@@ -12884,8 +13215,6 @@ mod tests {
             sidebar_x0: 0,
             sidebar_w: 0,
             tabs_row: None,
-            tab_files_end: 0,
-            tab_conv_end: 0,
             footer_row: 21,
             layout_end: 0,
             ..HitLayout::default()
@@ -12974,7 +13303,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         let mut app = pr_app();
         app.label = "PR #1".to_string();
-        app.pr_status = Some(PrStatus::Merged);
+        app.pr_overview = Some(overview(PrStatus::Merged));
         let mut term = Terminal::new(TestBackend::new(120, 6)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
         let buf = term.backend().buffer();
@@ -13184,7 +13513,7 @@ mod tests {
         assert!(app.selection.is_some(), "the drag builds a selection");
     }
 
-    fn hit(body_top: u16, sidebar_w: u16, tabs_row: Option<u16>, files_end: u16) -> HitLayout {
+    fn hit(body_top: u16, sidebar_w: u16, tabs_row: Option<u16>, _files_end: u16) -> HitLayout {
         HitLayout {
             body_top,
             body_height: 20,
@@ -13193,8 +13522,6 @@ mod tests {
             sidebar_x0: 0,
             sidebar_w,
             tabs_row,
-            tab_files_end: files_end,
-            tab_conv_end: files_end + 1 + 20,
             footer_row: body_top + 20,
             layout_end: 0,
             ..HitLayout::default()
@@ -13249,7 +13576,8 @@ mod tests {
             }],
         });
         app.relayout();
-        let files_end = app.tab_labels().0.chars().count() as u16;
+        let labels = app.tab_labels();
+        let files_end = labels[0].1.chars().count() as u16;
         app.hit.set(hit(2, 0, Some(1), files_end));
         app.mouse_down(files_end + 2, 1); // in the Conversation tab
         assert_eq!(app.view, View::Conversation);

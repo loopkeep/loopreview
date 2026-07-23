@@ -77,9 +77,27 @@ pub struct ResolvedPr {
     /// The merge timestamp (`mergedAt`), present only once the PR is merged.
     #[serde(default, rename = "mergedAt")]
     pub merged_at: Option<String>,
+    /// The creation timestamp (`createdAt`).
+    #[serde(default, rename = "createdAt")]
+    pub created_at: Option<String>,
+    /// The PR author — the person who opened it (distinct from the viewer). Its
+    /// `login` is what the Overview shows.
+    #[serde(default)]
+    pub author: Option<PrAuthor>,
+    /// The PR description (`body`), as markdown.
+    #[serde(default)]
+    pub body: String,
     /// The canonical PR URL.
     #[serde(default)]
     pub url: String,
+}
+
+/// The `author` object `gh pr view` returns — only its `login` is used.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct PrAuthor {
+    /// The author's GitHub login.
+    #[serde(default)]
+    pub login: String,
 }
 
 impl ResolvedPr {
@@ -91,6 +109,11 @@ impl ResolvedPr {
     /// A short label such as `PR #42` for UI headers.
     pub fn label(&self) -> String {
         format!("PR #{}", self.number)
+    }
+
+    /// The author's GitHub login, or an empty string when unknown.
+    pub fn author_login(&self) -> &str {
+        self.author.as_ref().map(|a| a.login.as_str()).unwrap_or("")
     }
 
     /// The PR's lifecycle status, for the header badge.
@@ -264,6 +287,9 @@ mod tests {
             state: "OPEN".into(),
             is_draft: true,
             merged_at: None,
+            created_at: None,
+            author: None,
+            body: String::new(),
             url: String::new(),
         };
         assert_eq!(pr.status(), PrStatus::Draft);
