@@ -188,10 +188,14 @@ move; `Enter` opens the file; `Esc` closes.
 | `o` | Collapse / expand |
 | `X` | Close the review (asks to confirm) |
 
-**Comment composer** (after `c` or `r`): type or paste markdown (multi-line).
-`Enter` saves; a newline is `Shift+Enter` (or `Alt+Enter` where the terminal
-does not report Shift+Enter); `Esc` discards (confirming if non-empty). On a pull
-request, `Ctrl-S` submits — it never saves the composer.
+**Comment composer** (after `c`, `s`, `r`, or `e`): type or paste markdown
+(multi-line). `Enter` inserts a newline and `Ctrl-S` saves — so multi-line
+comments and suggestions never hinge on `Shift+Enter`. `Esc` discards (confirming
+if non-empty). Outside the composer `Ctrl-S` opens the submit modal, so the one
+key saves inside and submits outside; the composer's hint bar always names the
+key that saves. Prefer `Enter` to save? Set `composer_enter = "save"` (below) —
+worth it only where your terminal reports `Shift+Enter` (the Kitty protocol),
+which then becomes the newline (with `Alt+Enter` as a fallback).
 
 ## Reviewing
 
@@ -306,6 +310,7 @@ legacy `config.json` is still read with a migration hint, but TOML is preferred.
 | `sidebar` | `"auto"` / `"open"` / `"closed"` | `"auto"` | Whether the file-explorer sidebar is shown by default (`auto` = when wide enough) |
 | `sidebar_min_content` | integer | `44` | Minimum diff width kept beside the sidebar; below this it auto-hides |
 | `sidebar_width` | integer | auto | Pin the sidebar to a fixed width in columns (clamped to 22–44); unset auto-fits the longest file row |
+| `composer_enter` | `"newline"` / `"save"` | `"newline"` | What `Enter` does in the comment composer: insert a newline (with `Ctrl-S` to save — the reliable default) or save (with `Shift`/`Alt+Enter` for a newline, where the Kitty protocol reaches your terminal) |
 
 ### Key bindings
 

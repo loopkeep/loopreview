@@ -158,6 +158,8 @@ pub struct Session {
     pub sidebar_min_content: usize,
     /// A fixed sidebar width, if the user pinned one (else it auto-fits).
     pub sidebar_width: Option<usize>,
+    /// What Enter does in the comment composer (newline by default; save opt-in).
+    pub composer_enter: crate::config::ComposerEnter,
     /// The resolved key bindings.
     pub keymap: crate::keys::Keymap,
     /// The repository directory, for reconstructing outdated comment lines from
@@ -263,6 +265,7 @@ pub fn run(session: Session) -> Result<()> {
         sidebar_mode,
         sidebar_min_content,
         sidebar_width,
+        composer_enter,
         keymap,
         repo_dir,
         loader,
@@ -285,6 +288,7 @@ pub fn run(session: Session) -> Result<()> {
     app.sidebar_mode = sidebar_mode;
     app.sidebar_min_content = sidebar_min_content;
     app.sidebar_width_cfg = sidebar_width;
+    app.composer_enter = composer_enter;
     app.keymap = keymap;
     app.status = notice;
     // For a directly-loaded diff (not a background PR load), apply auto-collapse
@@ -317,13 +321,14 @@ pub fn run(session: Session) -> Result<()> {
     let mut terminal = ratatui::init();
     // Mouse capture and bracketed paste are best-effort: the UI is usable
     // without them, but they make navigation and pasting comments pleasant.
-    // Bracketed paste in particular is what keeps a multi-line paste from
-    // triggering the composer's Enter-to-save (it arrives as one Paste event).
+    // Bracketed paste in particular delivers a multi-line paste as one event, so
+    // its newlines are inserted verbatim rather than handled key-by-key (which
+    // matters under the opt-in `composer_enter = "save"`, where Enter saves).
     let _ = execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
-    // The Kitty keyboard protocol lets the terminal disambiguate Shift+Enter
-    // from a bare Enter, so the composer can bind one to newline and the other
-    // to save. Only push it where supported; elsewhere Alt+Enter is the newline
-    // fallback. Remember whether we pushed, so teardown pops exactly what we set.
+    // The Kitty keyboard protocol lets the terminal disambiguate Shift+Enter from
+    // a bare Enter — needed for `composer_enter = "save"`, where Shift/Alt+Enter
+    // is the newline. Harmless under the default (Enter is already the newline).
+    // Only push it where supported; remember that, so teardown pops what we set.
     let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     if enhanced {
         let _ = execute!(
@@ -688,6 +693,9 @@ struct App {
     sidebar_min_content: usize,
     /// A fixed sidebar width (columns), if the user pinned one; else it auto-fits.
     sidebar_width_cfg: Option<usize>,
+    /// What Enter does in the comment composer: insert a newline (the default,
+    /// Ctrl-S saves) or save (Shift/Alt+Enter for a newline).
+    composer_enter: crate::config::ComposerEnter,
     /// Which pane has the keyboard focus.
     focus: Focus,
     /// Selected file index in the sidebar.
@@ -833,6 +841,7 @@ impl App {
             sidebar_override: None,
             sidebar_min_content: 44,
             sidebar_width_cfg: None,
+            composer_enter: crate::config::ComposerEnter::Newline,
             focus: Focus::Body,
             sidebar_cursor: 0,
             sidebar_scroll: 0,
@@ -2016,6 +2025,9 @@ impl App {
     /// Route a key while the comment composer is open.
     fn on_key_compose(&mut self, code: KeyCode, mods: KeyModifiers) {
         let ctrl = mods.contains(KeyModifiers::CONTROL);
+        // Read the Enter policy before borrowing `input` (so the Enter arm can
+        // both consult it and touch the buffer without a borrow conflict).
+        let enter_saves = self.composer_enter_saves();
         let Some(compose) = self.input.as_mut() else {
             return;
         };
@@ -2040,23 +2052,34 @@ impl App {
                     compose.confirming_discard = true;
                 }
             }
-            // Enter saves the comment; a newline needs a modifier — Shift+Enter
-            // where the terminal reports it (Kitty protocol), else Alt+Enter.
-            KeyCode::Enter if mods.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
-                compose.area.on_key(KeyCode::Enter);
+            // Ctrl-S saves from inside the composer. (Submit — sending the whole
+            // review to GitHub — is a Ctrl-S only when no composer is open.)
+            KeyCode::Char('s') if ctrl => self.submit_compose(),
+            // Enter inserts a newline by default (so multi-line comments and
+            // suggestions always work); with `composer_enter = "save"` it saves,
+            // and a modifier (Shift/Alt+Enter) makes the newline instead.
+            KeyCode::Enter
+                if enter_saves && !mods.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.submit_compose()
             }
-            KeyCode::Enter => self.submit_compose(),
-            // Ctrl combos (including the app's Ctrl-S submit) do nothing here —
-            // the composer saves with Enter, and submit is a whole-review action.
+            KeyCode::Enter => compose.area.on_key(KeyCode::Enter),
+            // Other Ctrl combos do nothing here.
             _ if ctrl => {}
             _ => compose.area.on_key(code),
         }
     }
 
-    /// What the composer's Enter will save, phrased for the current context: a
-    /// plain review has no local/draft split ("save comment"); on a pull request
-    /// the word tracks the resulting kind — "save draft" (queued for submit) or
-    /// "save note" (kept local).
+    /// Whether Enter saves the composer (the opt-in `composer_enter = "save"`),
+    /// as opposed to inserting a newline (the default, where Ctrl-S saves).
+    fn composer_enter_saves(&self) -> bool {
+        self.composer_enter == crate::config::ComposerEnter::Save
+    }
+
+    /// What saving the composer does, phrased for the current context (used in
+    /// the hint bar next to whichever key saves): a plain review has no
+    /// local/draft split ("save comment"); on a pull request the word tracks the
+    /// resulting kind — "save draft" (queued for submit) or "save note" (local).
     fn compose_save_label(&self) -> &'static str {
         if self.pr.is_none() {
             return "save comment";
@@ -4907,13 +4930,20 @@ impl App {
                 Style::default().fg(Color::Yellow),
             )
         } else {
-            TextSpan::styled(
+            // The hint always names the exact key that saves here, so the two
+            // roles of Ctrl-S (save inside, submit outside) never get confused.
+            let text = if self.composer_enter_saves() {
                 format!(
                     "Enter {} · Shift/Alt+Enter newline · Esc cancel",
                     self.compose_save_label()
-                ),
-                Style::default().fg(Color::DarkGray),
-            )
+                )
+            } else {
+                format!(
+                    "Ctrl-S {} · Enter newline · Esc cancel",
+                    self.compose_save_label()
+                )
+            };
+            TextSpan::styled(text, Style::default().fg(Color::DarkGray))
         };
         f.render_widget(Paragraph::new(TextLine::from(hint)), rows[1]);
     }
@@ -7881,7 +7911,9 @@ mod tests {
     }
 
     #[test]
-    fn composer_enter_saves_and_modified_enter_makes_a_newline() {
+    fn composer_enter_makes_newlines_and_ctrl_s_saves() {
+        // The default policy: Enter is always a newline (reliable everywhere),
+        // and Ctrl-S saves — so multi-line comments never depend on Shift+Enter.
         let mut app = sample_app();
         app.mode = Mode::Unified;
         app.cursor = 1; // a content line, not the file header
@@ -7889,17 +7921,17 @@ mod tests {
         assert!(app.input.is_some(), "the composer opened");
 
         app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
-        // Shift+Enter (Kitty protocol) inserts a newline and keeps composing.
-        app.on_key(KeyCode::Enter, KeyModifiers::SHIFT);
-        app.on_key(KeyCode::Char('b'), KeyModifiers::NONE);
-        assert!(app.input.is_some(), "Shift+Enter is a newline, not save");
-        // Alt+Enter is the fallback newline for terminals without the protocol.
-        app.on_key(KeyCode::Enter, KeyModifiers::ALT);
-        app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
-        assert!(app.input.is_some(), "Alt+Enter is a newline, not save");
-        // A bare Enter saves the comment and closes the composer.
         app.on_key(KeyCode::Enter, KeyModifiers::NONE);
-        assert!(app.input.is_none(), "Enter saves and closes the composer");
+        app.on_key(KeyCode::Char('b'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(
+            app.input.is_some(),
+            "Enter keeps composing, it does not save"
+        );
+        // Ctrl-S saves and closes the composer.
+        app.on_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(app.input.is_none(), "Ctrl-S saves and closes the composer");
 
         let body = app
             .review
@@ -7911,6 +7943,54 @@ mod tests {
             .body
             .clone();
         assert_eq!(body, "a\nb\nc", "the saved comment kept both newlines");
+    }
+
+    #[test]
+    fn composer_enter_can_be_configured_to_save() {
+        // The opt-in `composer_enter = "save"`: Enter saves, a modifier newlines.
+        let mut app = sample_app();
+        app.composer_enter = crate::config::ComposerEnter::Save;
+        app.mode = Mode::Unified;
+        app.cursor = 1;
+        app.start_compose();
+
+        app.on_key(KeyCode::Char('a'), KeyModifiers::NONE);
+        // Shift+Enter (Kitty protocol) and Alt+Enter (fallback) insert newlines.
+        app.on_key(KeyCode::Enter, KeyModifiers::SHIFT);
+        app.on_key(KeyCode::Char('b'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Enter, KeyModifiers::ALT);
+        app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(
+            app.input.is_some(),
+            "a modified Enter is a newline, not save"
+        );
+        // A bare Enter saves and closes.
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.input.is_none(), "Enter saves in save mode");
+
+        let body = app
+            .review
+            .threads
+            .last()
+            .unwrap()
+            .root()
+            .unwrap()
+            .body
+            .clone();
+        assert_eq!(body, "a\nb\nc", "the saved comment kept both newlines");
+    }
+
+    #[test]
+    fn ctrl_s_submits_when_no_composer_is_open() {
+        // Ctrl-S has two roles kept apart by whether a composer is open: it saves
+        // inside the composer (above), and opens the submit modal outside it.
+        let mut pr = pr_app();
+        assert!(pr.input.is_none() && pr.submit.is_none());
+        pr.on_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(
+            pr.submit.is_some(),
+            "Ctrl-S with no composer opens the submit modal"
+        );
     }
 
     #[test]
@@ -7955,10 +8035,10 @@ mod tests {
         app.on_key(KeyCode::Char('e'), KeyModifiers::NONE);
         assert!(app.input.is_some(), "the editor opened");
         assert_eq!(app.input.as_ref().unwrap().area.text(), "original");
-        // Append and save with Enter — the body is replaced in place.
+        // Append and save with Ctrl-S — the body is replaced in place.
         app.on_key(KeyCode::Char('!'), KeyModifiers::NONE);
-        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
-        assert!(app.input.is_none(), "Enter saves the edit");
+        app.on_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(app.input.is_none(), "Ctrl-S saves the edit");
         assert_eq!(app.review.threads[0].root().unwrap().body, "original!");
         // The comment count did not change — an edit, not a new comment.
         assert_eq!(app.review.threads[0].comments.len(), 1);
@@ -8102,7 +8182,7 @@ mod tests {
         );
         assert_eq!(app.input.as_ref().unwrap().area.text(), "my reply");
         app.on_key(KeyCode::Char('!'), KeyModifiers::NONE);
-        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert_eq!(app.review.threads[0].comments[1].body, "my reply!");
         assert_eq!(
             app.review.threads[0].comments[0].body, "root note",

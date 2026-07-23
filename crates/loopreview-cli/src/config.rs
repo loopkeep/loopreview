@@ -22,6 +22,20 @@ pub enum SidebarMode {
     Closed,
 }
 
+/// What the Enter key does in the comment composer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ComposerEnter {
+    /// Enter inserts a newline; Ctrl-S saves (the default — reliable in every
+    /// terminal, and multi-line comments and suggestions need dependable
+    /// newlines).
+    Newline,
+    /// Enter saves; a modifier (Shift+Enter, or Alt+Enter) inserts a newline.
+    /// Opt-in, for terminals where the Kitty keyboard protocol reliably reports
+    /// the modifier through to the app.
+    Save,
+}
+
 /// Loaded user preferences.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -40,6 +54,9 @@ pub struct Config {
     /// A fixed sidebar width (columns), clamped to the sensible bounds. When
     /// unset, the width auto-fits the longest file row.
     pub sidebar_width: Option<usize>,
+    /// What Enter does in the comment composer: insert a newline (the default,
+    /// with Ctrl-S to save) or save (with Shift/Alt+Enter for a newline).
+    pub composer_enter: ComposerEnter,
     /// Per-action key overrides (the `[keys]` table); action name → key string.
     pub keys: HashMap<String, String>,
 }
@@ -53,6 +70,7 @@ impl Default for Config {
             sidebar: SidebarMode::Auto,
             sidebar_min_content: 44,
             sidebar_width: None,
+            composer_enter: ComposerEnter::Newline,
             keys: HashMap::new(),
         }
     }
@@ -111,5 +129,23 @@ pub fn config_dir() -> Option<PathBuf> {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn composer_enter_defaults_to_newline_and_parses_the_opt_in() {
+        // Absent: the reliable default (Enter is a newline, Ctrl-S saves).
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.composer_enter, ComposerEnter::Newline);
+        // The opt-in for terminals where the Kitty protocol reaches the app.
+        let cfg: Config = toml::from_str("composer_enter = \"save\"").unwrap();
+        assert_eq!(cfg.composer_enter, ComposerEnter::Save);
+        // And the default named explicitly.
+        let cfg: Config = toml::from_str("composer_enter = \"newline\"").unwrap();
+        assert_eq!(cfg.composer_enter, ComposerEnter::Newline);
     }
 }
