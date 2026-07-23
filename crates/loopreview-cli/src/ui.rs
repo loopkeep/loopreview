@@ -167,6 +167,9 @@ pub struct Loaded {
     pub pr: Option<PrHandle>,
     /// The store key for this PR's drafts (`owner/repo#number`), if a PR.
     pub pr_key: Option<String>,
+    /// Stale draft ghosts dropped while merging saved drafts (pre-F2 store
+    /// contamination); surfaced in the status when non-zero.
+    pub stale_cleaned: usize,
 }
 
 /// A background load job: reports progress via the callback, then yields the
@@ -871,6 +874,12 @@ impl App {
         self.conv_cursor = 0;
         self.conv_scroll = 0;
         self.loading = None;
+        if loaded.stale_cleaned > 0 {
+            self.status = Some(format!(
+                "cleaned {} stale draft(s) from an old build",
+                loaded.stale_cleaned
+            ));
+        }
         // A large pull request opens collapsed (fast); this relays out again.
         self.maybe_auto_collapse();
     }
@@ -923,8 +932,13 @@ impl App {
     fn apply_job(&mut self, result: Result<JobOutcome, String>) {
         match result {
             Ok(JobOutcome::Refreshed(threads)) => {
-                self.review.threads = crate::prsync::merge_drafts(&self.review, threads);
-                self.status = Some("refreshed from GitHub".to_string());
+                let (merged, cleaned) = crate::prsync::merge_drafts(&self.review, threads);
+                self.review.threads = merged;
+                self.status = Some(if cleaned > 0 {
+                    format!("refreshed from GitHub — cleaned {cleaned} stale draft(s)")
+                } else {
+                    "refreshed from GitHub".to_string()
+                });
                 self.relayout();
             }
             Ok(JobOutcome::Resolved {
@@ -6993,6 +7007,33 @@ mod tests {
         app.on_key(KeyCode::Char('y'), KeyModifiers::NONE);
         assert!(app.confirming_delete.is_none());
         assert_eq!(app.review.threads.len(), 0, "the draft was removed");
+    }
+
+    #[test]
+    fn pr_drafts_excludes_a_fully_published_thread() {
+        // The store never saves a pulled/published thread as a draft — the source
+        // of the old ghost contamination. Only threads with an unpublished
+        // comment are kept, so the current build cannot reproduce it.
+        let mut app = pr_app();
+        app.review
+            .threads
+            .push(published_comment("c", "tester", "555"));
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 1),
+            "tester",
+            "my draft",
+            CommentKind::Draft,
+        );
+        let drafts = app.pr_drafts();
+        assert_eq!(
+            drafts.threads.len(),
+            1,
+            "only the unpublished draft is saved"
+        );
+        assert!(
+            drafts.threads[0].root().unwrap().remote_id.is_none(),
+            "the saved thread is the draft, not the published one"
+        );
     }
 
     #[test]

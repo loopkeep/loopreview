@@ -177,19 +177,20 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
     let loader: ui::Loader = Box::new(move |progress| {
         let (handle, label, diff, threads) = prsync::fetch(dir, pr_query, progress)?;
         let pr_key = handle.pr_key();
-        let review = match draft_common.as_deref().and_then(store::Store::for_repo) {
+        let (review, stale_cleaned) = match draft_common.as_deref().and_then(store::Store::for_repo)
+        {
             Some(store) => {
                 let drafts = store.load_pr_drafts(&pr_key).unwrap_or_default();
-                loopreview_core::Review {
-                    threads: prsync::merge_drafts(&drafts, threads),
-                }
+                let (threads, cleaned) = prsync::merge_drafts(&drafts, threads);
+                (loopreview_core::Review { threads }, cleaned)
             }
-            None => loopreview_core::Review { threads },
+            None => (loopreview_core::Review { threads }, 0),
         };
         Ok(ui::Loaded {
             label,
             diff,
             review,
+            stale_cleaned,
             pr: Some(handle),
             pr_key: Some(pr_key),
         })

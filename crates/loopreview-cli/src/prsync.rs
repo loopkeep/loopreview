@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use loopreview_core::{Diff, DiffSource, Review, Thread};
+use loopreview_core::{Anchor, Diff, DiffSource, Review, Thread};
 use loopreview_github::{GithubClient, PrQuery, ResolvedPr, ReviewEvent};
 
 /// Build a [`PrQuery`] from the CLI arguments, or an error message.
@@ -238,16 +238,65 @@ pub struct ReplyStamp {
     pub remote_id: String,
 }
 
+/// Match two anchors by their identifying location, ignoring the `Line` anchor's
+/// `commit`/`context` (which can differ between a stale saved draft and a fresh
+/// pull of the same comment).
+fn same_anchor_location(a: &Anchor, b: &Anchor) -> bool {
+    match (a, b) {
+        (
+            Anchor::Line {
+                file: f1,
+                side: s1,
+                start: st1,
+                end: e1,
+                ..
+            },
+            Anchor::Line {
+                file: f2,
+                side: s2,
+                start: st2,
+                end: e2,
+                ..
+            },
+        ) => f1 == f2 && s1 == s2 && st1 == st2 && e1 == e2,
+        (Anchor::File { file: f1 }, Anchor::File { file: f2 }) => f1 == f2,
+        (Anchor::Review, Anchor::Review) => true,
+        _ => false,
+    }
+}
+
 /// Merge local drafts into a freshly-pulled thread list: keep fully-local draft
 /// threads, and re-attach draft replies (comments with no remote id) to their
-/// published thread by id.
-pub fn merge_drafts(previous: &Review, fresh: Vec<Thread>) -> Vec<Thread> {
+/// published thread by id. Returns the merged threads and the number of stale
+/// draft ghosts dropped (see below).
+pub fn merge_drafts(previous: &Review, fresh: Vec<Thread>) -> (Vec<Thread>, usize) {
     let mut result = fresh;
+    let mut cleaned = 0usize;
     for old in &previous.threads {
         let root_published = old.root().is_some_and(|c| c.remote_id.is_some());
         if !root_published {
-            // A thread the user started locally — keep it as-is.
-            result.push(old.clone());
+            // Defense against a pre-F2 store: a saved "local draft" thread that
+            // duplicates a pulled published thread (same anchored location and the
+            // same root body) is a stale ghost — a published comment a buggy build
+            // once wrote back as a draft. Drop it so it does not reappear as a
+            // [draft] and risk a duplicate submit. A genuine new draft is affected
+            // only if its body exactly matches a published comment on the same
+            // line, which would merely avoid posting an identical duplicate.
+            let is_ghost = old.root().is_some_and(|old_root| {
+                result.iter().any(|t| {
+                    t.root().is_some_and(|r| {
+                        r.remote_id.is_some()
+                            && r.body == old_root.body
+                            && same_anchor_location(&t.anchor, &old.anchor)
+                    })
+                })
+            });
+            if is_ghost {
+                cleaned += 1;
+            } else {
+                // A thread the user started locally — keep it as-is.
+                result.push(old.clone());
+            }
             continue;
         }
         // A published thread: carry over any draft replies it accumulated,
@@ -271,7 +320,7 @@ pub fn merge_drafts(previous: &Review, fresh: Vec<Thread>) -> Vec<Thread> {
             fresh_thread.comments.extend(drafts);
         }
     }
-    result
+    (result, cleaned)
 }
 
 #[cfg(test)]
@@ -291,9 +340,13 @@ mod tests {
     }
 
     fn thread(id: &str, comments: Vec<Comment>) -> Thread {
+        thread_at(id, Anchor::line("f", Side::New, 1), comments)
+    }
+
+    fn thread_at(id: &str, anchor: Anchor, comments: Vec<Comment>) -> Thread {
         Thread {
             id: id.to_string(),
-            anchor: Anchor::line("f", Side::New, 1),
+            anchor,
             state: ThreadState::Open,
             comments,
         }
@@ -316,17 +369,42 @@ mod tests {
                     "T1",
                     vec![comment("c1", Some("r1")), comment("c2-draft", None)],
                 ),
-                // A fully-local draft thread.
-                thread("local", vec![comment("l1", None)]),
+                // A genuinely local draft — a distinct line, not a copy of a pull.
+                thread_at(
+                    "local",
+                    Anchor::line("other.rs", Side::New, 9),
+                    vec![comment("l1", None)],
+                ),
             ],
         };
         // A fresh pull returns the published thread (without the draft reply).
         let fresh = vec![thread("T1", vec![comment("c1", Some("r1"))])];
 
-        let merged = merge_drafts(&previous, fresh);
+        let (merged, cleaned) = merge_drafts(&previous, fresh);
+        assert_eq!(cleaned, 0, "nothing stale to clean");
         assert_eq!(merged.len(), 2);
         let t1 = merged.iter().find(|t| t.id == "T1").unwrap();
         assert_eq!(t1.comments.len(), 2, "draft reply re-attached");
         assert!(merged.iter().any(|t| t.id == "local"), "local thread kept");
+    }
+
+    #[test]
+    fn merge_drops_a_stale_published_ghost_saved_as_a_draft() {
+        // A pre-F2 build saved a published comment as a "local draft": same line
+        // and same body as the pulled published thread. It must be dropped, not
+        // reappear as a [draft] (which would risk a duplicate submit).
+        let previous = Review {
+            threads: vec![thread("ghost", vec![comment("g", None)])],
+        };
+        // The real published thread on the same line, same body ("b"), arrives fresh.
+        let fresh = vec![thread("T9", vec![comment("real", Some("r9"))])];
+
+        let (merged, cleaned) = merge_drafts(&previous, fresh);
+        assert_eq!(cleaned, 1, "the ghost draft was cleaned");
+        assert_eq!(merged.len(), 1, "only the real published thread remains");
+        assert!(
+            merged.iter().all(|t| t.root().unwrap().remote_id.is_some()),
+            "no draft ghost survives"
+        );
     }
 }
