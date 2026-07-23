@@ -20,6 +20,8 @@
 use loopreview_core::{Anchor, Side, Thread};
 use serde::{Deserialize, Serialize};
 
+use crate::error::GithubError;
+
 /// What kind of review to submit alongside a batch of inline comments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewEvent {
@@ -422,6 +424,46 @@ pub(crate) fn reconcile_published(
         .iter()
         .map(|p| (p.thread_id.clone(), matched.get(&p.thread_id).cloned()))
         .collect()
+}
+
+/// Read the created comments back and reconcile them, retrying a bounded number
+/// of times when the read is incomplete or errors — GitHub's read-after-write can
+/// lag right after the review POST, returning an empty or partial list from a
+/// replica that hasn't caught up. Results accumulate across attempts (each fetch
+/// is a full snapshot, but a union by id is robust to a flaky replica), so a
+/// comment seen on any attempt counts. Pure over its `fetch`/`sleep_ms` so the
+/// retry policy is testable without I/O or real delays: `sleep_ms` is a no-op in
+/// tests, `fetch` returns canned results.
+pub(crate) fn reconcile_with_retry(
+    planned: &[PlannedComment],
+    mut fetch: impl FnMut() -> Result<Vec<CreatedComment>, GithubError>,
+    mut sleep_ms: impl FnMut(u64),
+) -> Vec<(String, Option<String>)> {
+    // Two retries, ~1.1s total worst case (in the submit background job).
+    const BACKOFFS_MS: [u64; 2] = [300, 800];
+    let mut seen: Vec<CreatedComment> = Vec::new();
+    accumulate(&mut seen, fetch());
+    for &delay in &BACKOFFS_MS {
+        if seen.len() >= planned.len() {
+            break; // every planned comment has been read back
+        }
+        sleep_ms(delay);
+        accumulate(&mut seen, fetch());
+    }
+    let created = (!seen.is_empty()).then_some(seen.as_slice());
+    reconcile_published(planned, created)
+}
+
+/// Fold a read-back result into the accumulated set, de-duplicating by id and
+/// dropping errors (they trigger another attempt).
+fn accumulate(seen: &mut Vec<CreatedComment>, result: Result<Vec<CreatedComment>, GithubError>) {
+    if let Ok(comments) = result {
+        for c in comments {
+            if !seen.iter().any(|s| s.id == c.id) {
+                seen.push(c);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -895,6 +937,107 @@ mod tests {
                 ("t1".to_string(), Some("8001".to_string())),
                 ("t2".to_string(), None),
             ]
+        );
+    }
+
+    fn created_at(id: u64, line: u64, side: &str) -> CreatedComment {
+        CreatedComment {
+            id,
+            path: "src/a.rs".to_string(),
+            side: Some(side.to_string()),
+            line: Some(line),
+            original_line: None,
+        }
+    }
+
+    #[test]
+    fn read_back_completes_on_the_first_try_without_retrying() {
+        let plan = vec![planned("t1", 10, "RIGHT")];
+        let created = vec![created_at(100, 10, "RIGHT")];
+        let mut calls = 0;
+        let mut sleeps = 0;
+        let out = reconcile_with_retry(
+            &plan,
+            || {
+                calls += 1;
+                Ok(created.clone())
+            },
+            |_| sleeps += 1,
+        );
+        assert_eq!(calls, 1, "read back once — already complete");
+        assert_eq!(sleeps, 0, "no backoff needed");
+        assert_eq!(out, vec![("t1".to_string(), Some("100".to_string()))]);
+    }
+
+    #[test]
+    fn read_back_retries_an_incomplete_read_and_accumulates() {
+        let plan = vec![planned("t1", 10, "RIGHT"), planned("t2", 5, "LEFT")];
+        // First empty (replica lag), then one comment, then the other — each fetch
+        // adds to the accumulated set, so both end up reconciled.
+        let mut seq = [
+            Ok(Vec::new()),
+            Ok(vec![created_at(100, 10, "RIGHT")]),
+            Ok(vec![created_at(200, 5, "LEFT")]),
+        ]
+        .into_iter();
+        let mut calls = 0;
+        let mut sleeps = 0;
+        let out = reconcile_with_retry(
+            &plan,
+            || {
+                calls += 1;
+                seq.next().unwrap()
+            },
+            |_| sleeps += 1,
+        );
+        assert_eq!(calls, 3, "initial read plus two retries");
+        assert_eq!(sleeps, 2, "a backoff before each retry");
+        assert!(
+            out.iter().all(|(_, id)| id.is_some()),
+            "both reconciled across attempts: {out:?}"
+        );
+    }
+
+    #[test]
+    fn read_back_recovers_from_an_error_by_retrying() {
+        let plan = vec![planned("t1", 10, "RIGHT")];
+        let created = vec![created_at(100, 10, "RIGHT")];
+        let mut calls = 0;
+        let out = reconcile_with_retry(
+            &plan,
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(GithubError::NoPrForBranch) // a read-back error, like a timeout
+                } else {
+                    Ok(created.clone())
+                }
+            },
+            |_| {},
+        );
+        assert_eq!(calls, 2, "an errored read is retried");
+        assert_eq!(out, vec![("t1".to_string(), Some("100".to_string()))]);
+    }
+
+    #[test]
+    fn read_back_gives_up_after_two_retries_leaving_ids_pending() {
+        let plan = vec![planned("t1", 10, "RIGHT")];
+        let mut calls = 0;
+        let mut sleeps = 0;
+        let out = reconcile_with_retry(
+            &plan,
+            || {
+                calls += 1;
+                Ok(Vec::new()) // never catches up
+            },
+            |_| sleeps += 1,
+        );
+        assert_eq!(calls, 3, "initial plus two retries, then give up");
+        assert_eq!(sleeps, 2);
+        assert_eq!(
+            out,
+            vec![("t1".to_string(), None)],
+            "the id stays pending — the sentinel/refresh fallback takes over"
         );
     }
 

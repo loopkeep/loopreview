@@ -332,15 +332,20 @@ impl GithubClient {
 
         // Reconcile the created comment ids back onto the drafts. Only a review
         // with no inline comments has nothing to read back (a pending review still
-        // carries its comments, so it is reconciled too). The review is already
-        // created, so a failed read-back is not fatal: the affected drafts are
-        // reported id-pending (their ids arrive on the next pull) rather than
-        // failing the whole submit and re-posting a duplicate review on retry.
+        // carries its comments, so it is reconciled too). GitHub's read-after-write
+        // can lag right after the POST, so the read-back retries a couple of times
+        // with a short backoff; anything still unread stays id-pending (recovered
+        // on the next pull) rather than failing the submit and re-posting a
+        // duplicate. This runs in the submit background job, so the delay is off
+        // the UI thread.
         let published = if inputs.is_empty() {
             Vec::new()
         } else {
-            let created = self.fetch_review_comments(pr, review_id).ok();
-            push::reconcile_published(&planned, created.as_deref())
+            push::reconcile_with_retry(
+                &planned,
+                || self.fetch_review_comments(pr, review_id),
+                |ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
+            )
         };
 
         Ok(SubmitOutcome {
