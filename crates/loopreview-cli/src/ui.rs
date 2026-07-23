@@ -3608,6 +3608,20 @@ impl App {
         // An agent's reply is a local note unless it passes --draft (agents don't
         // queue GitHub sends implicitly, even under a draft thread).
         let kind = self.agent_kind(reply.draft);
+        // A draft reply under a local root would be stranded — it could never be
+        // sent while the root stays off GitHub. Refuse it, mirroring the human
+        // `t` rule; a reply without --draft inherits local as usual.
+        if kind == CommentKind::Draft
+            && self
+                .review
+                .thread(&reply.thread)
+                .and_then(|t| t.root())
+                .is_some_and(|c| c.disposition() == CommentKind::Local)
+        {
+            return Err(
+                "the thread root is local — promote it first, or reply without --draft".to_string(),
+            );
+        }
         let comment = self
             .add_reply(&reply.thread, &reply.author, &reply.body, kind)
             .ok_or_else(|| format!("no thread {}", reply.thread))?;
@@ -7503,6 +7517,47 @@ mod tests {
             author: "agent".into(),
             draft,
         }));
+    }
+
+    fn reply(app: &mut App, thread: &str, draft: bool) -> Response {
+        app.handle_control(Request::CommentReply(protocol::CommentReply {
+            thread: thread.to_string(),
+            body: "r".into(),
+            author: "agent".into(),
+            draft,
+        }))
+    }
+
+    #[test]
+    fn control_reply_refuses_a_draft_under_a_local_root() {
+        let mut app = pr_app(); // a PR, so --draft is meaningful
+        // A local-note root and a draft root (both on lines in the sample diff).
+        add(&mut app, 2, false); // local root
+        add(&mut app, 1, true); // draft root
+        let local_tid = app.review.threads[0].id.clone();
+        let draft_tid = app.review.threads[1].id.clone();
+
+        // A --draft reply under the local root is refused (it would strand a draft).
+        match reply(&mut app, &local_tid, true) {
+            Response::Error(msg) => assert!(msg.contains("promote"), "guard message: {msg}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        assert_eq!(
+            app.review.threads[0].comments.len(),
+            1,
+            "the local root gained no draft reply"
+        );
+        // Without --draft, the reply inherits local and is accepted.
+        assert!(matches!(
+            reply(&mut app, &local_tid, false),
+            Response::Ok(Reply::Comment(_))
+        ));
+        assert_eq!(app.review.threads[0].comments.len(), 2);
+        // Under a draft root, a --draft reply is fine (rule 2).
+        assert!(matches!(
+            reply(&mut app, &draft_tid, true),
+            Response::Ok(Reply::Comment(_))
+        ));
     }
 
     #[test]
