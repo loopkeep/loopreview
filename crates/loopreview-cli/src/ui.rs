@@ -745,12 +745,22 @@ struct App {
     /// Per thread, the block-line index where each comment begins (root first,
     /// then replies) — lets the Conversation cursor land on a single comment.
     conv_comment_starts: Vec<Vec<usize>>,
-    /// Per thread, the block-relative click regions (links/images) over its
-    /// comment bodies, aligned to `conv_blocks`.
+    /// Per thread, the block-relative click regions (links/images/`<details>`
+    /// toggles) over its comment bodies, aligned to `conv_blocks`.
     conv_block_regions: Vec<Vec<crate::markdown::MdRegion>>,
     /// The composed Conversation click regions from the last draw (absolute line
     /// indices in the scrolled line list), for mouse hit-testing.
     conv_regions: RefCell<Vec<crate::markdown::MdRegion>>,
+    /// Session fold overrides for comment-body `<details>`, keyed by (thread id,
+    /// the block's 0-based details index); survives a rebuild while the thread id
+    /// does. Not persisted.
+    conv_folds: HashMap<(String, usize), bool>,
+    /// The last draw's map from a composed `ToggleDetails` index to its
+    /// (thread id, block-local details index), so a click routes to the right fold.
+    conv_details: RefCell<Vec<(String, usize)>>,
+    /// The comment-body `<details>` effective open state from the last build, so a
+    /// toggle flips the current value (respecting a `<details open>` default).
+    conv_effective: RefCell<HashMap<(String, usize), bool>>,
     /// Whether each thread is outdated (line-anchored but no longer in the diff),
     /// index-aligned to `review.threads`. Drives the thread index's status icon.
     thread_outdated: Vec<bool>,
@@ -904,6 +914,8 @@ impl App {
             &outdated,
             &collapsed,
             repo_dir.as_deref(),
+            &HashMap::new(),
+            &RefCell::new(HashMap::new()),
         );
         let num_width = digits(layout.max_lineno).max(3);
         let file_count = diff.files.len();
@@ -945,6 +957,9 @@ impl App {
             conv_comment_starts,
             conv_block_regions,
             conv_regions: RefCell::new(Vec::new()),
+            conv_folds: HashMap::new(),
+            conv_details: RefCell::new(Vec::new()),
+            conv_effective: RefCell::new(HashMap::new()),
             thread_outdated: outdated,
             conv_order,
             conv_comment: 0,
@@ -1699,6 +1714,8 @@ impl App {
             &self.thread_outdated,
             &self.collapsed,
             self.repo_dir.as_deref(),
+            &self.conv_folds,
+            &self.conv_effective,
         );
         self.conv_order = conv_display_order(&self.review);
         self.conv_cursor = self
@@ -5077,7 +5094,7 @@ impl App {
                 if self.view == View::Conversation {
                     let line = self.conv_scroll + row;
                     if let Some(action) = self.conv_action_at(line, col) {
-                        self.run_md_action(action);
+                        self.run_conv_md_action(action);
                         return;
                     }
                     if let Some((pos, is_header)) = self.conv_hit(row) {
@@ -6040,13 +6057,41 @@ impl App {
     }
 
     /// The click action at absolute Conversation line `line`, column `col`, from
-    /// the regions cached by the last draw (comment-body links/images only).
+    /// the regions cached by the last draw (comment-body links/images/details).
     fn conv_action_at(&self, line: usize, col: u16) -> Option<crate::markdown::MdAction> {
         self.conv_regions
             .borrow()
             .iter()
             .find(|r| r.line == line && col >= r.start && col < r.end)
             .map(|r| r.action.clone())
+    }
+
+    /// Run a Conversation body click: open a URL, or fold/unfold a comment-body
+    /// `<details>` (the toggle index routes through `conv_details` to its thread).
+    fn run_conv_md_action(&mut self, action: crate::markdown::MdAction) {
+        match action {
+            crate::markdown::MdAction::Open(url) => {
+                self.status = Some(match (self.url_opener)(&url) {
+                    Ok(()) => format!("opened {url}"),
+                    Err(_) => format!("open it yourself: {url}"),
+                });
+            }
+            crate::markdown::MdAction::ToggleDetails(global) => {
+                let Some(key) = self.conv_details.borrow().get(global).cloned() else {
+                    return;
+                };
+                let current = self
+                    .conv_effective
+                    .borrow()
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(false);
+                self.conv_folds.insert(key, !current);
+                // Re-lay the conversation with the new fold (fewer/more lines) and
+                // re-clamp the scroll; the selected thread/comment is unchanged.
+                self.relayout();
+            }
+        }
     }
 
     /// Run a markdown click action (shared by the Overview and Conversation): open
@@ -6091,8 +6136,10 @@ impl App {
         let width = area.width as usize;
         let mut lines: Vec<TextLine> = Vec::new();
         // Click regions for the composed line list, absolute so mouse_down can map
-        // a scrolled row straight to an action.
+        // a scrolled row straight to an action; `details` routes a toggle index to
+        // its (thread id, per-thread details index).
         let mut regions: Vec<crate::markdown::MdRegion> = Vec::new();
+        let mut details: Vec<(String, usize)> = Vec::new();
         for (pos, &ti) in self.conv_order.iter().enumerate() {
             let block = &self.conv_blocks[ti];
             let thread_start = lines.len();
@@ -6142,18 +6189,32 @@ impl App {
                 }
             }
             // This thread's body regions, shifted to their composed line indices
-            // (tinting re-styles content in place, so columns are unchanged).
+            // (tinting re-styles content in place, so columns are unchanged). A
+            // `ToggleDetails(per-thread index)` is remapped to a conversation-wide
+            // index whose `conv_details` entry routes the click back to this thread.
+            let thread_id = &self.review.threads[ti].id;
             for r in &self.conv_block_regions[ti] {
+                let action = match &r.action {
+                    crate::markdown::MdAction::Open(url) => {
+                        crate::markdown::MdAction::Open(url.clone())
+                    }
+                    crate::markdown::MdAction::ToggleDetails(local) => {
+                        let global = details.len();
+                        details.push((thread_id.clone(), *local));
+                        crate::markdown::MdAction::ToggleDetails(global)
+                    }
+                };
                 regions.push(crate::markdown::MdRegion {
                     line: r.line + thread_start,
                     start: r.start,
                     end: r.end,
-                    action: r.action.clone(),
+                    action,
                 });
             }
             lines.push(TextLine::from("")); // a blank between threads
         }
         self.conv_regions.replace(regions);
+        self.conv_details.replace(details);
         let height = area.height as usize;
         let start = self.conv_scroll.min(lines.len().saturating_sub(1));
         let end = (start + height).min(lines.len());
@@ -7805,6 +7866,7 @@ type ConversationBuild = (
 );
 
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn build_conversation(
     review: &Review,
     diff: &Diff,
@@ -7813,8 +7875,11 @@ fn build_conversation(
     outdated: &[bool],
     collapsed: &HashSet<String>,
     repo_dir: Option<&Path>,
+    folds: &HashMap<(String, usize), bool>,
+    effective: &RefCell<HashMap<(String, usize), bool>>,
 ) -> ConversationBuild {
     let now = now();
+    effective.borrow_mut().clear();
     let built: Vec<(
         Vec<TextLine<'static>>,
         Vec<usize>,
@@ -7827,9 +7892,20 @@ fn build_conversation(
             let is_outdated = outdated.get(ti).copied().unwrap_or(false);
             let is_collapsed = collapsed.contains(&thread.id);
             let mut lines = Vec::new();
-            // Click regions (links/images) over this thread's comment bodies,
-            // block-relative; details stay expanded in comment bodies for now.
+            // Click regions (links/images/`<details>` toggles) over this thread's
+            // comment bodies, block-relative. A comment body's `<details>` folds
+            // by (thread id, its 0-based index in the body), from `folds`.
             let mut regions: Vec<crate::markdown::MdRegion> = Vec::new();
+            let is_open = |index: usize, default: bool| {
+                let open = folds
+                    .get(&(thread.id.clone(), index))
+                    .copied()
+                    .unwrap_or(default);
+                effective
+                    .borrow_mut()
+                    .insert((thread.id.clone(), index), open);
+                open
+            };
             // An informative one-line header (the thread index's vocabulary): a
             // fold chevron, the status glyph, the anchor, the author, and the
             // reply count — so a collapsed thread still says what it is.
@@ -7908,28 +7984,48 @@ fn build_conversation(
                 ));
             }
 
+            // Details indices are per-thread (offset across the root and replies)
+            // so root/reply folds never collide on the same (thread id, index) key.
+            let mut details_base = 0usize;
+
             if let Some(root) = thread.root() {
                 comment_starts.push(lines.len());
                 lines.push(comment_meta_line(root, now, false));
                 let base = lines.len();
-                let rendered =
-                    crate::markdown::render_rich(&root.body, Some(width), highlighter, &|_, _| {
-                        true
-                    });
-                collect_open_regions(&rendered.regions, base, 0, &mut regions);
+                let seen = std::cell::Cell::new(0usize);
+                let dbase = details_base;
+                let is_open_body = |local: usize, default: bool| {
+                    seen.set(seen.get().max(local + 1));
+                    is_open(dbase + local, default)
+                };
+                let rendered = crate::markdown::render_rich(
+                    &root.body,
+                    Some(width),
+                    highlighter,
+                    &is_open_body,
+                );
+                collect_regions(&rendered.regions, base, 0, dbase, &mut regions);
+                details_base += seen.get();
                 lines.extend(rendered.lines);
             }
             for reply in thread.replies() {
                 comment_starts.push(lines.len());
                 lines.push(comment_meta_line(reply, now, true));
                 let base = lines.len();
+                let seen = std::cell::Cell::new(0usize);
+                let dbase = details_base;
+                let is_open_body = |local: usize, default: bool| {
+                    seen.set(seen.get().max(local + 1));
+                    is_open(dbase + local, default)
+                };
                 let rendered = crate::markdown::render_rich(
                     &reply.body,
                     Some(width.saturating_sub(2)),
                     highlighter,
-                    &|_, _| true,
+                    &is_open_body,
                 );
-                collect_open_regions(&rendered.regions, base, 2, &mut regions);
+                collect_regions(&rendered.regions, base, 2, dbase, &mut regions);
+                details_base += seen.get();
                 for line in rendered.lines {
                     let mut spans = vec![TextSpan::raw("  ")]; // a reply is indented 2 cols
                     spans.extend(line.spans);
@@ -7953,24 +8049,30 @@ fn build_conversation(
     (blocks, starts, all_regions)
 }
 
-/// Copy the `Open` regions from a rendered comment body into `out`, offsetting
-/// each by the body's `base` line in the block and a left `indent`. Details
-/// toggles are dropped — comment-body `<details>` render expanded for now.
-fn collect_open_regions(
+/// Copy a rendered comment body's regions into `out`, offsetting each by the
+/// body's `base` line in the block and a left `indent`. A `ToggleDetails(local)`
+/// index is shifted by `details_base` to the per-thread index space (so a fold in
+/// the root and one in a reply do not collide).
+fn collect_regions(
     regions: &[crate::markdown::MdRegion],
     base: usize,
     indent: u16,
+    details_base: usize,
     out: &mut Vec<crate::markdown::MdRegion>,
 ) {
     for region in regions {
-        if matches!(region.action, crate::markdown::MdAction::Open(_)) {
-            out.push(crate::markdown::MdRegion {
-                line: region.line + base,
-                start: region.start + indent,
-                end: region.end + indent,
-                action: region.action.clone(),
-            });
-        }
+        let action = match &region.action {
+            crate::markdown::MdAction::Open(url) => crate::markdown::MdAction::Open(url.clone()),
+            crate::markdown::MdAction::ToggleDetails(local) => {
+                crate::markdown::MdAction::ToggleDetails(local + details_base)
+            }
+        };
+        out.push(crate::markdown::MdRegion {
+            line: region.line + base,
+            start: region.start + indent,
+            end: region.end + indent,
+            action,
+        });
     }
 }
 
@@ -14296,6 +14398,56 @@ mod tests {
             opened.borrow().as_slice(),
             &["https://example.org/deep".to_string()],
             "the conversation link click routed to the opener"
+        );
+    }
+
+    #[test]
+    fn a_conversation_details_folds_on_click() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = pr_app();
+        app.review.threads.push(Thread {
+            id: "td".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: "c1".into(),
+                author: "octo".into(),
+                body: "<details>\n<summary>More</summary>\n\nhidden line\n\n</details>".into(),
+                created_at: 0,
+                remote_id: Some("IC_1".into()),
+                kind: CommentKind::Published,
+            }],
+        });
+        app.collapsed.clear();
+        app.relayout();
+        app.set_view(View::Conversation);
+        app.focus = Focus::Body;
+        let draw = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+            term.draw(|f| app.draw(f)).unwrap();
+            screen_text(&term)
+        };
+        // Closed by default: the ▸ summary shows, the body is hidden.
+        let closed = draw(&mut app);
+        assert!(closed.contains("▸ More"), "folded by default: {closed:?}");
+        assert!(!closed.contains("hidden line"), "body hidden: {closed:?}");
+        // Clicking the summary's toggle region opens it (a re-draw shows the body).
+        let toggle = app
+            .conv_regions
+            .borrow()
+            .iter()
+            .find(|r| matches!(r.action, crate::markdown::MdAction::ToggleDetails(_)))
+            .cloned()
+            .expect("a details toggle region in the conversation");
+        let action = app
+            .conv_action_at(toggle.line, toggle.start)
+            .expect("the toggle is hit");
+        app.run_conv_md_action(action);
+        let opened = draw(&mut app);
+        assert!(
+            opened.contains("▾ More") && opened.contains("hidden line"),
+            "the body shows after unfolding: {opened:?}"
         );
     }
 
