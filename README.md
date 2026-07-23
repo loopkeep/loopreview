@@ -180,11 +180,12 @@ move; `Enter` opens the file; `Esc` closes.
 | `j` / `k` | Move between comments (root and replies), crossing into the next/previous thread at a thread's ends |
 | `g` / `G` | First / last thread |
 | `Ctrl-D` / `Ctrl-U` (or `PageDown` / `PageUp`) | Scroll |
-| `r` | Reply to the selected thread |
+| `c` | New conversation comment — a note tied to nothing in the diff (a draft on a pull request, sent as a PR comment; a local note otherwise) |
+| `r` | Reply to the selected thread (a reply to a conversation thread always stays local — the footer shows `r local reply`) |
 | `x` | Resolve / reopen |
 | `e` | Edit your own comment at the cursor (root or reply; a published edit syncs to GitHub) |
 | `d` | Remove your own comment at the cursor (a draft reply removes itself, a draft root its thread; your own published comment is deleted from GitHub, with confirmation) |
-| `t` | Toggle the comment at the cursor between a draft and a local note — a reply needs its root to be a draft first (pull requests) |
+| `t` | Toggle the comment at the cursor between a draft and a local note — a reply needs its root to be a draft first, and a conversation reply can't (it stays local) (pull requests) |
 | `o` | Collapse / expand |
 | `X` | Close the review (asks to confirm) |
 
@@ -249,7 +250,11 @@ thread's root), so you can adopt an agent's note as a draft to send, or drop one
 of your drafts to a local note. The kinds stay coherent: a reply can only become
 a draft under a draft or published root (otherwise `t` says to promote the root
 first), and demoting a root to a local note takes its draft replies down with it.
-Only drafts are ever submitted; local notes stay off GitHub.
+A reply to a **conversation** thread is the exception — it always stays local and
+can't be promoted, because GitHub's conversation is flat and sending it would
+reword it into an unrelated top-level comment; to say something new there, use `c`
+(a new conversation comment). Only drafts are ever submitted; local notes stay off
+GitHub.
 
 You can also edit (`e`) or delete (`d`) your **own already-published** comment —
 matched against your GitHub login — and it syncs straight to GitHub: an edit via

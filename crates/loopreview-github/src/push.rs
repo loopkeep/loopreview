@@ -320,24 +320,27 @@ pub struct PlannedConversationComment {
 
 /// Decide which draft comments become new PR-conversation comments.
 ///
-/// Every draft comment (root or reply) under a conversation-anchored thread
-/// ([`Anchor::Review`]) is posted individually as a new conversation comment.
-/// Local notes and already-published comments are skipped. Inline threads are
-/// handled by [`plan_inline_comments`] / [`plan_replies`], not here.
+/// Only the **root** of a conversation-anchored thread ([`Anchor::Review`]) is
+/// posted — as a fresh `POST /issues/{n}/comments` — when it is a draft. Replies
+/// under a conversation thread stay local and are never sent: GitHub's
+/// conversation is flat, so posting a reply would flatten it into an unrelated
+/// top-level comment, changing its meaning. Local notes and already-published
+/// roots are skipped; inline threads are handled by [`plan_inline_comments`] /
+/// [`plan_replies`], not here.
 pub(crate) fn plan_conversation_comments(threads: &[Thread]) -> Vec<PlannedConversationComment> {
     let mut planned = Vec::new();
     for thread in threads {
         if thread.anchor != Anchor::Review {
             continue;
         }
-        for comment in &thread.comments {
-            if comment.is_draft() {
-                planned.push(PlannedConversationComment {
-                    thread_id: thread.id.clone(),
-                    comment_id: comment.id.clone(),
-                    body: comment.body.clone(),
-                });
-            }
+        if let Some(root) = thread.comments.first()
+            && root.is_draft()
+        {
+            planned.push(PlannedConversationComment {
+                thread_id: thread.id.clone(),
+                comment_id: root.id.clone(),
+                body: root.body.clone(),
+            });
         }
     }
     planned
@@ -659,11 +662,12 @@ mod tests {
     }
 
     #[test]
-    fn conversation_thread_replies_do_not_take_in_reply_to() {
-        // A draft reply under an issuecomment/review conversation thread must NOT
-        // be planned as an inline reply: its root id is a conversation id, so
-        // in_reply_to against pulls/{n}/comments would 422. It belongs to the
-        // conversation-comment plan instead.
+    fn conversation_replies_are_never_sent() {
+        // A draft reply under a conversation thread (issue comment / review
+        // summary) is not sent at all — conversation replies stay local. It is
+        // neither an inline reply (its root id is a conversation id, which would
+        // 422 against pulls/{n}/comments) nor a new conversation comment (only a
+        // new draft root is posted).
         let issue_thread = Thread {
             id: "issuecomment:900".to_string(),
             anchor: Anchor::Review,
@@ -683,36 +687,38 @@ mod tests {
             ],
         };
 
-        // No inline reply is planned for either.
         assert!(plan_replies(&[issue_thread.clone(), review_thread.clone()]).is_empty());
-
-        // Both drafts route to the conversation-comment plan.
-        let convo = plan_conversation_comments(&[issue_thread, review_thread]);
-        assert_eq!(convo.len(), 2);
-        assert_eq!(convo[0].thread_id, "issuecomment:900");
-        assert_eq!(convo[0].comment_id, "d1");
-        assert_eq!(convo[0].body, "my conversation reply");
-        assert_eq!(convo[1].comment_id, "d2");
+        assert!(
+            plan_conversation_comments(&[issue_thread, review_thread]).is_empty(),
+            "a published-root conversation thread sends nothing — replies stay local"
+        );
     }
 
     #[test]
-    fn conversation_comments_skip_published_and_inline() {
-        // A published conversation root is not re-posted; only its draft replies
-        // are. Inline threads never appear in the conversation plan.
-        let issue_thread = Thread {
+    fn conversation_plan_takes_only_new_draft_roots() {
+        // A brand-new conversation thread (draft root) is sent. A thread whose
+        // root is already published contributes nothing (its reply stays local),
+        // and inline threads never appear in the conversation plan.
+        let fresh = Thread {
+            id: "local-convo".to_string(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![draft_comment("r", "a general note")],
+        };
+        let published_root = Thread {
             id: "issuecomment:1".to_string(),
             anchor: Anchor::Review,
             state: ThreadState::Open,
             comments: vec![
                 published_comment("1", "1", "already sent"),
-                draft_comment("d", "new"),
+                draft_comment("d", "a reply that stays local"),
             ],
         };
         let inline = line_thread("t", Side::New, 3, draft_comment("c", "inline draft"));
 
-        let convo = plan_conversation_comments(&[issue_thread, inline]);
-        assert_eq!(convo.len(), 1);
-        assert_eq!(convo[0].comment_id, "d");
+        let convo = plan_conversation_comments(&[fresh, published_root, inline]);
+        assert_eq!(convo.len(), 1, "only the new draft root is sent");
+        assert_eq!(convo[0].comment_id, "r");
     }
 
     #[test]

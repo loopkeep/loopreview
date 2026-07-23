@@ -291,8 +291,9 @@ pub fn run(session: Session) -> Result<()> {
     app.composer_enter = composer_enter;
     app.keymap = keymap;
     app.status = notice;
-    // A directly-loaded local review may carry an old resolved-draft state.
+    // A directly-loaded local review may carry old contradictory state.
     app.normalize_resolved_drafts();
+    app.normalize_conversation_reply_drafts();
     // For a directly-loaded diff (not a background PR load), apply auto-collapse
     // now; the PR path does it in install_loaded once the diff arrives.
     if loader.is_none() {
@@ -920,6 +921,7 @@ impl App {
         self.label = loaded.label;
         self.review = loaded.review;
         self.normalize_resolved_drafts();
+        self.normalize_conversation_reply_drafts();
         self.pr = loaded.pr.map(Arc::new);
         self.pr_key = loaded.pr_key;
         self.apply_layout(loaded.diff);
@@ -1715,6 +1717,8 @@ impl App {
         match self.view {
             View::Conversation => match action {
                 NavIn => true,
+                // `c` starts a new conversation comment (needs somewhere to keep it).
+                Comment => self.store.is_some() || self.pr.is_some(),
                 Fold => !self.review.threads.is_empty(),
                 CloseReview => self.has_review(),
                 _ => common(action),
@@ -1950,6 +1954,15 @@ impl App {
             self.status = Some("a published comment can't change kind".to_string());
             return;
         }
+        // A reply under a conversation thread stays local — it never posts, so it
+        // cannot be promoted to a draft. Point at the way to say it on GitHub.
+        if ci != 0 && self.review.threads[ti].anchor == Anchor::Review {
+            self.status = Some(
+                "conversation replies stay local — post a new conversation comment (c) instead"
+                    .to_string(),
+            );
+            return;
+        }
         // Promoting a reply to a draft under a local root would queue a reply whose
         // root is never sent. Refuse and point at the root.
         if ci != 0
@@ -2176,6 +2189,24 @@ impl App {
         });
         // The range is captured in the anchor; drop the visual selection.
         self.clear_selection();
+    }
+
+    /// Begin composing a new PR-conversation comment — a thread tied to nothing
+    /// in the diff ([`Anchor::Review`]), the Conversation view's `c`. It saves
+    /// through the same kind/submit flow as any comment: a draft on a pull
+    /// request (sent as a new conversation comment), a local note otherwise.
+    fn start_conversation_comment(&mut self) {
+        if self.store.is_none() && self.pr.is_none() {
+            self.status = Some("comments need a git repository or a pull request".to_string());
+            return;
+        }
+        self.input = Some(Compose {
+            area: TextArea::default(),
+            kind: ComposeKind::New(Anchor::Review),
+            target: "conversation".to_string(),
+            confirming_discard: false,
+            suggestion: false,
+        });
     }
 
     /// Begin composing a GitHub suggested change on the cursor's line or the
@@ -2502,6 +2533,22 @@ impl App {
                     .is_some_and(|c| c.disposition() == CommentKind::Draft);
             if contradiction {
                 thread.state = ThreadState::Open;
+            }
+        }
+    }
+
+    /// Demote to local any draft reply under a conversation thread. Conversation
+    /// replies never post (a conversation is flat on GitHub), so a draft one is a
+    /// contradiction the current guards prevent but an older store may carry.
+    fn normalize_conversation_reply_drafts(&mut self) {
+        for thread in &mut self.review.threads {
+            if thread.anchor != Anchor::Review {
+                continue;
+            }
+            for reply in thread.comments.iter_mut().skip(1) {
+                if reply.disposition() == CommentKind::Draft {
+                    reply.kind = CommentKind::Local;
+                }
             }
         }
     }
@@ -3073,6 +3120,7 @@ impl App {
                 }
             }
             Action::CloseReview if self.has_review() => self.confirming_close = true,
+            Action::Comment => self.start_conversation_comment(),
             Action::Delete => self.request_delete(),
             Action::Edit => self.start_edit(),
             Action::ToggleKind => self.toggle_selected_kind(),
@@ -3633,16 +3681,19 @@ impl App {
 
     /// The kind a reply inherits: local reviews are all local; on a PR, a reply
     /// continues its thread — local under a local note, draft under a draft or
-    /// published thread.
+    /// published thread. A reply under a **conversation** thread
+    /// ([`Anchor::Review`]) is always local: it never posts, since GitHub's
+    /// conversation is flat and sending it would flatten the reply into a new
+    /// top-level comment, changing what it means.
     fn reply_kind(&self, thread_id: &str) -> CommentKind {
         if self.pr.is_none() {
             return CommentKind::Local;
         }
-        let root_local = self
-            .review
-            .thread(thread_id)
-            .and_then(|t| t.root())
-            .is_some_and(|c| c.is_local());
+        let thread = self.review.thread(thread_id);
+        if thread.is_some_and(|t| t.anchor == Anchor::Review) {
+            return CommentKind::Local;
+        }
+        let root_local = thread.and_then(|t| t.root()).is_some_and(|c| c.is_local());
         if root_local {
             CommentKind::Local
         } else {
@@ -3966,6 +4017,19 @@ impl App {
         // An agent's reply is a local note unless it passes --draft (agents don't
         // queue GitHub sends implicitly, even under a draft thread).
         let kind = self.agent_kind(reply.draft);
+        // A conversation reply always stays local — it never posts — so --draft on
+        // one is refused, mirroring the human `t` rule.
+        if kind == CommentKind::Draft
+            && self
+                .review
+                .thread(&reply.thread)
+                .is_some_and(|t| t.anchor == Anchor::Review)
+        {
+            return Err(
+                "conversation replies stay local — post a new conversation comment instead"
+                    .to_string(),
+            );
+        }
         // A draft reply under a local root would be stranded — it could never be
         // sent while the root stays off GitHub. Refuse it, mirroring the human
         // `t` rule; a reply without --draft inherits local as usual.
@@ -5104,6 +5168,7 @@ impl App {
         f.render_widget(Clear, area);
         let title = match &compose.kind {
             ComposeKind::Edit { .. } => " Edit comment ".to_string(),
+            ComposeKind::New(Anchor::Review) => " Comment — conversation ".to_string(),
             _ if compose.suggestion => format!(" Suggest change — {} ", compose.target),
             _ => format!(" Comment on {} ", compose.target),
         };
@@ -5269,6 +5334,7 @@ impl App {
                 (Reply, "reply"),
                 (Edit, "edit"),
                 (Delete, "del"),
+                (Comment, "comment"),
                 (ToggleKind, "kind"),
                 (Resolve, "resolve"),
                 (Fold, "fold"),
@@ -5295,14 +5361,26 @@ impl App {
         } else {
             0
         };
+        // A reply on a conversation thread stays local — name it so the behaviour
+        // shows in the hint, not just after the fact.
+        let conv_reply_local = self.view == View::Conversation
+            && self
+                .selected_thread()
+                .is_some_and(|t| self.review.threads[t].anchor == Anchor::Review);
         let mut parts = Vec::new();
         for (action, label) in candidates {
             if parts.len() >= 6 {
                 break;
             }
             if self.action_available(*action) {
-                let shown = if *action == Reply && overlap > 1 {
-                    format!("{label} ({overlap})")
+                let shown = if *action == Reply {
+                    if conv_reply_local {
+                        "local reply".to_string()
+                    } else if overlap > 1 {
+                        format!("{label} ({overlap})")
+                    } else {
+                        (*label).to_string()
+                    }
                 } else {
                     (*label).to_string()
                 };
@@ -9045,10 +9123,12 @@ mod tests {
         assert!(matches!(sample_app().human_new_kind(), CommentKind::Local));
         let mut pr = pr_app();
         assert!(matches!(pr.human_new_kind(), CommentKind::Draft));
-        // A reply inherits its thread: local under a local note, draft otherwise.
+        // A reply to an *inline* thread inherits it: local under a local note,
+        // draft otherwise. (Conversation-thread replies are always local — that
+        // rule is covered separately.)
         let mk = |id: &str, kind: CommentKind| Thread {
             id: id.into(),
-            anchor: Anchor::Review,
+            anchor: Anchor::line("a.rs", Side::New, 2),
             state: ThreadState::Open,
             comments: vec![Comment {
                 id: format!("{id}c"),
@@ -9063,6 +9143,143 @@ mod tests {
         pr.review.threads.push(mk("drf", CommentKind::Draft));
         assert!(matches!(pr.reply_kind("loc"), CommentKind::Local));
         assert!(matches!(pr.reply_kind("drf"), CommentKind::Draft));
+    }
+
+    #[test]
+    fn c_in_conversation_starts_a_draft_conversation_comment() {
+        let mut app = pr_app(); // a pull request; the viewer is "tester"
+        app.view = View::Conversation;
+        app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        match &app.input.as_ref().expect("the composer opened").kind {
+            ComposeKind::New(Anchor::Review) => {}
+            _ => panic!("expected a conversation composer (Anchor::Review)"),
+        }
+        app.on_key(KeyCode::Char('h'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('i'), KeyModifiers::NONE);
+        app.on_key(KeyCode::Char('s'), KeyModifiers::CONTROL); // Ctrl-S saves
+        assert!(app.input.is_none(), "the composer closed on save");
+        let convo = app
+            .review
+            .threads
+            .iter()
+            .find(|t| t.anchor == Anchor::Review)
+            .expect("a conversation thread was created");
+        assert_eq!(convo.root().unwrap().body, "hi");
+        assert!(
+            convo.root().unwrap().is_draft(),
+            "a new conversation comment is a draft on a pull request"
+        );
+    }
+
+    #[test]
+    fn a_conversation_reply_is_always_local() {
+        let mut app = pr_app();
+        app.review.threads.push(Thread {
+            id: "conv".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: "root".into(),
+                author: "someone".into(),
+                body: "conversation root".into(),
+                created_at: 0,
+                remote_id: Some("900".into()), // a published conversation root
+                kind: CommentKind::Draft,
+            }],
+        });
+        assert_eq!(
+            app.reply_kind("conv"),
+            CommentKind::Local,
+            "a reply under a conversation thread never becomes a draft"
+        );
+    }
+
+    #[test]
+    fn t_refuses_a_conversation_reply() {
+        let mut app = pr_app();
+        let (tid, _) = app.add_thread(Anchor::Review, "tester", "root", CommentKind::Draft);
+        app.add_reply(&tid, "tester", "reply", CommentKind::Local);
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        app.on_key(KeyCode::Char('j'), KeyModifiers::NONE); // step to the reply
+        assert_eq!(app.conv_comment, 1);
+        app.on_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("conversation replies stay local"),
+            "t on a conversation reply is refused: {:?}",
+            app.status
+        );
+        assert!(
+            app.review.threads[0].comments[1].is_local(),
+            "the reply stayed local"
+        );
+    }
+
+    #[test]
+    fn control_reply_refuses_draft_on_a_conversation_thread() {
+        let mut app = pr_app();
+        let (tid, _) = app.add_thread(Anchor::Review, "tester", "root", CommentKind::Draft);
+        let res = app.control_comment_reply(protocol::CommentReply {
+            thread: tid,
+            body: "x".into(),
+            author: "agent".into(),
+            draft: true,
+        });
+        assert!(
+            res.is_err(),
+            "an agent draft reply on a conversation thread is refused: {res:?}"
+        );
+    }
+
+    #[test]
+    fn loading_demotes_a_draft_conversation_reply_to_local() {
+        let mut app = pr_app();
+        let (tid, _) = app.add_thread(Anchor::Review, "tester", "root", CommentKind::Draft);
+        app.add_reply(&tid, "tester", "reply", CommentKind::Draft); // stale draft reply
+        app.normalize_conversation_reply_drafts();
+        assert!(
+            app.review.threads[0].comments[1].is_local(),
+            "the draft conversation reply became local"
+        );
+        assert!(
+            app.review.threads[0].comments[0].is_draft(),
+            "the root draft is untouched"
+        );
+    }
+
+    #[test]
+    fn footer_says_local_reply_on_a_conversation_thread() {
+        let mut app = pr_app();
+        app.add_thread(Anchor::Review, "tester", "root", CommentKind::Draft);
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        let f = app.footer_ops();
+        assert!(
+            f.contains("local reply"),
+            "a conversation reply is flagged local in the footer: {f}"
+        );
+
+        // An inline thread keeps the plain `reply` wording.
+        let mut inline = pr_app();
+        inline.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "root",
+            CommentKind::Draft,
+        );
+        inline.relayout();
+        inline.view = View::Conversation;
+        inline.conv_cursor = 0;
+        let f = inline.footer_ops();
+        assert!(
+            f.contains("reply") && !f.contains("local reply"),
+            "an inline reply is plain: {f}"
+        );
     }
 
     #[test]
@@ -10618,9 +10835,10 @@ mod tests {
         assert!(app.cursor_is_header());
         assert!(!app.action_available(Action::Comment));
         app.cursor = 1;
-        // Conversation view: Comment does not apply, Reply and CloseReview do.
+        // Conversation view: Comment applies (a new conversation comment, given a
+        // store), and Reply and CloseReview do too.
         app.view = View::Conversation;
-        assert!(!app.action_available(Action::Comment));
+        assert!(app.action_available(Action::Comment));
         assert!(app.action_available(Action::CloseReview));
         // Submit is available only on a pull request.
         assert!(!app.action_available(Action::Submit));

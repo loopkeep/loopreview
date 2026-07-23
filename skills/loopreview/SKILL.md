@@ -103,7 +103,9 @@ lr session comment rm --repo . --comment <id>                     # withdraw a l
   reply) is a local note. `--draft` only matters on a pull request. A `--draft`
   **reply** is refused under a local-note root — it could never be sent while the
   root stays off GitHub — so reply without `--draft`, or have the root promoted
-  to a draft first.
+  to a draft first. A reply to a **conversation** thread (one not tied to a line)
+  is always local: `--draft` on it is refused, since GitHub's conversation is
+  flat and the reply would post as an unrelated top-level comment.
 - `comment edit --comment <id> --body <text>` replaces the body of one of your
   own unpublished comments (a draft or local note, root or reply). It refuses a
   published comment (writing to GitHub is the human's action) and another
