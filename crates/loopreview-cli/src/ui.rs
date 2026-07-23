@@ -55,6 +55,9 @@ use crate::textarea::TextArea;
 
 /// Rows of context kept above/below the cursor when scrolling.
 const SCROLLOFF: usize = 3;
+/// Terminal height at or above which the tab bar gets padding rows above and
+/// below it; below this the padding collapses so the body is not squeezed.
+const TAB_SPACING_MIN_HEIGHT: u16 = 16;
 /// Columns moved per horizontal-scroll step.
 const HSCROLL_STEP: isize = 8;
 /// Trailing whitespace allowed past the longest line at the far-right scroll
@@ -4038,30 +4041,40 @@ impl App {
             self.draw_load_error(f, error);
             return;
         }
-        // A tab bar appears once the review has threads.
+        // A tab bar appears once the review has threads. A comfortable terminal
+        // gives it breathing room — a blank row above and below; a short one
+        // collapses that so the body keeps every row it can.
         let tabs = self.has_review();
-        let constraints = if tabs {
-            vec![
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ]
-        } else {
-            vec![
-                Constraint::Length(1),
-                Constraint::Min(1),
-                Constraint::Length(1),
-            ]
+        let spacious = tabs && f.area().height >= TAB_SPACING_MIN_HEIGHT;
+        let constraints: Vec<Constraint> = match (tabs, spacious) {
+            (true, true) => vec![
+                Constraint::Length(1), // header
+                Constraint::Length(1), // gap
+                Constraint::Length(1), // tabs
+                Constraint::Length(1), // gap
+                Constraint::Min(1),    // body
+                Constraint::Length(1), // footer
+            ],
+            (true, false) => vec![
+                Constraint::Length(1), // header
+                Constraint::Length(1), // tabs
+                Constraint::Min(1),    // body
+                Constraint::Length(1), // footer
+            ],
+            (false, _) => vec![
+                Constraint::Length(1), // header
+                Constraint::Min(1),    // body
+                Constraint::Length(1), // footer
+            ],
         };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(f.area());
-        let (header, body, footer) = if tabs {
-            (chunks[0], chunks[2], chunks[3])
-        } else {
-            (chunks[0], chunks[1], chunks[2])
+        let (header, tabs_area, body, footer) = match (tabs, spacious) {
+            (true, true) => (chunks[0], Some(chunks[2]), chunks[4], chunks[5]),
+            (true, false) => (chunks[0], Some(chunks[1]), chunks[2], chunks[3]),
+            (false, _) => (chunks[0], None, chunks[1], chunks[2]),
         };
         // Split off the file-explorer sidebar when shown and the terminal is
         // wide enough (it auto-hides on a narrow terminal — the finder still
@@ -4114,7 +4127,7 @@ impl App {
             content_w: content.width,
             sidebar_x0,
             sidebar_w: sidebar_cols,
-            tabs_row: tabs.then(|| chunks[1].y),
+            tabs_row: tabs_area.map(|t| t.y),
             tab_files_end: files_w,
             tab_conv_end: files_w + 1 + conv_label.chars().count() as u16,
             footer_row: footer.y,
@@ -4122,8 +4135,8 @@ impl App {
         });
 
         self.draw_header(f, header);
-        if tabs {
-            self.draw_tabs(f, chunks[1]);
+        if let Some(tabs_area) = tabs_area {
+            self.draw_tabs(f, tabs_area);
         }
         if self.view == View::Conversation {
             self.draw_conversation(f, content);
@@ -8881,6 +8894,53 @@ mod tests {
             Color::DarkGray,
             "the unfocused sidebar frame is dim"
         );
+    }
+
+    #[test]
+    fn tab_bar_padding_collapses_on_a_short_terminal() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = sample_app();
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "me",
+            "c",
+            CommentKind::Local,
+        );
+        app.relayout();
+        app.sidebar_override = Some(false); // single pane, so content == body
+
+        // Tall: blank rows pad the tab bar (header · gap · tabs · gap · body).
+        let mut tall = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        tall.draw(|f| app.draw(f)).unwrap();
+        let hit = app.hit.get();
+        let tabs_row = hit.tabs_row.expect("the tab bar is shown");
+        assert_eq!(
+            tabs_row, 2,
+            "a gap row sits between the header and the tabs"
+        );
+        assert_eq!(
+            hit.body_top,
+            tabs_row + 2,
+            "a gap row sits between tabs and body"
+        );
+        assert_eq!(hit_region(0, tabs_row, hit), Region::Tabs);
+        assert!(
+            matches!(
+                hit_region(hit.content_x0, hit.body_top, hit),
+                Region::Content { .. }
+            ),
+            "the first body row is still content, at its shifted position"
+        );
+
+        // Short: the padding collapses (header · tabs · body) so the body keeps
+        // its rows and the hit geometry stays consistent.
+        let mut short = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        short.draw(|f| app.draw(f)).unwrap();
+        let hit = app.hit.get();
+        let tabs_row = hit.tabs_row.expect("the tab bar is shown");
+        assert_eq!(tabs_row, 1, "no header/tabs gap when short");
+        assert_eq!(hit.body_top, tabs_row + 1, "no tabs/body gap when short");
     }
 
     #[test]
