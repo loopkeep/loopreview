@@ -10,6 +10,7 @@ mod control;
 mod highlight;
 mod keys;
 mod markdown;
+mod opener;
 mod palette;
 mod prsync;
 mod session_cli;

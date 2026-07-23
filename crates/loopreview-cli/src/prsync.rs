@@ -70,6 +70,12 @@ impl PrHandle {
         &self.pr.title
     }
 
+    /// The canonical pull-request URL — the page to open in a browser, and the
+    /// base a published comment's [`CommentEndpoint::anchor`] deep-links onto.
+    pub fn url(&self) -> &str {
+        &self.pr.url
+    }
+
     /// A handle with an offline client, for tests that only need PR mode plus
     /// the number/title (no network calls are made).
     #[cfg(test)]
@@ -84,7 +90,7 @@ impl PrHandle {
                 base_ref: "main".into(),
                 head_ref: "feature".into(),
                 state: "OPEN".into(),
-                url: String::new(),
+                url: format!("https://github.com/owner/repo/pull/{number}"),
             },
             viewer: Some("tester".into()),
         }

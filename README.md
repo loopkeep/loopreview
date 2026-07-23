@@ -111,6 +111,7 @@ files from a working-tree review.
 | `?` | Open the command palette — a searchable list of every action with its current key; actions that apply right now are listed first, the rest greyed |
 | `b` | Toggle the file-explorer sidebar |
 | `Ctrl-P` | Open the fuzzy file finder |
+| `Ctrl-O` | Open the current spot on github.com — a published comment under the Conversation cursor deep-links to it, otherwise the PR page (pull requests) |
 | `Ctrl-R` | Refresh from GitHub (pull requests) |
 | `Ctrl-S` | Open the submit modal (pull requests) |
 
@@ -305,7 +306,7 @@ composer likewise keep their own keys while open. Action names:
 `next_file`, `prev_file`, `next_hunk`, `prev_hunk`, `nav_in`, `nav_out`,
 `scroll_left`, `scroll_right`, `layout_toggle`, `comment`, `reply`, `resolve`,
 `fold`, `select`, `close_review`, `delete`, `edit`, `toggle_kind`, `sidebar`,
-`file_finder`, `refresh`, `submit`, `palette`.
+`file_finder`, `refresh`, `submit`, `palette`, `open_github`.
 
 ```toml
 split_min_width = 160

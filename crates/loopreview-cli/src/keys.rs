@@ -57,6 +57,7 @@ pub enum Action {
     Refresh,
     Submit,
     Palette,
+    OpenGithub,
 }
 
 impl Action {
@@ -93,6 +94,7 @@ impl Action {
         Action::Refresh,
         Action::Submit,
         Action::Palette,
+        Action::OpenGithub,
     ];
 
     /// The config/`[keys]` name — the source of truth for remappable actions is
@@ -143,6 +145,7 @@ impl Action {
             Action::Refresh => "Refresh from GitHub",
             Action::Submit => "Open the submit modal",
             Action::Palette => "Open this command palette",
+            Action::OpenGithub => "Open the current spot on github.com",
         }
     }
 }
@@ -179,6 +182,7 @@ const DEFAULTS: &[(Action, &str, &str)] = &[
     (Action::Refresh, "refresh", "ctrl+r"),
     (Action::Submit, "submit", "ctrl+s"),
     (Action::Palette, "palette", "?"),
+    (Action::OpenGithub, "open_github", "ctrl+o"),
 ];
 
 /// Fixed alternate keys, always mapped regardless of the config.

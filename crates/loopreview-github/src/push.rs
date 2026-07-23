@@ -161,6 +161,18 @@ impl CommentEndpoint {
     pub fn is_deletable(&self) -> bool {
         !matches!(self, CommentEndpoint::ReviewSummary(_))
     }
+
+    /// The URL fragment (including the leading `#`) that scrolls a PR page to this
+    /// comment, e.g. `#discussion_r123`. Appended to a [`ResolvedPr::url`] it forms
+    /// a deep link. Each object type has its own anchor scheme on github.com, keyed
+    /// by the same numeric id the edit/delete routes use.
+    pub fn anchor(&self) -> String {
+        match self {
+            CommentEndpoint::ReviewComment(id) => format!("#discussion_r{id}"),
+            CommentEndpoint::IssueComment(id) => format!("#issuecomment-{id}"),
+            CommentEndpoint::ReviewSummary(id) => format!("#pullrequestreview-{id}"),
+        }
+    }
 }
 
 /// Decide which draft threads become inline review comments.
@@ -475,6 +487,16 @@ mod tests {
         assert_eq!(ReviewSummary(42).delete_path("o", "r"), None);
         assert!(!ReviewSummary(42).is_deletable());
         assert!(ReviewComment(42).is_deletable());
+    }
+
+    #[test]
+    fn comment_endpoint_anchors_match_github_fragments() {
+        use CommentEndpoint::*;
+        // Each object type deep-links through its own fragment scheme, keyed by the
+        // same numeric id used to edit/delete it.
+        assert_eq!(ReviewComment(123).anchor(), "#discussion_r123");
+        assert_eq!(IssueComment(456).anchor(), "#issuecomment-456");
+        assert_eq!(ReviewSummary(789).anchor(), "#pullrequestreview-789");
     }
 
     #[test]

@@ -1051,6 +1051,40 @@ impl App {
         );
     }
 
+    /// Open the current position on github.com in the browser (`open_github`,
+    /// default Ctrl-O). Only pull requests have a page; a plain local review has
+    /// nowhere to go. On a PR the target is a deep link to the published comment
+    /// under the Conversation cursor, else the PR page itself. A launcher that
+    /// won't run falls back to printing the URL for the user to open by hand.
+    fn open_github(&mut self) {
+        let Some(pr) = self.pr.clone() else {
+            self.status = Some("no GitHub context here".to_string());
+            return;
+        };
+        let url = self.github_link(&pr);
+        self.status = Some(match crate::opener::open_url(&url) {
+            Ok(()) => format!("opened {url}"),
+            Err(_) => format!("open it yourself: {url}"),
+        });
+    }
+
+    /// The github.com URL for the current position: a deep link to the published
+    /// comment the Conversation cursor rests on (built from its kept remote id via
+    /// [`CommentEndpoint::anchor`]), or the PR page for anything else — a diff
+    /// line, a draft/local note, or the Files view.
+    fn github_link(&self, pr: &PrHandle) -> String {
+        if self.view == View::Conversation
+            && let Some((ti, ci)) = self.selected_comment()
+            && let Some(comment) = self.review.threads[ti].comments.get(ci)
+            && comment.is_published()
+            && let Some(endpoint) =
+                self.published_endpoint(&self.review.threads[ti].id, &comment.id)
+        {
+            return format!("{}{}", pr.url(), endpoint.anchor());
+        }
+        pr.url().to_string()
+    }
+
     /// Count the local drafts that a submit would post: new inline threads and
     /// replies (comments without a remote id).
     /// What a submit would send: the new-inline and reply counts, the draft
@@ -1566,6 +1600,7 @@ impl App {
             Action::Palette => return self.open_palette(),
             Action::Refresh if self.pr.is_some() => return self.refresh(),
             Action::Submit if self.pr.is_some() => return self.open_submit(),
+            Action::OpenGithub => return self.open_github(),
             _ => {}
         }
         let in_sidebar =
@@ -1585,7 +1620,8 @@ impl App {
     fn action_available(&self, action: Action) -> bool {
         use Action::*;
         match action {
-            ToggleSidebar | FileFinder | Palette => return true,
+            // OpenGithub always runs (it reports "no GitHub context" itself off a PR).
+            ToggleSidebar | FileFinder | Palette | OpenGithub => return true,
             Refresh | Submit => return self.pr.is_some(),
             _ => {}
         }
@@ -7751,6 +7787,74 @@ mod tests {
                 .unwrap_or("")
                 .contains("published")
         );
+    }
+
+    #[test]
+    fn github_link_deep_links_a_published_comment_by_kind() {
+        // On a PR the Conversation cursor on a published comment deep-links to it;
+        // the anchor scheme follows the thread-id prefix the pull assigns (review
+        // summary / conversation comment / inline review comment).
+        let mut app = pr_app();
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "posted",
+            CommentKind::Draft,
+        );
+        app.review.threads[0].comments[0].remote_id = Some("123".into());
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        app.conv_comment = 0;
+        let pr = app.pr.clone().unwrap();
+
+        // A plain (non-prefixed) thread id is an inline review comment.
+        assert_eq!(
+            app.github_link(&pr),
+            "https://github.com/owner/repo/pull/1#discussion_r123"
+        );
+        // A conversation comment and a review summary key off the prefix.
+        app.review.threads[0].id = "issuecomment:9".into();
+        app.relayout();
+        assert_eq!(
+            app.github_link(&pr),
+            "https://github.com/owner/repo/pull/1#issuecomment-123"
+        );
+        app.review.threads[0].id = "review:9".into();
+        app.relayout();
+        assert_eq!(
+            app.github_link(&pr),
+            "https://github.com/owner/repo/pull/1#pullrequestreview-123"
+        );
+
+        // An unpublished draft under the cursor falls back to the PR page.
+        app.review.threads[0].comments[0].remote_id = None;
+        app.relayout();
+        assert_eq!(app.github_link(&pr), "https://github.com/owner/repo/pull/1");
+    }
+
+    #[test]
+    fn github_link_is_the_pr_page_off_conversation_and_absent_off_a_pr() {
+        // The Files view never rests "on" a comment, so it opens the PR page even
+        // over a published thread.
+        let mut app = pr_app();
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "posted",
+            CommentKind::Draft,
+        );
+        app.review.threads[0].comments[0].remote_id = Some("123".into());
+        app.relayout();
+        app.view = View::Files;
+        let pr = app.pr.clone().unwrap();
+        assert_eq!(app.github_link(&pr), "https://github.com/owner/repo/pull/1");
+
+        // Off a pull request there is nowhere to go — Ctrl-O just says so (and must
+        // not try to launch a browser).
+        let mut local = sample_app();
+        local.on_key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_eq!(local.status.as_deref(), Some("no GitHub context here"));
     }
 
     #[test]
