@@ -262,6 +262,9 @@ enum JobOutcome {
 /// A background action worker: reports progress, then yields an outcome.
 type JobWorker = Box<dyn FnOnce(&dyn Fn(&str)) -> Result<JobOutcome, String> + Send>;
 
+/// How a URL is launched (a link/image click, `Ctrl-O`); injectable for tests.
+type UrlOpener = Box<dyn Fn(&str) -> std::io::Result<()>>;
+
 /// Spinner frames shown while a background load runs.
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -845,6 +848,9 @@ struct App {
     /// The Overview `<details>` effective open state from the last render, so a
     /// toggle flips the current value.
     overview_effective: RefCell<HashMap<usize, bool>>,
+    /// How a URL is opened (a link/image click, `Ctrl-O`). Injectable so tests
+    /// capture the URL instead of launching the system browser.
+    url_opener: UrlOpener,
     /// The store key for the current PR's drafts (`owner/repo#number`).
     pr_key: Option<String>,
     /// The repo directory, for reconstructing outdated lines from history.
@@ -975,6 +981,7 @@ impl App {
             overview_folds: HashMap::new(),
             overview_regions: RefCell::new(Vec::new()),
             overview_effective: RefCell::new(HashMap::new()),
+            url_opener: Box::new(crate::opener::open_url),
             pr_key: None,
             repo_dir,
             source: None,
@@ -1297,7 +1304,7 @@ impl App {
             self.status = Some("no GitHub context here".to_string());
             return;
         };
-        self.status = Some(match crate::opener::open_url(&url) {
+        self.status = Some(match (self.url_opener)(&url) {
             Ok(()) => format!("opened {url}"),
             Err(_) => format!("open it yourself: {url}"),
         });
@@ -1313,7 +1320,7 @@ impl App {
         } else {
             return;
         };
-        self.status = Some(match crate::opener::open_url(&url) {
+        self.status = Some(match (self.url_opener)(&url) {
             Ok(()) => format!("opened {url}"),
             Err(_) => format!("open it yourself: {url}"),
         });
@@ -5941,6 +5948,11 @@ impl App {
             facts,
             Style::default().fg(Color::DarkGray),
         )));
+        // A dim rule marks the boundary between the facts block and the body.
+        lines.push(TextLine::from(TextSpan::styled(
+            "─".repeat(width.max(1)),
+            Style::default().fg(Color::DarkGray),
+        )));
         lines.push(TextLine::from(""));
         // The description, or a placeholder when empty (still shown, so the tab
         // is never a blank pane).
@@ -6004,7 +6016,7 @@ impl App {
     fn run_overview_md_action(&mut self, action: crate::markdown::MdAction) {
         match action {
             crate::markdown::MdAction::Open(url) => {
-                self.status = Some(match crate::opener::open_url(&url) {
+                self.status = Some(match (self.url_opener)(&url) {
                     Ok(()) => format!("opened {url}"),
                     Err(_) => format!("open it yourself: {url}"),
                 });
@@ -13982,6 +13994,14 @@ mod tests {
     #[test]
     fn an_overview_link_click_opens_it() {
         let mut app = issue_app();
+        // Capture the URL instead of launching a real browser (never open a real
+        // process from a test).
+        let opened = std::rc::Rc::new(RefCell::new(Vec::<String>::new()));
+        let sink = opened.clone();
+        app.url_opener = Box::new(move |url: &str| {
+            sink.borrow_mut().push(url.to_string());
+            Ok(())
+        });
         if let Some(ov) = app.pr_overview.as_mut() {
             ov.body = "See https://example.com/xyz here".into();
         }
@@ -13991,11 +14011,17 @@ mod tests {
             .iter()
             .find(|r| matches!(&r.action, crate::markdown::MdAction::Open(u) if u.contains("xyz")))
             .expect("a link region in the overview body");
-        // Resolve the click through the cached regions and run it.
+        // Resolve the click through the cached regions (with scroll offset 0) and
+        // run it — the injected opener records the URL.
         let action = app
             .overview_action_at(link.line, link.start)
             .expect("the region is hit at its own coordinates");
         app.run_overview_md_action(action);
+        assert_eq!(
+            opened.borrow().as_slice(),
+            &["https://example.com/xyz".to_string()],
+            "the click routed the url to the opener (no real browser launch)"
+        );
         assert!(
             app.status
                 .as_deref()
@@ -14035,6 +14061,25 @@ mod tests {
             opened.contains("▾ More") && opened.contains("hidden body"),
             "the body shows after unfolding: {opened:?}"
         );
+    }
+
+    #[test]
+    fn the_overview_shows_a_rule_below_the_facts() {
+        // Both a PR and an issue Overview separate the facts block from the body
+        // with a dim, full-width rule.
+        let mut pr = pr_app();
+        pr.pr_overview = Some(overview(PrStatus::Open));
+        let issue = issue_app();
+        for app in [&pr, &issue] {
+            let lines = app.overview_lines(40);
+            assert!(
+                lines.iter().any(|l| {
+                    let t: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                    !t.is_empty() && t.chars().all(|c| c == '─')
+                }),
+                "a rule line separates facts from body"
+            );
+        }
     }
 
     #[test]

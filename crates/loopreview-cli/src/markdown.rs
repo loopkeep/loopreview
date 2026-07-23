@@ -310,17 +310,9 @@ impl Renderer<'_> {
             TagEnd::Emphasis => self.style = self.style.remove_modifier(Modifier::ITALIC),
             TagEnd::Strong => self.style = self.style.remove_modifier(Modifier::BOLD),
             TagEnd::Strikethrough => self.style = self.style.remove_modifier(Modifier::CROSSED_OUT),
+            // The label text carried the link style + action; nothing to append.
             TagEnd::Link => {
-                if let Some(url) = self.link.take() {
-                    // The "(url)" tail is the clickable part of a markdown link.
-                    self.spans.push(Piece {
-                        span: TextSpan::styled(
-                            format!(" ({url})"),
-                            self.style.fg(palette::LINK_FG),
-                        ),
-                        action: Some(MdAction::Open(url)),
-                    });
-                }
+                self.link = None;
             }
             TagEnd::Image => {
                 if let Some((url, alt)) = self.image.take() {
@@ -378,12 +370,20 @@ impl Renderer<'_> {
         }
     }
 
-    /// Push a run of text, autolinking bare `http(s)://` URLs (GitHub does).
-    /// Skipped inside a markdown link label, already a link.
+    /// Push a run of text. Inside a markdown link label it becomes underlined
+    /// link text carrying the destination (clickable, no separate `(url)`);
+    /// elsewhere bare `http(s)://` URLs autolink (GitHub does).
     fn push_text(&mut self, text: &str) {
-        if self.link.is_some() {
-            self.spans
-                .push(Piece::plain(TextSpan::styled(text.to_string(), self.style)));
+        if let Some(url) = self.link.clone() {
+            self.spans.push(Piece {
+                span: TextSpan::styled(
+                    text.to_string(),
+                    self.style
+                        .fg(palette::LINK_FG)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
+                action: Some(MdAction::Open(url)),
+            });
             return;
         }
         let mut rest = text;
@@ -1553,8 +1553,20 @@ mod tests {
     }
 
     #[test]
-    fn a_markdown_link_is_clickable() {
+    fn a_markdown_link_shows_underlined_text_only_and_is_clickable() {
         let r = rich("read [the docs](https://docs.example.com)", Some(60));
+        let joined = texts(&r.lines).join(" ");
+        assert!(joined.contains("the docs"), "the label shows: {joined:?}");
+        assert!(
+            !joined.contains("(https://"),
+            "no `(url)` suffix: {joined:?}"
+        );
+        // The label text is underlined link text (wrapping splits it into words).
+        let label = style_of(&r.lines, "docs").unwrap();
+        assert!(
+            label.add_modifier.contains(Modifier::UNDERLINED) && label.fg == Some(palette::LINK_FG)
+        );
+        // A click on the label opens the destination.
         assert!(
             r.regions
                 .iter()
