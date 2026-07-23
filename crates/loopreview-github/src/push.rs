@@ -366,6 +366,19 @@ pub struct CreatedComment {
     /// The comment's original line (used when `line` is null).
     #[serde(default)]
     pub original_line: Option<u64>,
+    /// The submitted review this comment belongs to. Present on the PR-wide
+    /// `/pulls/{n}/comments` collection, letting us filter to one review's
+    /// comments — the review-scoped endpoint returns null `line`/`side`.
+    #[serde(default)]
+    pub pull_request_review_id: Option<u64>,
+}
+
+/// Keep only the comments belonging to review `review_id` — used to pick a
+/// submitted review's created comments out of the PR-wide comment collection.
+pub(crate) fn comments_for_review(all: Vec<CreatedComment>, review_id: u64) -> Vec<CreatedComment> {
+    all.into_iter()
+        .filter(|c| c.pull_request_review_id == Some(review_id))
+        .collect()
 }
 
 /// Match created review comments back to the drafts that produced them.
@@ -842,6 +855,7 @@ mod tests {
                 side: Some("LEFT".to_string()),
                 line: Some(5),
                 original_line: None,
+                pull_request_review_id: None,
             },
             CreatedComment {
                 id: 8002,
@@ -849,6 +863,7 @@ mod tests {
                 side: Some("RIGHT".to_string()),
                 line: Some(10),
                 original_line: None,
+                pull_request_review_id: None,
             },
         ];
         let matched = match_created_comments(&planned, &created);
@@ -886,6 +901,7 @@ mod tests {
                 side: Some("RIGHT".to_string()),
                 line: Some(10),
                 original_line: None,
+                pull_request_review_id: None,
             },
             CreatedComment {
                 id: 8002,
@@ -893,6 +909,7 @@ mod tests {
                 side: Some("LEFT".to_string()),
                 line: Some(5),
                 original_line: None,
+                pull_request_review_id: None,
             },
         ];
         let reconciled = reconcile_published(&plan, Some(&created));
@@ -929,6 +946,7 @@ mod tests {
             side: Some("RIGHT".to_string()),
             line: Some(10),
             original_line: None,
+            pull_request_review_id: None,
         }];
         let reconciled = reconcile_published(&plan, Some(&created));
         assert_eq!(
@@ -947,7 +965,74 @@ mod tests {
             side: Some(side.to_string()),
             line: Some(line),
             original_line: None,
+            pull_request_review_id: None,
         }
+    }
+
+    #[test]
+    fn a_null_line_side_read_back_matches_nothing() {
+        // The bug: the review-scoped endpoint returns null line/side/original_line,
+        // so the (path, side, line) match can pair nothing — every draft ends up
+        // id-pending. This is what motivated the endpoint switch.
+        let plan = vec![planned("t1", 5, "RIGHT")];
+        let null_shaped = vec![CreatedComment {
+            id: 900,
+            path: "src/a.rs".to_string(),
+            side: None,
+            line: None,
+            original_line: None,
+            pull_request_review_id: Some(42),
+        }];
+        assert!(
+            match_created_comments(&plan, &null_shaped).is_empty(),
+            "null line/side reconciles nothing — the endpoint bug"
+        );
+    }
+
+    #[test]
+    fn comments_for_review_isolates_by_review_id() {
+        // The PR-wide collection carries comments from several reviews; the filter
+        // keeps only ours.
+        let mut mine = created_at(100, 5, "RIGHT");
+        mine.pull_request_review_id = Some(42);
+        let mut other = created_at(200, 9, "RIGHT");
+        other.pull_request_review_id = Some(99);
+        let mut a_reply = created_at(300, 5, "RIGHT");
+        a_reply.pull_request_review_id = None; // a loose reply, no review
+        let kept = comments_for_review(vec![mine, other, a_reply], 42);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, 100);
+    }
+
+    #[test]
+    fn a_populated_read_back_matches_single_and_multi_line() {
+        // With line/side populated (the PR-wide endpoint), both a single-line and a
+        // multi-line comment reconcile — the multi-line key is its end line, which
+        // is what GitHub returns as `line`. (The endpoint bug killed both equally,
+        // since line was null regardless of span — multi-line was never at fault.)
+        let plan = vec![
+            planned("single", 5, "RIGHT"),
+            planned("multi", 14, "RIGHT"), // a 10-14 range's end line
+        ];
+        let created = vec![
+            created_at(100, 5, "RIGHT"),
+            CreatedComment {
+                id: 200,
+                path: "src/a.rs".to_string(),
+                side: Some("RIGHT".to_string()),
+                line: Some(14),
+                original_line: None,
+                pull_request_review_id: Some(42),
+            },
+        ];
+        let matched = match_created_comments(&plan, &created);
+        assert_eq!(
+            matched,
+            vec![
+                ("single".to_string(), "100".to_string()),
+                ("multi".to_string(), "200".to_string()),
+            ]
+        );
     }
 
     #[test]

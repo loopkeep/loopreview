@@ -354,18 +354,23 @@ impl GithubClient {
         })
     }
 
-    /// Read the comments a submitted review created, to match remote ids.
+    /// Read the comments a submitted review created, to match remote ids. Reads
+    /// the PR-wide review-comment collection and filters to this review — the
+    /// review-scoped endpoint (`/reviews/{id}/comments`) returns null `line`/`side`,
+    /// which the `(path, side, line)` match can't use, so it never reconciles.
     fn fetch_review_comments(
         &self,
         pr: &ResolvedPr,
         review_id: u64,
     ) -> Result<Vec<push::CreatedComment>, GithubError> {
         let path = format!(
-            "repos/{}/{}/pulls/{}/reviews/{}/comments",
-            pr.owner, pr.repo, pr.number, review_id
+            "repos/{}/{}/pulls/{}/comments",
+            pr.owner, pr.repo, pr.number
         );
         let out = cmd::run_ok("gh", &["api", "--paginate", &path], &self.dir, None)?;
-        serde_json::from_str(&out).map_err(|e| GithubError::parse("review comments", e))
+        let all: Vec<push::CreatedComment> =
+            serde_json::from_str(&out).map_err(|e| GithubError::parse("review comments", e))?;
+        Ok(push::comments_for_review(all, review_id))
     }
 
     /// Post every draft reply in `threads` and return one [`ReplyOutcome`] per

@@ -336,15 +336,14 @@ pub fn merge_drafts(previous: &Review, fresh: Vec<Thread>) -> (Vec<Thread>, usiz
             }
             continue;
         }
-        // A published thread: carry over any draft replies it accumulated,
-        // matching the fresh thread by id. A thread published normally keeps the
-        // GraphQL node id it was pulled under, so this matches. The exception is a
-        // locally-created thread whose root was submitted but left id-pending (its
-        // root carries the `PENDING_REMOTE_ID` sentinel): its id is a local id, not
-        // the GraphQL node id the fresh pull carries, so no fresh thread matches
-        // and any draft reply under it is intentionally dropped here — it was never
-        // sent (a reply cannot attach to an unreconciled root) and the real thread
-        // arrives fresh from the pull. This is a rare, accepted edge.
+        // A published thread: carry its draft/local notes over onto the fresh
+        // thread. A normally-published thread keeps the GraphQL node id it was
+        // pulled under, so it matches by id. A locally-created thread whose root was
+        // submitted but left id-pending (a `PENDING_REMOTE_ID` sentinel) has a
+        // *local* id that won't match the fresh pull's GraphQL id — so re-home its
+        // notes by anchor + root body instead. Without this the draft reply that the
+        // "refresh and submit again" prompt tells the user to send would be lost on
+        // the very refresh it asks for (a data-loss self-contradiction).
         let root_pending =
             old.root().and_then(|c| c.remote_id.as_deref()) == Some(PENDING_REMOTE_ID);
         let drafts: Vec<_> = old
@@ -354,14 +353,23 @@ pub fn merge_drafts(previous: &Review, fresh: Vec<Thread>) -> (Vec<Thread>, usiz
             .cloned()
             .collect();
         if !drafts.is_empty() {
-            if let Some(fresh_thread) = result.iter_mut().find(|t| t.id == old.id) {
-                fresh_thread.comments.extend(drafts);
-            } else if !root_pending {
-                // No fresh thread matches and the root was a real published comment:
-                // it was deleted on GitHub. Its local notes have no thread to hang
-                // under and are dropped — counted so the refresh can report it. (The
-                // sentinel case above is an expected re-sync, not a deletion.)
-                orphans += drafts.len();
+            let target = result.iter().position(|t| t.id == old.id).or_else(|| {
+                root_pending
+                    .then(|| {
+                        let old_body = old.root().map(|c| c.body.as_str());
+                        result.iter().position(|t| {
+                            same_anchor_location(&t.anchor, &old.anchor)
+                                && t.root().map(|c| c.body.as_str()) == old_body
+                        })
+                    })
+                    .flatten()
+            });
+            match target {
+                Some(i) => result[i].comments.extend(drafts),
+                // No fresh thread by id (nor by anchor+body for a sentinel): the
+                // root is gone from GitHub. The notes have nowhere to live — dropped
+                // and counted so the refresh reports it rather than losing it silently.
+                None => orphans += drafts.len(),
             }
         }
     }
@@ -451,6 +459,49 @@ mod tests {
         assert_eq!(cleaned, 0);
         assert_eq!(orphans, 1, "the orphaned local note is counted");
         assert!(merged.is_empty(), "and not carried into the merged review");
+    }
+
+    #[test]
+    fn merge_rehomes_a_sentinel_threads_reply_onto_the_fresh_thread() {
+        // A locally-submitted root left id-pending (sentinel) with a draft reply.
+        // On pull the real published root arrives under a *different* (GraphQL) id,
+        // so the id match misses — the reply must be re-homed by anchor+body, not
+        // dropped (that would lose the very reply "refresh and submit again" wants).
+        let previous = Review {
+            threads: vec![thread_at(
+                "local-id",
+                Anchor::line("f", Side::New, 1),
+                vec![
+                    comment("root", Some(PENDING_REMOTE_ID)),
+                    comment("reply", None),
+                ],
+            )],
+        };
+        let fresh = vec![thread_at(
+            "PRRT_real",
+            Anchor::line("f", Side::New, 1),
+            vec![comment("c-real", Some("999"))],
+        )];
+
+        let (merged, cleaned, orphans) = merge_drafts(&previous, fresh);
+        assert_eq!((cleaned, orphans), (0, 0), "nothing lost");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].id, "PRRT_real", "kept the fresh thread");
+        assert_eq!(
+            merged[0].comments.len(),
+            2,
+            "the draft reply re-homed under the now-published root"
+        );
+        assert!(
+            merged[0].comments[1].remote_id.is_none(),
+            "the reply is still a draft (kind preserved)"
+        );
+        // The reply now sits under a root that carries a real numeric id — exactly
+        // the shape plan_replies needs, so a resubmit will send it.
+        assert!(
+            merged[0].root().unwrap().remote_id.as_deref() == Some("999"),
+            "under a real-id published root"
+        );
     }
 
     #[test]
