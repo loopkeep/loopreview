@@ -96,6 +96,15 @@ impl PrHandle {
         }
     }
 
+    /// Like [`for_test`](Self::for_test) but with a chosen viewer login — for
+    /// tests that exercise a git-name / GitHub-login mismatch.
+    #[cfg(test)]
+    pub fn for_test_with_viewer(number: u64, title: &str, viewer: &str) -> PrHandle {
+        let mut handle = PrHandle::for_test(number, title);
+        handle.viewer = Some(viewer.to_string());
+        handle
+    }
+
     /// The authenticated GitHub login, when known.
     pub fn viewer(&self) -> Option<&str> {
         self.viewer.as_deref()

@@ -1979,14 +1979,15 @@ impl App {
         let published = comment.is_published();
         let mine = self.comment_is_mine(comment);
         if published {
-            // A published comment's owner is the GitHub viewer login; if that is
-            // unknown (gh unreachable at load) say so rather than "not yours".
-            if self.pr.is_some() && self.pr.as_deref().and_then(|p| p.viewer()).is_none() {
-                return Err(
-                    "can't confirm your GitHub identity — check `gh auth login`".to_string()
-                );
-            }
             if !mine {
+                // Not mine by local author — ownership hinges on the GitHub login;
+                // if that is unknown (gh unreachable at load) say so rather than
+                // flatly "not yours".
+                if self.pr.is_some() && self.pr.as_deref().and_then(|p| p.viewer()).is_none() {
+                    return Err(
+                        "can't confirm your GitHub identity — check `gh auth login`".to_string()
+                    );
+                }
                 return Err("you can only delete your own published comment".to_string());
             }
             let Some(endpoint) = self.published_endpoint(&thread_id, &comment_id) else {
@@ -2115,11 +2116,16 @@ impl App {
     /// published comment's author is a GitHub login). Editing another author's
     /// comment would misattribute it, so it is never offered.
     fn comment_is_mine(&self, comment: &Comment) -> bool {
-        if comment.is_published() {
-            self.pr.as_deref().and_then(|p| p.viewer()) == Some(comment.author.as_str())
-        } else {
-            comment.author == self.author
+        // A comment is mine if I authored it locally (its author is my git
+        // `user.name`) or GitHub attributes it to my login. The local-author check
+        // is what makes a *just-submitted* comment editable: it publishes with my
+        // git name still as the author — only the next pull rewrites that to my
+        // login — so comparing against the login alone would disown my own comment
+        // whenever my git name and GitHub login differ.
+        if comment.author == self.author {
+            return true;
         }
+        self.pr.as_deref().and_then(|p| p.viewer()) == Some(comment.author.as_str())
     }
 
     /// Open the composer to edit the targeted comment, pre-filled with its body.
@@ -2139,15 +2145,18 @@ impl App {
         let thread_id = self.review.threads[ti].id.clone();
         let comment_id = comment.id.clone();
 
-        // A published comment's owner is the GitHub viewer login; on a PR where
-        // that is unknown (gh unreachable at load) say so rather than implying the
-        // comment isn't yours.
-        if published && self.pr.is_some() && self.pr.as_deref().and_then(|p| p.viewer()).is_none() {
-            self.status =
-                Some("can't confirm your GitHub identity — check `gh auth login`".to_string());
-            return;
-        }
         if !mine {
+            // For a published comment, ownership hinges on the GitHub login; if
+            // that is unknown (gh unreachable at load) say so rather than implying
+            // the comment isn't yours.
+            if published
+                && self.pr.is_some()
+                && self.pr.as_deref().and_then(|p| p.viewer()).is_none()
+            {
+                self.status =
+                    Some("can't confirm your GitHub identity — check `gh auth login`".to_string());
+                return;
+            }
             self.status = Some(
                 if published {
                     "you can only edit your own published comment"
@@ -3415,29 +3424,24 @@ impl App {
         None
     }
 
-    /// The thread whose inline comment header (or the blank pad above it) sits at
-    /// Files body `row`, for a fold-toggle click. An expanded block starts with a
-    /// padding line, so its header is block-line 1; a collapsed block is just its
-    /// header at line 0. A click on either the header or that top pad folds.
+    /// The thread whose inline comment header sits at Files body `row` (the first
+    /// line of its comment block), for a fold-toggle click.
     fn comment_header_at(&self, body_row: usize) -> Option<usize> {
         if body_row >= self.body_height.get() {
             return None;
         }
         let i = self.scroll + body_row;
-        let (t, k) = if self.sbs() {
+        if self.sbs() {
             match self.srows.get(i) {
-                Some(SRow::Comment(t, k)) => (*t, *k),
-                _ => return None,
+                Some(SRow::Comment(t, 0)) => Some(*t),
+                _ => None,
             }
         } else {
             match self.urows.get(i) {
-                Some(URow::Comment(t, k)) => (*t, *k),
-                _ => return None,
+                Some(URow::Comment(t, 0)) => Some(*t),
+                _ => None,
             }
-        };
-        let collapsed = self.collapsed.contains(&self.review.threads[t].id);
-        let header_k = if collapsed { 0 } else { 1 };
-        (k <= header_k).then_some(t)
+        }
     }
 
     fn conv_max_scroll(&self) -> usize {
@@ -6867,15 +6871,7 @@ fn build_comment_blocks(
                     Style::default().fg(Color::DarkGray),
                 ));
             }
-            // An expanded block gets a blank bar line above and below its content,
-            // so the comment reads as a roomy card rather than crowding the diff
-            // lines it sits between. A collapsed block stays a single header line.
-            let pad = || TextLine::from(vec![TextSpan::styled("  ▏ ", bar)]);
-            let mut lines = Vec::new();
-            if !is_collapsed {
-                lines.push(pad());
-            }
-            lines.push(TextLine::from(header));
+            let mut lines = vec![TextLine::from(header)];
             if !is_collapsed && let Some(root) = thread.root() {
                 for body in
                     crate::markdown::render(&root.body, Some(INLINE_COMMENT_WRAP), highlighter)
@@ -6884,7 +6880,6 @@ fn build_comment_blocks(
                     spans.extend(body.spans);
                     lines.push(TextLine::from(spans));
                 }
-                lines.push(pad());
             }
             lines
         })
@@ -8824,14 +8819,16 @@ mod tests {
         published.on_key(KeyCode::Char('e'), KeyModifiers::NONE);
         assert!(
             published.input.is_none(),
-            "a published comment can't be edited"
+            "a published comment with no addressable id can't be edited"
         );
+        // It is mine (I authored it), but its non-numeric remote id has no GitHub
+        // route — the refusal is about the id, not ownership.
         assert!(
             published
                 .status
                 .as_deref()
                 .unwrap_or("")
-                .contains("published")
+                .contains("editable id")
         );
     }
 
@@ -9647,6 +9644,34 @@ mod tests {
             matches!(endpoint, CommentEndpoint::IssueComment(777)),
             "a local conversation comment routes to the issue endpoint: {endpoint:?}"
         );
+    }
+
+    #[test]
+    fn my_own_just_submitted_comment_stays_editable_before_the_login_syncs() {
+        // The Pattern A fix: a comment I drafted keeps my git name as its author
+        // when it publishes, but my GitHub login differs — the login check alone
+        // used to disown my own comment until the next pull.
+        let mut app = sample_app(); // author (git name) "tester"
+        app.pr = Some(Arc::new(crate::prsync::PrHandle::for_test_with_viewer(
+            1, "t", "octocat", // login != git name
+        )));
+        app.pr_key = Some("owner/repo#1".into());
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "mine, just sent",
+            CommentKind::Draft,
+        );
+        app.review.threads[0].comments[0].remote_id = Some("500".into()); // just published
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        assert!(
+            app.delete_target().is_ok(),
+            "my just-published comment is still deletable: {:?}",
+            app.delete_target()
+        );
+        assert!(app.can_edit_target(), "and editable");
     }
 
     #[test]
@@ -10860,50 +10885,6 @@ mod tests {
             app.collapsed.contains(&id),
             "clicking the inline comment header folds the thread"
         );
-    }
-
-    #[test]
-    fn an_expanded_inline_comment_block_is_padded_top_and_bottom() {
-        let mut app = sample_app();
-        app.add_thread(
-            Anchor::line("a.rs", Side::New, 2),
-            "alice",
-            "looks wrong",
-            CommentKind::Local,
-        );
-        app.relayout();
-        let text = |line: &TextLine<'static>| {
-            line.spans
-                .iter()
-                .map(|s| s.content.clone())
-                .collect::<String>()
-        };
-        let block = &app.comment_blocks[0];
-        assert!(
-            block.len() >= 4,
-            "pad + header + body + pad: {}",
-            block.len()
-        );
-        // The first line is a blank bar (padding), the header (with the author)
-        // is the second, and the last line is padding again.
-        assert_eq!(text(&block[0]).trim(), "▏", "a top padding line");
-        assert!(text(&block[1]).contains("alice"), "the header follows it");
-        assert_eq!(
-            text(block.last().unwrap()).trim(),
-            "▏",
-            "a bottom padding line"
-        );
-        assert!(
-            block.iter().any(|l| text(l).contains("looks wrong")),
-            "the body is still there"
-        );
-
-        // A collapsed block stays a single header line — no padding.
-        let id = app.review.threads[0].id.clone();
-        app.toggle_collapse(id);
-        let block = &app.comment_blocks[0];
-        assert_eq!(block.len(), 1, "collapsed is just the header");
-        assert!(text(&block[0]).contains("alice"));
     }
 
     /// A one-file diff with five context lines `line1`..`line5` (new 1..5).
