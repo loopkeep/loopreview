@@ -3433,12 +3433,13 @@ impl App {
         let page = self.body_height.get().max(1);
         match action {
             // j/k step through comments (root, then replies) and cross into the
-            // next thread at a thread's ends; the wheel and page/end keys scroll
+            // next thread at a thread's ends; g/G jump the selection to the very
+            // first/last comment (the pane follows); the wheel and page keys scroll
             // the pane freely without moving the cursor.
             Action::MoveDown => self.move_conv_comment(1),
             Action::MoveUp => self.move_conv_comment(-1),
-            Action::Top => self.conv_scroll = 0,
-            Action::Bottom => self.conv_scroll = self.conv_max_scroll(),
+            Action::Top => self.conv_first(),
+            Action::Bottom => self.conv_last(),
             Action::HalfPageDown | Action::PageDown => {
                 self.conv_scroll = (self.conv_scroll + page / 2).min(self.conv_max_scroll())
             }
@@ -3578,6 +3579,33 @@ impl App {
                 self.conv_comment = self.selected_comment_count().saturating_sub(1);
             }
         }
+        self.follow_conv_comment();
+        self.reveal_in_sidebar(self.conv_cursor);
+    }
+
+    /// `g` in the Conversation body: select the very first comment (the first
+    /// thread's root) and scroll to it — the same cursor grammar as Files' `g`.
+    fn conv_first(&mut self) {
+        if self.conv_order.is_empty() {
+            return;
+        }
+        self.conv_cursor = 0;
+        self.conv_comment = 0;
+        self.follow_conv_comment();
+        self.reveal_in_sidebar(self.conv_cursor);
+    }
+
+    /// `G` in the Conversation body: select the very last comment — the last
+    /// thread's last reply, or its header when collapsed (a collapsed thread has a
+    /// single stop) — and scroll to it.
+    fn conv_last(&mut self) {
+        if self.conv_order.is_empty() {
+            return;
+        }
+        self.conv_cursor = self.conv_order.len() - 1;
+        // `selected_comment_count` reads the now-selected thread, so set the
+        // cursor first; it is 1 for a collapsed thread, so the stop is its header.
+        self.conv_comment = self.selected_comment_count().saturating_sub(1);
         self.follow_conv_comment();
         self.reveal_in_sidebar(self.conv_cursor);
     }
@@ -11489,6 +11517,65 @@ mod tests {
             !app.selected_collapsed(),
             "Enter on a reply does not fold the thread"
         );
+    }
+
+    #[test]
+    fn conversation_g_moves_to_the_first_and_last_comment() {
+        let mut app = app_with_threads(); // one thread has a root + two replies
+        app.body_height.set(4);
+        app.set_view(View::Conversation);
+        app.focus = Focus::Body;
+        app.conv_cursor = 0;
+        app.conv_comment = 1; // start mid-thread
+
+        // G selects the last comment of the last thread, and the pane follows.
+        app.conversation_action(Action::Bottom);
+        let last = app.conv_order.len() - 1;
+        assert_eq!(app.conv_cursor, last, "G lands on the last thread");
+        assert_eq!(
+            app.conv_comment,
+            app.selected_comment_count() - 1,
+            "and on its last comment"
+        );
+        let ti = app.conv_order[app.conv_cursor];
+        let within = app.conv_comment_starts[ti][app.conv_comment];
+        let target = app.conv_offsets()[app.conv_cursor] + within;
+        let h = app.body_height.get();
+        assert!(
+            (app.conv_scroll..app.conv_scroll + h).contains(&target),
+            "the selected comment is on screen after G"
+        );
+
+        // g jumps back to the very first comment; the pane follows up to it.
+        let scroll_at_bottom = app.conv_scroll;
+        app.conversation_action(Action::Top);
+        assert_eq!(app.conv_cursor, 0);
+        assert_eq!(app.conv_comment, 0);
+        let ti0 = app.conv_order[0];
+        let first = app.conv_offsets()[0] + app.conv_comment_starts[ti0][0];
+        assert_eq!(app.conv_scroll, first, "g scrolls up to the first comment");
+        assert!(
+            app.conv_scroll < scroll_at_bottom,
+            "g scrolled the pane back up"
+        );
+    }
+
+    #[test]
+    fn conversation_g_last_handles_a_collapsed_final_thread() {
+        let mut app = app_with_threads();
+        app.set_view(View::Conversation);
+        app.focus = Focus::Body;
+        let last = app.conv_order.len() - 1;
+        app.conv_cursor = last;
+        app.fold_selected(true); // collapse the final thread
+        assert!(app.selected_collapsed());
+        app.conv_cursor = 0;
+        app.conv_comment = 0;
+
+        // G still lands on the collapsed thread, on its single stop (the header).
+        app.conversation_action(Action::Bottom);
+        assert_eq!(app.conv_cursor, last);
+        assert_eq!(app.conv_comment, 0, "a collapsed thread has one stop");
     }
 
     #[test]

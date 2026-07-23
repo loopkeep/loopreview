@@ -89,7 +89,7 @@ from source or a package manager, update through that channel instead — after 
 ## Quickstart
 
 ```sh
-lr                    # review the working tree (staged + unstaged vs HEAD)
+lr                    # review the working tree (staged + unstaged + untracked vs HEAD)
 lr diff main...       # review this branch's changes off main
 lr diff --staged      # review only the staged changes
 lr show               # review the last commit's own changes (like git show)
@@ -159,7 +159,7 @@ action (an inapplicable one reports why), `Esc` to close.
 | `t` | Toggle the thread's root between a draft and a local note (pull requests) |
 | `o` | Fold: expand the current file if collapsed, else fold the thread at the cursor, else collapse the current file |
 | Wheel | Scroll the diff (or the sidebar, when the pointer is over it) |
-| Click | Focuses the pane you click; moves the cursor; a file header (in the diff) folds/unfolds it; a sidebar row jumps to that file (expanding it if collapsed) without folding; a tab switches views; the footer's layout indicator (`[unified]`/`[split]`) toggles the layout; the header's `#N` opens the pull request on github.com |
+| Click | In the diff: moves the cursor and focuses the diff; a file header folds/unfolds that file, and a comment thread's header folds/unfolds that thread. A sidebar row jumps to that file (expanding it if collapsed, focus following to the diff — never folding). A tab switches views; the footer's layout indicator (`[unified]`/`[split]`) toggles the layout; the header's `#N` opens the pull request on github.com |
 | Drag | Select a line range (then `c` to comment) |
 
 **Sidebar** (focused after `b`)
@@ -189,7 +189,7 @@ move; `Enter` opens the file; `Esc` closes.
 | Key | Action |
 | --- | --- |
 | `j` / `k` | Move between comments (root and replies), crossing into the next/previous thread at a thread's ends |
-| `g` / `G` | First / last thread |
+| `g` / `G` | First / last comment (the very first thread's root / the last thread's last reply; the pane follows) |
 | `Ctrl-D` / `Ctrl-U` (or `PageDown` / `PageUp`) | Scroll |
 | `l` (or `→`) | Go in: expand a folded thread, or scroll an open one to its top |
 | `h` (or `←`) | Go out to the thread index (pure movement, never folds — `b` also jumps there) |
@@ -261,7 +261,10 @@ identity). When the batch adds new inline comments you pick a review event
 (comment / approve / request changes) and an optional summary; a reply-only batch
 (replies and conversation comments, no new inline comments) skips that — it posts
 directly, with just a send confirmation. `Ctrl-R` re-pulls from
-GitHub while keeping your drafts. Resolving a published thread syncs to GitHub.
+GitHub while keeping your drafts; if a thread was deleted on GitHub, the local
+notes you had under it drop with it, and a status line reports `N local note(s)
+removed — their thread was deleted on GitHub`. Resolving a published thread syncs
+to GitHub.
 Multi-line comments round-trip as ranges (GitHub's `start_line` / `startLine`).
 (The pull-request features use the `gh` CLI, which must be installed and
 authenticated.)
@@ -280,10 +283,17 @@ reword it into an unrelated top-level comment; to say something new there, use `
 GitHub.
 
 You can also edit (`e`) or delete (`d`) your **own already-published** comment —
-matched against your GitHub login — and it syncs straight to GitHub: an edit via
-a PATCH, a delete via a DELETE (with a confirmation, since it is irreversible).
-Both run in the background and report failures. Someone else's comment is never
-editable or deletable, and an agent can only touch its own unpublished notes.
+yours by your `git config user.name` or your GitHub login (a comment you just
+submitted keeps your git name until the next pull, so both are checked) — and it
+syncs straight to GitHub: an edit via a PATCH, a delete via a DELETE (with a
+confirmation, since it is irreversible). Both run in the background and report
+failures. Deleting a published comment that would leave its thread with no
+published comment removes the whole thread — your own local and draft replies
+under it go too, so the confirmation warns `⚠ its N local repl(ies) will be
+removed too` before you commit. A submitted review's summary has no GitHub delete
+API, so `d` on one says `review summaries can't be deleted on GitHub` rather than
+pretending. Someone else's comment is never editable or deletable, and an agent
+can only touch its own unpublished notes.
 
 ## Agent integration
 
@@ -351,7 +361,8 @@ written like `j`, `V` (or `shift+v`), `ctrl+p`, `enter`, `esc`, `tab`, `space`,
 `pageup`. The arrow, page, and home/end keys always work and are not remappable;
 an invalid binding is reported at startup with the offending line. A few keys are
 reserved by the UI and cannot be reassigned to an action: `q` / `Esc` / `Ctrl-C`
-(quit), `Tab` (switch view), and `y` / `Enter` (confirm); the finder and comment
+(quit), `Tab` / `Shift+Tab` (cycle the views, forward / back — arriving as
+`BackTab` or `Tab`+Shift), and `y` / `Enter` (confirm); the finder and comment
 composer likewise keep their own keys while open. Action names:
 `cursor_down`, `cursor_up`, `half_page_down`, `half_page_up`, `top`, `bottom`,
 `next_file`, `prev_file`, `next_hunk`, `prev_hunk`, `nav_in`, `nav_out`,
