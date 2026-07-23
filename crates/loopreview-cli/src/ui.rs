@@ -291,6 +291,8 @@ pub fn run(session: Session) -> Result<()> {
     app.composer_enter = composer_enter;
     app.keymap = keymap;
     app.status = notice;
+    // A directly-loaded local review may carry an old resolved-draft state.
+    app.normalize_resolved_drafts();
     // For a directly-loaded diff (not a background PR load), apply auto-collapse
     // now; the PR path does it in install_loaded once the diff arrives.
     if loader.is_none() {
@@ -897,6 +899,7 @@ impl App {
     fn install_loaded(&mut self, loaded: Loaded) {
         self.label = loaded.label;
         self.review = loaded.review;
+        self.normalize_resolved_drafts();
         self.pr = loaded.pr.map(Arc::new);
         self.pr_key = loaded.pr_key;
         self.apply_layout(loaded.diff);
@@ -2358,22 +2361,47 @@ impl App {
     }
 
     /// Whether thread `idx` can be resolved. Local reviews resolve everything (a
-    /// local concept); on a pull request only review threads (line/file-anchored)
-    /// resolve — conversation comments (issue comments and review bodies, which
-    /// anchor at [`Anchor::Review`]) have no resolve affordance on GitHub.
+    /// local concept). On a pull request:
+    /// - conversation comments (issue comments and review bodies, anchored at
+    ///   [`Anchor::Review`]) have no resolve affordance on GitHub;
+    /// - a **draft** thread (root queued to submit, not yet published) can't be
+    ///   resolved either — resolving folds something still scheduled to send, so
+    ///   the only coherent moves are to demote it to a local note or delete it.
+    ///
+    /// Local notes and published threads on a pull request stay resolvable.
     fn is_resolvable(&self, idx: usize) -> bool {
-        self.pr.is_none()
-            || !matches!(
-                self.review.threads.get(idx).map(|t| &t.anchor),
-                Some(Anchor::Review)
-            )
+        let Some(thread) = self.review.threads.get(idx) else {
+            return false;
+        };
+        if self.pr.is_none() {
+            return true;
+        }
+        if matches!(thread.anchor, Anchor::Review) {
+            return false;
+        }
+        !thread
+            .root()
+            .is_some_and(|c| c.disposition() == CommentKind::Draft)
     }
 
     /// Toggle the resolved state of thread `idx`. A published thread in a PR
     /// syncs to GitHub in the background; a local thread just toggles and saves.
     fn resolve_thread(&mut self, idx: usize) {
         if !self.is_resolvable(idx) {
-            self.status = Some("conversation comments can't be resolved on GitHub".to_string());
+            let draft = self
+                .review
+                .threads
+                .get(idx)
+                .and_then(|t| t.root())
+                .is_some_and(|c| c.disposition() == CommentKind::Draft);
+            self.status = Some(
+                if draft {
+                    "a draft can't be resolved — demote it to local (t) or delete it (d)"
+                } else {
+                    "conversation comments can't be resolved on GitHub"
+                }
+                .to_string(),
+            );
             return;
         }
         let thread = &self.review.threads[idx];
@@ -2412,6 +2440,22 @@ impl App {
         self.emit(EventKind::Resolve, Some(id));
         self.status = self.persist(if resolved { "resolved" } else { "reopened" });
         self.relayout();
+    }
+
+    /// Reopen any thread that is both a draft and marked resolved — a
+    /// contradiction (resolving folds work still queued to submit) that the guards
+    /// now prevent, but an older store may carry. Run at load so no stale
+    /// resolved-draft state is ever carried into a session.
+    fn normalize_resolved_drafts(&mut self) {
+        for thread in &mut self.review.threads {
+            let contradiction = thread.is_resolved()
+                && thread
+                    .root()
+                    .is_some_and(|c| c.disposition() == CommentKind::Draft);
+            if contradiction {
+                thread.state = ThreadState::Open;
+            }
+        }
     }
 
     /// `o` in the Files view, context-dependent: fold the comment thread at the
@@ -3865,6 +3909,16 @@ impl App {
             self.review.threads[idx].root(),
             "resolving a published pull-request thread is a human action (press x in the TUI)",
         )?;
+        // A draft thread has no meaningful resolve — it is still queued to send.
+        if resolve.resolved
+            && self.review.threads[idx]
+                .root()
+                .is_some_and(|c| c.disposition() == CommentKind::Draft)
+        {
+            return Err(
+                "a draft thread can't be resolved — demote it to local or remove it".to_string(),
+            );
+        }
         let thread = &mut self.review.threads[idx];
         thread.state = if resolve.resolved {
             ThreadState::Resolved
@@ -8723,6 +8777,114 @@ mod tests {
     }
 
     #[test]
+    fn a_draft_thread_is_not_resolvable_on_a_pr() {
+        let mut app = pr_app();
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "queued",
+            CommentKind::Draft,
+        );
+        app.relayout();
+        assert!(!app.is_resolvable(0), "a draft thread can't be resolved");
+        // On the draft, the palette/footer drop Resolve.
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        assert!(
+            !app.action_available(Action::Resolve),
+            "x is not offered on a draft"
+        );
+        // The runtime guard refuses and points at the coherent moves.
+        app.resolve_thread(0);
+        assert!(!app.review.threads[0].is_resolved(), "the draft stays open");
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("draft can't be resolved"),
+            "with guidance: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn local_and_published_threads_stay_resolvable_on_a_pr() {
+        // A local note resolves — work-tracking semantics, never sent.
+        let mut local = pr_app();
+        local.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "agent",
+            "note",
+            CommentKind::Local,
+        );
+        assert!(local.is_resolvable(0), "a local note resolves on a pr");
+        // A published line thread resolves — it syncs to GitHub.
+        let mut published = pr_app();
+        published.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "posted",
+            CommentKind::Draft,
+        );
+        published.review.threads[0].comments[0].remote_id = Some("R1".into());
+        assert!(
+            published.is_resolvable(0),
+            "a published line thread resolves"
+        );
+    }
+
+    #[test]
+    fn loading_reopens_a_resolved_draft() {
+        let mut app = pr_app();
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "queued",
+            CommentKind::Draft,
+        );
+        // Stale state from before the guard: a draft marked resolved.
+        app.review.threads[0].state = ThreadState::Resolved;
+        app.normalize_resolved_drafts();
+        assert!(
+            !app.review.threads[0].is_resolved(),
+            "the resolved draft is reopened"
+        );
+        // A resolved local note is legitimate — left as is.
+        app.review.threads[0].comments[0].kind = CommentKind::Local;
+        app.review.threads[0].state = ThreadState::Resolved;
+        app.normalize_resolved_drafts();
+        assert!(
+            app.review.threads[0].is_resolved(),
+            "a resolved local note stays resolved"
+        );
+    }
+
+    #[test]
+    fn control_resolve_refuses_a_draft_thread() {
+        let mut app = sample_app();
+        app.review.threads.push(Thread {
+            id: "t1".into(),
+            anchor: Anchor::line("a.rs", Side::New, 2),
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: "c1".into(),
+                author: "agent".into(),
+                body: "b".into(),
+                created_at: 0,
+                remote_id: None,
+                kind: loopreview_core::CommentKind::Draft,
+            }],
+        });
+        let response = app.handle_control(Request::CommentResolve(protocol::CommentResolve {
+            thread: "t1".into(),
+            resolved: true,
+            author: "agent".into(),
+        }));
+        assert!(matches!(response, Response::Error(_)));
+        assert!(!app.review.threads[0].is_resolved(), "state unchanged");
+    }
+
+    #[test]
     fn control_navigate_reports_a_missing_target() {
         let mut app = sample_app();
         let response = app.handle_control(Request::Navigate(protocol::Navigate {
@@ -9444,6 +9606,10 @@ mod tests {
         app.review
             .threads
             .push(thread_with("line", Anchor::line("a.rs", Side::New, 1), 1));
+        // Local notes (not drafts), so resolvability turns purely on the anchor —
+        // a draft would be unresolvable regardless (covered separately).
+        app.review.threads[0].comments[0].kind = CommentKind::Local;
+        app.review.threads[1].comments[0].kind = CommentKind::Local;
         app.relayout();
         assert!(
             !app.is_resolvable(0),
