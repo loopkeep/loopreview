@@ -469,6 +469,12 @@ struct DeleteTarget {
     /// For a published comment, its GitHub endpoint — the removal goes to GitHub
     /// first. `None` for a purely-local removal.
     published: Option<CommentEndpoint>,
+    /// How many *other* comments in the thread this removal takes with it: when
+    /// the deletion leaves the thread with no published comment (a conversation
+    /// root with local replies is the case), the whole thread — and the local
+    /// notes hanging under it — goes. Surfaced in the confirmation so the reader
+    /// consents before their own notes are removed. `0` when the thread survives.
+    also_removed: usize,
 }
 
 /// The review events offered in the submit modal.
@@ -1099,13 +1105,22 @@ impl App {
             .position(|c| c.id == comment_id)
         {
             self.review.threads[ti].comments.remove(ci);
-            if self.review.threads[ti].comments.is_empty() {
-                self.review.threads.remove(ti);
-            }
+        }
+        // The thread lives on only while a published comment anchors it. Once the
+        // last published comment is gone, remove the whole thread — cascading the
+        // local/draft notes that hung under it (and their store entries), so no
+        // orphan reply is stranded under a root that no longer exists.
+        let anchored = self.review.threads[ti]
+            .comments
+            .iter()
+            .any(|c| c.is_published());
+        if !anchored {
+            self.review.threads.remove(ti);
+            self.store_remove(thread_id, None);
         }
         self.conv_cursor = self
             .conv_cursor
-            .min(self.conv_order.len().saturating_sub(1));
+            .min(self.review.threads.len().saturating_sub(1));
     }
 
     /// Re-pull the PR's threads (keeping local drafts).
@@ -1999,17 +2014,36 @@ impl App {
             if !endpoint.is_deletable() {
                 return Err("review summaries can't be deleted on GitHub".to_string());
             }
+            // If removing this leaves no published comment, the whole thread goes
+            // (its local notes with it) — count them so the confirmation can warn.
+            let leaves_published = self.review.threads[ti]
+                .comments
+                .iter()
+                .any(|c| c.id != comment_id && c.is_published());
+            let also_removed = if leaves_published {
+                0
+            } else {
+                self.review.threads[ti].comments.len() - 1
+            };
             Ok(DeleteTarget {
                 thread_id,
                 comment_id: Some(comment_id),
                 published: Some(endpoint),
+                also_removed,
             })
         } else {
+            // A draft root takes its whole thread (and any replies) with it; a
+            // reply removes just itself.
+            let also_removed = if ci == 0 {
+                self.review.threads[ti].comments.len() - 1
+            } else {
+                0
+            };
             Ok(DeleteTarget {
-                // A draft root takes its whole thread; a reply removes itself.
                 comment_id: (ci != 0).then_some(comment_id),
                 thread_id,
                 published: None,
+                also_removed,
             })
         }
     }
@@ -5177,19 +5211,7 @@ impl App {
         let Some(target) = &self.confirming_delete else {
             return;
         };
-        let area = centered_rect(60, 22, f.area());
-        f.render_widget(Clear, area);
         let published = target.published.is_some();
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(if published {
-                " Delete from GitHub? "
-            } else {
-                " Remove draft? "
-            })
-            .border_style(Style::default().fg(if published { Color::Red } else { Color::Yellow }));
-        let inner = block.inner(area);
-        f.render_widget(block, area);
         let thread = self.review.thread(&target.thread_id);
         let label = thread.map(|t| anchor_label(&t.anchor)).unwrap_or_default();
         let what = if published {
@@ -5201,6 +5223,16 @@ impl App {
         } else {
             format!("Withdraw your draft thread on {label}?")
         };
+        // Removing this empties the thread of published comments — the local notes
+        // under it go too. Warn on its own line (the message above is long and
+        // truncates), since those notes are the reviewer's own to lose.
+        let cascade = (target.also_removed > 0).then(|| {
+            let n = target.also_removed;
+            format!(
+                "⚠ its {n} local repl{} will be removed too",
+                if n == 1 { "y" } else { "ies" }
+            )
+        });
         // A one-line excerpt of the exact comment, so the delete can't misfire on
         // the wrong one. A whole-thread draft (`comment_id` is `None`) shows its
         // root; otherwise the named comment.
@@ -5211,19 +5243,50 @@ impl App {
             })
             .map(|c| one_line_excerpt(&c.body, 56))
             .unwrap_or_default();
-        let lines = vec![
+        let mut lines = vec![
             TextLine::from(TextSpan::styled(what, Style::default().fg(Color::White))),
             TextLine::from(""),
             TextLine::from(TextSpan::styled(
                 format!("“{excerpt}”"),
                 Style::default().fg(Color::Gray),
             )),
-            TextLine::from(""),
-            TextLine::from(TextSpan::styled(
-                "y / Enter confirm · any other key cancel",
-                Style::default().fg(Color::DarkGray),
-            )),
         ];
+        if let Some(cascade) = cascade {
+            lines.push(TextLine::from(""));
+            lines.push(TextLine::from(TextSpan::styled(
+                cascade,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+        lines.push(TextLine::from(""));
+        lines.push(TextLine::from(TextSpan::styled(
+            "y / Enter confirm · any other key cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        // Size the modal to its content so the cascade warning is never cut off.
+        let screen = f.area();
+        let width = (screen.width * 60 / 100).clamp(30, screen.width);
+        let height = (lines.len() as u16 + 2).min(screen.height); // + borders
+        let area = Rect {
+            x: (screen.width.saturating_sub(width)) / 2,
+            y: (screen.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        };
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(if published {
+                " Delete from GitHub? "
+            } else {
+                " Remove draft? "
+            })
+            .border_style(Style::default().fg(if published { Color::Red } else { Color::Yellow }));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
         f.render_widget(Paragraph::new(lines), inner);
     }
 
@@ -8986,6 +9049,7 @@ mod tests {
             thread_id: b_id.clone(),
             comment_id: None,
             published: None,
+            also_removed: 0,
         });
         // Interleave: thread A is removed, shifting B to index 0.
         app.review.threads.remove(0);
@@ -9742,6 +9806,105 @@ mod tests {
         assert!(
             app.delete_target().is_ok(),
             "a real published id is deletable"
+        );
+    }
+
+    /// A comment with an explicit author/kind/remote id, for delete-cascade tests.
+    fn comment_of(id: &str, author: &str, remote: Option<&str>, kind: CommentKind) -> Comment {
+        Comment {
+            id: id.into(),
+            author: author.into(),
+            body: format!("body {id}"),
+            created_at: 0,
+            remote_id: remote.map(Into::into),
+            kind,
+        }
+    }
+
+    #[test]
+    fn deleting_a_conversation_root_cascades_its_local_replies() {
+        let mut app = pr_app();
+        // A published conversation root with two local replies of my own.
+        app.review.threads.push(Thread {
+            id: "issuecomment:5".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![
+                comment_of("root", "tester", Some("5"), CommentKind::Draft),
+                comment_of("r1", "tester", None, CommentKind::Local),
+                comment_of("r2", "tester", None, CommentKind::Local),
+            ],
+        });
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        app.conv_comment = 0; // the root
+
+        // The confirmation counts the local replies that will cascade.
+        let target = app.delete_target().expect("the root is deletable");
+        assert_eq!(target.also_removed, 2, "both local replies are counted");
+
+        // The post-GitHub-delete application removes the whole thread — no orphan.
+        app.remove_comment_by_id("issuecomment:5", "root");
+        assert!(
+            app.review.threads.iter().all(|t| t.id != "issuecomment:5"),
+            "the whole thread is gone — no orphan reply left behind"
+        );
+    }
+
+    #[test]
+    fn the_delete_prompt_states_the_cascade() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = pr_app();
+        app.review.threads.push(Thread {
+            id: "issuecomment:5".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![
+                comment_of("root", "tester", Some("5"), CommentKind::Draft),
+                comment_of("r1", "tester", None, CommentKind::Local),
+            ],
+        });
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE); // arm the confirm
+        assert!(app.confirming_delete.is_some());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(
+            screen.contains("1 local reply will be removed too"),
+            "the prompt warns about the cascaded local reply:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn deleting_one_published_comment_keeps_a_thread_that_still_has_another() {
+        let mut app = pr_app();
+        // An inline thread with two published comments.
+        app.review.threads.push(Thread {
+            id: "t".into(),
+            anchor: Anchor::line("a.rs", Side::New, 2),
+            state: ThreadState::Open,
+            comments: vec![
+                comment_of("root", "tester", Some("500"), CommentKind::Draft),
+                comment_of("r2", "tester", Some("600"), CommentKind::Draft),
+            ],
+        });
+        app.relayout();
+        app.remove_comment_by_id("t", "root");
+        let thread = app
+            .review
+            .threads
+            .iter()
+            .find(|t| t.id == "t")
+            .expect("the thread survives");
+        assert_eq!(
+            thread.comments.len(),
+            1,
+            "the other published comment anchors it"
         );
     }
 
