@@ -1324,15 +1324,20 @@ impl App {
             let _ = store.replace_pr_drafts(key, &self.pr_drafts());
         }
         self.emit(EventKind::Submit, None);
-        self.status = Some(if submitted.failed_replies > 0 {
+        let plural = |n: usize| if n == 1 { "y" } else { "ies" };
+        self.status = Some(if submitted.deferred_replies > 0 {
+            // A reply couldn't attach because its root's id wasn't read back —
+            // never silent: point at the two-step recovery.
+            format!(
+                "review submitted — {} repl{} kept as draft (root id not synced yet); refresh and submit again",
+                submitted.deferred_replies,
+                plural(submitted.deferred_replies)
+            )
+        } else if submitted.failed_replies > 0 {
             format!(
                 "review submitted — {} repl{} failed, still draft",
                 submitted.failed_replies,
-                if submitted.failed_replies == 1 {
-                    "y"
-                } else {
-                    "ies"
-                }
+                plural(submitted.failed_replies)
             )
         } else {
             "review submitted".to_string()
@@ -8402,6 +8407,7 @@ mod tests {
             published: vec![(tid, "PRRC_1".into())],
             replies: Vec::new(),
             failed_replies: 0,
+            deferred_replies: 0,
         });
         assert_eq!(
             app.review.threads[0].root().unwrap().remote_id.as_deref(),
@@ -8441,6 +8447,7 @@ mod tests {
             published: vec![(tid, crate::prsync::PENDING_REMOTE_ID.into())],
             replies: Vec::new(),
             failed_replies: 0,
+            deferred_replies: 0,
         });
 
         let root = app.review.threads[0].root().unwrap();
@@ -8477,11 +8484,30 @@ mod tests {
             published: vec![(tid, "PRRC_1".into())],
             replies: Vec::new(),
             failed_replies: 1,
+            deferred_replies: 0,
         });
         assert!(
             app.status.as_deref().unwrap_or("").contains("failed"),
             "a partial failure is surfaced: {:?}",
             app.status
+        );
+    }
+
+    #[test]
+    fn a_deferred_reply_is_reported_with_a_recovery_hint() {
+        // A reply whose root's id wasn't read back stays draft — never silently:
+        // the status names the two-step refresh-and-resubmit recovery.
+        let mut app = pr_app();
+        app.apply_submitted(crate::prsync::Submitted {
+            published: Vec::new(),
+            replies: Vec::new(),
+            failed_replies: 0,
+            deferred_replies: 1,
+        });
+        let status = app.status.as_deref().unwrap_or("");
+        assert!(
+            status.contains("kept as draft") && status.contains("refresh and submit again"),
+            "the deferral is surfaced with a recovery hint: {status:?}"
         );
     }
 
@@ -8653,6 +8679,27 @@ mod tests {
             (s.new_inline, s.replies, s.conversation),
             (0, 1, 1),
             "one inline reply and one conversation root; the conversation reply is local"
+        );
+    }
+
+    #[test]
+    fn submit_summary_counts_a_draft_reply_under_a_draft_root() {
+        // A brand-new inline thread the reviewer drafted a root and a reply on:
+        // both go out in one submit (the root, then the reply via in_reply_to),
+        // so the modal must count both as sends.
+        let mut app = pr_app();
+        let (tid, _) = app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "root",
+            CommentKind::Draft,
+        );
+        app.add_reply(&tid, "tester", "reply", CommentKind::Draft);
+        let s = app.draft_summary();
+        assert_eq!(
+            (s.new_inline, s.replies),
+            (1, 1),
+            "the draft root and its draft reply both count"
         );
     }
 

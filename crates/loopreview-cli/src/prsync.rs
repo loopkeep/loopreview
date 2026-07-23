@@ -172,6 +172,20 @@ impl PrHandle {
                 root.remote_id = Some(remote_id.to_string());
             }
         }
+        // A draft reply whose root was submitted but not reconciled (its id not
+        // read back) has no id to attach to yet — it stays draft this round.
+        // Count these so the UI can prompt a refresh-then-resubmit, not go silent.
+        let unreconciled: std::collections::HashSet<&str> = outcome
+            .published
+            .iter()
+            .filter(|(_, id)| id.is_none())
+            .map(|(tid, _)| tid.as_str())
+            .collect();
+        let deferred_replies: usize = threads
+            .iter()
+            .filter(|t| unreconciled.contains(t.id.as_str()))
+            .map(|t| t.comments.iter().skip(1).filter(|c| c.is_draft()).count())
+            .sum();
         let (replies, failed_replies) = self
             .client
             .submit_replies(&self.pr, &threads)
@@ -205,6 +219,7 @@ impl PrHandle {
             published,
             replies: replies.into_iter().chain(conversation).map(stamp).collect(),
             failed_replies: failed_replies + failed_conversation,
+            deferred_replies,
         })
     }
 }
@@ -244,6 +259,10 @@ pub struct Submitted {
     pub replies: Vec<ReplyStamp>,
     /// How many draft replies failed to post (they stay draft, re-sendable).
     pub failed_replies: usize,
+    /// How many draft replies could not be posted this round because their root
+    /// was submitted but its id was not read back — they stay draft, and a
+    /// refresh-then-resubmit sends them once the root's real id is known.
+    pub deferred_replies: usize,
 }
 
 /// One published reply's id stamp.
