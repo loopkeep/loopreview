@@ -262,6 +262,16 @@ enum JobOutcome {
 /// A background action worker: reports progress, then yields an outcome.
 type JobWorker = Box<dyn FnOnce(&dyn Fn(&str)) -> Result<JobOutcome, String> + Send>;
 
+/// Flatten a scoped join used by the refresh legs: a panicking leg becomes an
+/// `Err` so a crashed refresh fails cleanly rather than tearing down the job.
+fn join_refresh<T>(
+    handle: std::thread::ScopedJoinHandle<'_, Result<T, String>>,
+) -> Result<T, String> {
+    handle
+        .join()
+        .unwrap_or_else(|_| Err("the refresh task panicked".to_string()))
+}
+
 /// How a URL is launched (a link/image click, `Ctrl-O`); injectable for tests.
 type UrlOpener = Box<dyn Fn(&str) -> std::io::Result<()>>;
 
@@ -1268,10 +1278,19 @@ impl App {
                 "Refreshing",
                 Box::new(move |progress| {
                     progress("fetching comments…");
-                    let threads = pr.pull()?;
-                    // Best-effort: a metadata re-fetch failure keeps the facts.
-                    let overview = pr.fetch_overview().ok().map(Box::new);
-                    Ok(JobOutcome::Refreshed { threads, overview })
+                    // The threads pull and the facts re-fetch are independent —
+                    // run them together. The pull's failure is the refresh's
+                    // failure; the facts stay best-effort (a metadata re-fetch
+                    // miss keeps the current facts).
+                    let (threads, overview) = std::thread::scope(|scope| {
+                        let threads = scope.spawn(|| pr.pull());
+                        let overview = scope.spawn(|| pr.fetch_overview().ok().map(Box::new));
+                        (join_refresh(threads), overview.join().unwrap_or(None))
+                    });
+                    Ok(JobOutcome::Refreshed {
+                        threads: threads?,
+                        overview,
+                    })
                 }),
             );
         } else if let Some(issue) = self.issue.clone() {
@@ -1279,9 +1298,15 @@ impl App {
                 "Refreshing",
                 Box::new(move |progress| {
                     progress("fetching comments…");
-                    let threads = issue.pull()?;
-                    let overview = issue.fetch_overview().ok().map(Box::new);
-                    Ok(JobOutcome::Refreshed { threads, overview })
+                    let (threads, overview) = std::thread::scope(|scope| {
+                        let threads = scope.spawn(|| issue.pull());
+                        let overview = scope.spawn(|| issue.fetch_overview().ok().map(Box::new));
+                        (join_refresh(threads), overview.join().unwrap_or(None))
+                    });
+                    Ok(JobOutcome::Refreshed {
+                        threads: threads?,
+                        overview,
+                    })
                 }),
             );
         }

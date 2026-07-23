@@ -46,6 +46,14 @@ pub enum Opened {
 /// Resolve a reference to its true type and fetch it — a pull request (diff +
 /// threads) or an issue (its flat conversation). The type is decided by the API
 /// ([`GithubClient::resolve_subject`]), never the reference's look.
+///
+/// Once the subject is resolved, the independent legs of the load run
+/// concurrently on scoped threads: for a PR the diff (a `git fetch`), the comment
+/// threads (`gh`), and the viewer login (`gh`) share no state and gate on nothing
+/// but the resolved PR, so they need not be serial. Error semantics are
+/// unchanged: every leg still runs to completion, and the failure surfaced is the
+/// one the old serial order would have shown first (the diff, then the threads);
+/// no partial [`Opened`] is built unless every leg succeeded.
 pub fn fetch_subject(
     dir: PathBuf,
     query: PrQuery,
@@ -56,11 +64,18 @@ pub fn fetch_subject(
     match client.resolve_subject(&query).map_err(|e| e.to_string())? {
         Subject::Pr(pr) => {
             let label = pr.label();
-            progress(&format!("fetching {label} diff…"));
-            let diff = client.pr_source(&pr).load().map_err(|e| e.to_string())?;
-            progress("fetching comments…");
-            let threads = client.pull(&pr).map_err(|e| e.to_string())?;
-            let viewer = client.viewer_login().ok();
+            // One aggregated progress line: the legs share no progress sink (the
+            // callback is not `Sync`, so it cannot be handed to several threads),
+            // and one settled message reads better than three racing ones.
+            progress(&format!("fetching {label} diff & comments…"));
+            let (diff, threads, viewer) = std::thread::scope(|scope| {
+                let diff = scope.spawn(|| client.pr_source(&pr).load().map_err(|e| e.to_string()));
+                let threads = scope.spawn(|| client.pull(&pr).map_err(|e| e.to_string()));
+                let viewer = scope.spawn(|| client.viewer_login().ok());
+                (joined(diff), joined(threads), viewer.join().unwrap_or(None))
+            });
+            let diff = diff?;
+            let threads = threads?;
             Ok(Opened::Pr {
                 handle: PrHandle { client, pr, viewer },
                 label,
@@ -71,8 +86,12 @@ pub fn fetch_subject(
         Subject::Issue(issue) => {
             let label = issue.label();
             progress(&format!("fetching {label} comments…"));
-            let threads = client.pull_issue(&issue).map_err(|e| e.to_string())?;
-            let viewer = client.viewer_login().ok();
+            let (threads, viewer) = std::thread::scope(|scope| {
+                let threads = scope.spawn(|| client.pull_issue(&issue).map_err(|e| e.to_string()));
+                let viewer = scope.spawn(|| client.viewer_login().ok());
+                (joined(threads), viewer.join().unwrap_or(None))
+            });
+            let threads = threads?;
             Ok(Opened::Issue {
                 handle: IssueHandle {
                     client,
@@ -84,6 +103,14 @@ pub fn fetch_subject(
             })
         }
     }
+}
+
+/// Flatten a scoped join: a panicking leg becomes an `Err` so a crashed load
+/// task fails the load cleanly rather than tearing down the loader thread.
+fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, Result<T, String>>) -> Result<T, String> {
+    handle
+        .join()
+        .unwrap_or_else(|_| Err("a background load task panicked".to_string()))
 }
 
 /// A subject's lifecycle status — a pull request's or an issue's — for the badge.

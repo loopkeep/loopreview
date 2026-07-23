@@ -11,3 +11,9 @@ loopreview-core = { path = "../loopreview-core" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.19"
+
+[dev-dependencies]
+# Integration tests drive `PrSource` against a local bare "remote" and inspect
+# the resulting core `Diff` — the core types are not otherwise in scope for the
+# separately-compiled test crate.
+loopreview-core = { path = "../loopreview-core" }
