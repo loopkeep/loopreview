@@ -139,7 +139,7 @@ inapplicable one reports why), `Esc` to close.
 | `x` | Resolve / reopen that thread |
 | `e` | Edit your own comment (the thread's root; opens the composer pre-filled — a published edit syncs to GitHub) |
 | `d` | Remove your own comment at the cursor (a draft locally; your own published comment is deleted from GitHub, with confirmation) |
-| `t` | Toggle that thread between a draft and a local note (pull requests) |
+| `t` | Toggle the thread's root between a draft and a local note (pull requests) |
 | `o` | Fold: expand the current file if collapsed, else fold the thread at the cursor, else collapse the current file |
 | Wheel | Scroll the diff (or the sidebar, when the pointer is over it) |
 | Click | Move the cursor; a file header folds/unfolds it; a sidebar row toggles that file (opens it, or collapses an open one); a tab switches views; the footer's layout indicator (`[unified]`/`[split]`) toggles the layout |
@@ -177,7 +177,7 @@ move; `Enter` opens the file; `Esc` closes.
 | `x` | Resolve / reopen |
 | `e` | Edit your own comment at the cursor (root or reply; a published edit syncs to GitHub) |
 | `d` | Remove your own comment at the cursor (a draft reply removes itself, a draft root its thread; your own published comment is deleted from GitHub, with confirmation) |
-| `t` | Toggle the selected thread between a draft and a local note (pull requests) |
+| `t` | Toggle the comment at the cursor between a draft and a local note — a reply needs its root to be a draft first (pull requests) |
 | `o` | Collapse / expand |
 | `X` | Close the review (asks to confirm) |
 
@@ -221,9 +221,12 @@ authenticated.)
 
 A comment also has a **kind**. Yours default to drafts; an agent's default to
 **local notes** (a `[local]` badge) — attached to the review but never sent. `t`
-toggles the selected thread between the two, so you can adopt an agent's note as
-a draft to send, or drop one of your drafts to a local note. Only drafts are ever
-submitted; local notes stay off GitHub.
+toggles the comment at the cursor between the two (in Files it toggles the
+thread's root), so you can adopt an agent's note as a draft to send, or drop one
+of your drafts to a local note. The kinds stay coherent: a reply can only become
+a draft under a draft or published root (otherwise `t` says to promote the root
+first), and demoting a root to a local note takes its draft replies down with it.
+Only drafts are ever submitted; local notes stay off GitHub.
 
 You can also edit (`e`) or delete (`d`) your **own already-published** comment —
 matched against your GitHub login — and it syncs straight to GitHub: an edit via

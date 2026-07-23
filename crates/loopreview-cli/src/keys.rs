@@ -137,7 +137,7 @@ impl Action {
             Action::CloseReview => "Close (delete) the review",
             Action::Delete => "Withdraw a draft/local comment, or delete your published one",
             Action::Edit => "Edit your own comment",
-            Action::ToggleKind => "Toggle a comment between draft and local note",
+            Action::ToggleKind => "Toggle the cursor's comment between draft and local note",
             Action::ToggleSidebar => "Toggle the file sidebar",
             Action::FileFinder => "Open the fuzzy file finder",
             Action::Refresh => "Refresh from GitHub",
