@@ -1,10 +1,12 @@
 //! A small markdown renderer for comment bodies.
 //!
-//! Parses with `pulldown-cmark` and paints to ratatui lines: headings, emphasis,
-//! inline and fenced code (syntax-highlighted via [`Highlighter`]), lists, block
-//! quotes, GitHub alerts (`> [!NOTE]` …), task lists, and GFM tables. Paragraphs
-//! word-wrap to a width when one is given (the Conversation and Overview panes),
-//! or render unwrapped for tight inline display.
+//! Parses with `pulldown-cmark` and paints to ratatui lines: headings (a visual
+//! hierarchy, no raw `#`), emphasis, inline and fenced code (syntax-highlighted
+//! via [`Highlighter`]), lists, block quotes, GitHub alerts (`> [!NOTE]` …), task
+//! lists, GFM tables, thematic breaks, and footnotes. In wrap mode (the
+//! Conversation and Overview panes) paragraphs word-wrap and top-level blocks are
+//! separated by a blank line, matching how GitHub renders the same text; in
+//! no-wrap mode (tight inline display) each block stays on one clipped line.
 
 use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
@@ -17,8 +19,25 @@ use crate::palette;
 
 use crate::highlight::Highlighter;
 
+/// The sentinel span marking a forced in-paragraph line break (a soft/hard break
+/// or a `<br>`). A lone newline never appears inside a normal inline span, so it
+/// is safe to recognize by content.
+const BREAK: &str = "\n";
+
+fn break_span() -> TextSpan<'static> {
+    TextSpan::raw(BREAK)
+}
+
+fn is_break(span: &TextSpan<'_>) -> bool {
+    span.content.as_ref() == BREAK
+}
+
+/// A wrap unit: a run of non-space text that may cross several styles. Kept
+/// together with no fabricated space at a style boundary.
+type Word = Vec<(String, Style)>;
+
 /// Render markdown `text` to styled lines. `wrap` is the wrap width, or `None`
-/// to keep each paragraph on one (clipped) line.
+/// to keep each block on one (clipped) line.
 pub fn render(
     text: &str,
     wrap: Option<usize>,
@@ -36,13 +55,16 @@ pub fn render(
         code: None,
         link: None,
         table: None,
+        started: false,
+        fresh: false,
     };
     // GFM adds alert blockquotes (`> [!NOTE]`); tables and task lists are the
-    // other two GFM constructs a PR body leans on.
+    // other GFM constructs a PR body leans on. Footnotes appear in issue bodies.
     let options = Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_GFM
         | Options::ENABLE_TABLES
-        | Options::ENABLE_TASKLISTS;
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
     for event in Parser::new_ext(text, options) {
         renderer.event(event);
     }
@@ -82,6 +104,11 @@ struct Renderer<'a> {
     link: Option<String>,
     /// A table being built, while inside one.
     table: Option<TableBuild>,
+    /// Whether any block has been emitted yet (so the first gets no leading gap).
+    started: bool,
+    /// Whether the next block is the first inside a freshly-entered list or
+    /// blockquote (so it gets no separator against the container's opening).
+    fresh: bool,
 }
 
 impl Renderer<'_> {
@@ -106,8 +133,26 @@ impl Renderer<'_> {
             // A `- [ ]` / `- [x]` marker: remembered so the item's bullet becomes
             // a checkbox (rather than adding a second glyph beside the bullet).
             Event::TaskListMarker(checked) => self.task = Some(checked),
-            Event::SoftBreak | Event::HardBreak => {
-                self.spans.push(TextSpan::styled(" ", self.style));
+            // GitHub renders a single newline in a comment/issue body as a line
+            // break, so both soft and hard breaks become real breaks here — the
+            // same text must not read differently on github.com and in lr.
+            Event::SoftBreak | Event::HardBreak => self.spans.push(break_span()),
+            // Inline/raw HTML: only `<br>` is meaningful for us (a line break).
+            // Any other tag is dropped — its inner text still arrives as separate
+            // Text events, so content is kept, markup stripped.
+            Event::Html(html) | Event::InlineHtml(html) => {
+                if is_br(&html) {
+                    self.spans.push(break_span());
+                }
+            }
+            Event::Rule => self.rule(),
+            // A footnote reference renders as a compact `[label]` marker; the
+            // definition is emitted as its own block (see FootnoteDefinition).
+            Event::FootnoteReference(label) => {
+                self.spans.push(TextSpan::styled(
+                    format!("[{label}]"),
+                    self.style.fg(palette::LINK_FG),
+                ));
             }
             _ => {}
         }
@@ -115,19 +160,32 @@ impl Renderer<'_> {
 
     fn start(&mut self, tag: Tag) {
         match tag {
+            Tag::Paragraph => self.open_block(),
+            Tag::Heading { .. } => self.open_block(),
             Tag::Emphasis => self.style = self.style.add_modifier(Modifier::ITALIC),
             Tag::Strong => self.style = self.style.add_modifier(Modifier::BOLD),
             Tag::Strikethrough => self.style = self.style.add_modifier(Modifier::CROSSED_OUT),
             Tag::Link { dest_url, .. } => self.link = Some(dest_url.into_string()),
-            Tag::List(start) => self.list.push(List { next: start }),
+            Tag::List(start) => {
+                // Flush an enclosing item's pending inline text before its nested
+                // list, so the two don't run together on one line.
+                self.flush_block();
+                self.open_block();
+                self.list.push(List { next: start });
+                self.fresh = true;
+            }
             Tag::BlockQuote(kind) => {
+                self.flush_block();
+                self.open_block();
                 self.quotes.push(kind);
                 if let Some(kind) = kind {
                     self.alert_header(kind);
                 }
+                self.fresh = true;
             }
             Tag::CodeBlock(kind) => {
                 self.flush_block();
+                self.open_block();
                 let lang = match kind {
                     CodeBlockKind::Fenced(info) => info
                         .into_string()
@@ -141,6 +199,7 @@ impl Renderer<'_> {
             }
             Tag::Table(aligns) => {
                 self.flush_block();
+                self.open_block();
                 self.table = Some(TableBuild {
                     aligns,
                     head: Vec::new(),
@@ -161,6 +220,17 @@ impl Renderer<'_> {
                 }
             }
             Tag::TableCell => self.spans.clear(),
+            // A footnote definition renders as a block led by its `[label]`.
+            Tag::FootnoteDefinition(label) => {
+                self.open_block();
+                self.spans.push(TextSpan::styled(
+                    format!("[{label}] "),
+                    Style::default()
+                        .fg(palette::LINK_FG)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                self.fresh = true;
+            }
             _ => {}
         }
     }
@@ -180,14 +250,15 @@ impl Renderer<'_> {
             }
             TagEnd::Paragraph => self.flush_block(),
             TagEnd::Heading(level) => {
-                // Prefix with `#`s and render bold cyan.
-                let hashes = "#".repeat(heading_depth(level));
-                self.spans.insert(
-                    0,
-                    TextSpan::styled(format!("{hashes} "), Style::default().fg(Color::DarkGray)),
-                );
+                // No raw `#`: a visual hierarchy by level, like GitHub.
+                let (color, bold) = heading_style(level);
                 for span in &mut self.spans {
-                    span.style = span.style.fg(Color::Cyan).add_modifier(Modifier::BOLD);
+                    if bold {
+                        span.style = span.style.add_modifier(Modifier::BOLD);
+                    }
+                    if let Some(color) = color {
+                        span.style = span.style.fg(color);
+                    }
                 }
                 self.flush_block();
             }
@@ -199,6 +270,7 @@ impl Renderer<'_> {
             }
             TagEnd::Item => self.flush_block(),
             TagEnd::CodeBlock => self.flush_code(),
+            TagEnd::FootnoteDefinition => self.flush_block(),
             TagEnd::TableCell => {
                 let cell = std::mem::take(&mut self.spans);
                 if let Some(t) = &mut self.table {
@@ -224,6 +296,53 @@ impl Renderer<'_> {
         }
     }
 
+    /// Place the inter-block separator before the next block, when wrapping. Top
+    /// level gets a blank line; inside a blockquote a bar-prefixed blank; a list's
+    /// items stay tight. No leading gap (nothing emitted yet), and none against a
+    /// container's own opening (the `fresh` guard).
+    fn open_block(&mut self) {
+        if self.wrap.is_none() || !self.started {
+            return;
+        }
+        if self.fresh {
+            self.fresh = false;
+            return;
+        }
+        if !self.list.is_empty() {
+            return; // list items/blocks stay tight
+        }
+        if self.quotes.is_empty() {
+            self.out.push(TextLine::from(""));
+        } else {
+            let color = self.alert_color().unwrap_or(Color::DarkGray);
+            let bar = "▏ ".repeat(self.quotes.len());
+            self.out.push(TextLine::from(TextSpan::styled(
+                bar,
+                Style::default().fg(color),
+            )));
+        }
+    }
+
+    /// Emit a thematic break (`---`) as a dim rule: pane-wide when wrapping, a
+    /// short fixed dash run in tight mode; inside a quote it sits after the bars.
+    fn rule(&mut self) {
+        self.flush_block();
+        self.open_block();
+        let prefix = "▏ ".repeat(self.quotes.len());
+        let color = self.alert_color().unwrap_or(Color::DarkGray);
+        let rule = match self.wrap {
+            Some(w) => "─".repeat(w.saturating_sub(prefix_width(&prefix)).max(3)),
+            None => "───".to_string(),
+        };
+        let mut spans = Vec::new();
+        if !prefix.is_empty() {
+            spans.push(TextSpan::styled(prefix, Style::default().fg(color)));
+        }
+        spans.push(TextSpan::styled(rule, Style::default().fg(Color::DarkGray)));
+        self.out.push(TextLine::from(spans));
+        self.mark_emitted();
+    }
+
     /// Emit a GitHub alert's coloured header line (`⚠ Warning`, …) at the top of
     /// its blockquote, with the quote bars in the same colour.
     fn alert_header(&mut self, kind: BlockQuoteKind) {
@@ -237,6 +356,14 @@ impl Renderer<'_> {
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
         ]));
+        self.mark_emitted();
+    }
+
+    /// Record that a block was emitted: the next block gets a separator, and the
+    /// fresh-context grace is spent.
+    fn mark_emitted(&mut self) {
+        self.started = true;
+        self.fresh = false;
     }
 
     /// The colour of the nearest enclosing alert, for tinting its quote bar.
@@ -290,6 +417,7 @@ impl Renderer<'_> {
         let spans = std::mem::take(&mut self.spans);
         let lines = wrap_spans(&spans, self.wrap, &first, &cont, color);
         self.out.extend(lines);
+        self.mark_emitted();
     }
 
     /// Emit the collected fenced code block, syntax-highlighted.
@@ -311,6 +439,7 @@ impl Renderer<'_> {
             }
             self.out.push(TextLine::from(spans));
         }
+        self.mark_emitted();
     }
 
     /// Lay out the collected table and emit its lines.
@@ -322,6 +451,7 @@ impl Renderer<'_> {
         let color = self.alert_color();
         let lines = render_table(&table, self.wrap, &prefix, color);
         self.out.extend(lines);
+        self.mark_emitted();
     }
 
     fn finish(mut self) -> Vec<TextLine<'static>> {
@@ -333,14 +463,20 @@ impl Renderer<'_> {
     }
 }
 
-fn heading_depth(level: HeadingLevel) -> usize {
+/// Whether a raw inline-HTML fragment is a `<br>` (in any of its spellings).
+fn is_br(html: &str) -> bool {
+    let t = html.trim().trim_start_matches("</").trim_start_matches('<');
+    let t = t.trim_end_matches('>').trim_end_matches('/').trim();
+    t.eq_ignore_ascii_case("br")
+}
+
+/// A heading's `(colour, bold)` by level: H1/H2 accent (cyan), H3/H4 plain bold,
+/// H5/H6 dim — a visual hierarchy with no leading `#`, as GitHub renders.
+fn heading_style(level: HeadingLevel) -> (Option<Color>, bool) {
     match level {
-        HeadingLevel::H1 => 1,
-        HeadingLevel::H2 => 2,
-        HeadingLevel::H3 => 3,
-        HeadingLevel::H4 => 4,
-        HeadingLevel::H5 => 5,
-        HeadingLevel::H6 => 6,
+        HeadingLevel::H1 | HeadingLevel::H2 => (Some(Color::Cyan), true),
+        HeadingLevel::H3 | HeadingLevel::H4 => (None, true),
+        HeadingLevel::H5 | HeadingLevel::H6 => (Some(Color::DarkGray), true),
     }
 }
 
@@ -357,7 +493,8 @@ fn alert_style(kind: BlockQuoteKind) -> (&'static str, &'static str, Color) {
 
 /// Word-wrap styled spans to `wrap` display columns (when set), prefixing the
 /// first line with `first` and the rest with `cont`. `prefix_color` tints the
-/// prefix (an alert's bar colour, else the default dim).
+/// prefix (an alert's bar colour, else the default dim). A break sentinel forces
+/// a new line; in no-wrap mode it collapses to a space (tight display).
 fn wrap_spans(
     spans: &[TextSpan<'static>],
     wrap: Option<usize>,
@@ -368,55 +505,26 @@ fn wrap_spans(
     let prefix_style = Style::default().fg(prefix_color.unwrap_or(Color::DarkGray));
 
     let Some(width) = wrap else {
-        // No wrapping: one line, prefixed.
+        // No wrapping: one line, prefixed; breaks become spaces.
         let mut line = vec![TextSpan::styled(first.to_string(), prefix_style)];
-        line.extend(spans.iter().cloned());
+        for span in spans {
+            if is_break(span) {
+                line.push(TextSpan::styled(" ", span.style));
+            } else {
+                line.push(span.clone());
+            }
+        }
         return vec![TextLine::from(line)];
     };
 
-    // Split spans into words, keeping each word's style.
-    let mut words: Vec<(String, Style)> = Vec::new();
-    for span in spans {
-        for word in span.content.split(' ') {
-            if !word.is_empty() {
-                words.push((word.to_string(), span.style));
-            }
-        }
-    }
-
-    let mut lines = Vec::new();
-    let mut current: Vec<TextSpan<'static>> = Vec::new();
-    let mut used = 0usize;
-    let mut on_first = true;
-    for (word, style) in words {
-        let budget = width.saturating_sub(prefix_width(if on_first { first } else { cont }));
-        let word_w = UnicodeWidthStr::width(word.as_str());
-        let sep = usize::from(!current.is_empty());
-        if !current.is_empty() && used + sep + word_w > budget {
-            lines.push(build_line(
-                if on_first { first } else { cont },
-                prefix_style,
-                current,
-            ));
-            current = Vec::new();
-            used = 0;
-            on_first = false;
-        }
-        if !current.is_empty() {
-            current.push(TextSpan::styled(" ", style));
-            used += 1;
-        }
-        current.push(TextSpan::styled(word, style));
-        used += word_w;
-    }
-    if !current.is_empty() || lines.is_empty() {
-        lines.push(build_line(
-            if on_first { first } else { cont },
-            prefix_style,
-            current,
-        ));
-    }
-    lines
+    // `first` and `cont` are built to the same display width, so one budget fits
+    // every line; the first line carries `first`, the rest `cont`.
+    let budget = width.saturating_sub(prefix_width(first)).max(1);
+    let rows = wrap_runs(spans, budget);
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, row)| build_line(if i == 0 { first } else { cont }, prefix_style, row))
+        .collect()
 }
 
 fn prefix_width(prefix: &str) -> usize {
@@ -433,9 +541,161 @@ fn build_line(
     TextLine::from(line)
 }
 
+/// Break `spans` into visual lines fitting `width` columns. A break sentinel
+/// starts a new line; words split only at real spaces; a run of non-space text
+/// that crosses style spans stays one unit (no fabricated space at a style
+/// boundary); an over-wide unit hard-breaks. Returns lines of spans (no prefix).
+fn wrap_runs(spans: &[TextSpan<'static>], width: usize) -> Vec<Vec<TextSpan<'static>>> {
+    let width = width.max(1);
+    let mut lines: Vec<Vec<TextSpan<'static>>> = Vec::new();
+    for segment in split_breaks(spans) {
+        let words = to_words(&segment);
+        wrap_words_into(&words, width, &mut lines);
+    }
+    if lines.is_empty() {
+        lines.push(Vec::new());
+    }
+    lines
+}
+
+/// Split a span list at break sentinels, dropping the sentinels; each returned
+/// segment renders on its own line (or wraps within its own lines).
+fn split_breaks(spans: &[TextSpan<'static>]) -> Vec<Vec<TextSpan<'static>>> {
+    let mut segments: Vec<Vec<TextSpan<'static>>> = vec![Vec::new()];
+    for span in spans {
+        if is_break(span) {
+            segments.push(Vec::new());
+        } else {
+            segments.last_mut().unwrap().push(span.clone());
+        }
+    }
+    segments
+}
+
+/// Group a break-free span list into words: maximal runs of non-space text,
+/// split only where a real space occurs. A word keeps its (possibly several)
+/// style runs, so adjacent styles never get a fabricated space between them.
+fn to_words(spans: &[TextSpan<'static>]) -> Vec<Word> {
+    let mut words: Vec<Word> = Vec::new();
+    let mut cur: Word = Vec::new();
+    let mut run = String::new();
+    let mut run_style = Style::default();
+    let flush_run = |run: &mut String, run_style: Style, cur: &mut Word| {
+        if !run.is_empty() {
+            cur.push((std::mem::take(run), run_style));
+        }
+    };
+    for span in spans {
+        let style = span.style;
+        for ch in span.content.chars() {
+            if ch == ' ' || ch == '\t' {
+                flush_run(&mut run, run_style, &mut cur);
+                if !cur.is_empty() {
+                    words.push(std::mem::take(&mut cur));
+                }
+            } else {
+                if !run.is_empty() && style != run_style {
+                    flush_run(&mut run, run_style, &mut cur);
+                }
+                if run.is_empty() {
+                    run_style = style;
+                }
+                run.push(ch);
+            }
+        }
+        // A span boundary is not a word boundary — flush the run so the next
+        // span's style starts cleanly, but keep the word open (no space).
+        flush_run(&mut run, run_style, &mut cur);
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+}
+
+fn word_width(word: &Word) -> usize {
+    word.iter()
+        .map(|(t, _)| UnicodeWidthStr::width(t.as_str()))
+        .sum()
+}
+
+fn push_word(line: &mut Vec<TextSpan<'static>>, word: &Word) {
+    for (text, style) in word {
+        line.push(TextSpan::styled(text.clone(), *style));
+    }
+}
+
+/// Greedy word-wrap into `lines`, hard-breaking any word wider than `width`.
+fn wrap_words_into(words: &[Word], width: usize, lines: &mut Vec<Vec<TextSpan<'static>>>) {
+    let mut cur: Vec<TextSpan<'static>> = Vec::new();
+    let mut used = 0usize;
+    for word in words {
+        let ww = word_width(word);
+        if ww > width {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            let mut rest = word.clone();
+            while word_width(&rest) > width {
+                let (head, tail) = split_word_at_width(&rest, width);
+                let mut line = Vec::new();
+                push_word(&mut line, &head);
+                lines.push(line);
+                rest = tail;
+            }
+            push_word(&mut cur, &rest);
+            used = word_width(&rest);
+            continue;
+        }
+        let sep = usize::from(!cur.is_empty());
+        if !cur.is_empty() && used + sep + ww > width {
+            lines.push(std::mem::take(&mut cur));
+            used = 0;
+        }
+        if !cur.is_empty() {
+            cur.push(TextSpan::raw(" "));
+            used += 1;
+        }
+        push_word(&mut cur, word);
+        used += ww;
+    }
+    lines.push(cur);
+}
+
+/// Split a word at `width` display columns, preserving style runs; the split
+/// point falls inside whichever run crosses the boundary.
+fn split_word_at_width(word: &Word, width: usize) -> (Word, Word) {
+    let mut head: Word = Vec::new();
+    let mut tail: Word = Vec::new();
+    let mut used = 0usize;
+    let mut cutting = false;
+    for (text, style) in word {
+        if cutting {
+            tail.push((text.clone(), *style));
+            continue;
+        }
+        let tw = UnicodeWidthStr::width(text.as_str());
+        if used + tw <= width {
+            head.push((text.clone(), *style));
+            used += tw;
+        } else {
+            let (h, t) = split_at_width(text, (width - used).max(1));
+            if !h.is_empty() {
+                head.push((h, *style));
+            }
+            if !t.is_empty() {
+                tail.push((t, *style));
+            }
+            cutting = true;
+        }
+    }
+    (head, tail)
+}
+
 fn span_width(spans: &[TextSpan<'static>]) -> usize {
     spans
         .iter()
+        .filter(|s| !is_break(s))
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum()
 }
@@ -563,6 +823,10 @@ fn table_flat_row(
         }
         if let Some(cell) = row.get(i) {
             for s in cell {
+                if is_break(s) {
+                    spans.push(TextSpan::raw(" "));
+                    continue;
+                }
                 let style = if bold {
                     s.style.add_modifier(Modifier::BOLD)
                 } else {
@@ -623,62 +887,20 @@ fn table_row(
 }
 
 /// Word-wrap one cell's styled spans to `width` columns, hard-breaking a word
-/// that is itself too wide. Header cells render bold.
+/// that is itself too wide. Header cells render bold. Break sentinels split lines.
 fn wrap_cell(spans: &[TextSpan<'static>], width: usize, bold: bool) -> Vec<Vec<TextSpan<'static>>> {
     let width = width.max(1);
-    let mut words: Vec<(String, Style)> = Vec::new();
-    for s in spans {
-        let style = if bold {
-            s.style.add_modifier(Modifier::BOLD)
-        } else {
-            s.style
-        };
-        for w in s.content.split(' ') {
-            if !w.is_empty() {
-                words.push((w.to_string(), style));
+    let styled: Vec<TextSpan<'static>> = spans
+        .iter()
+        .map(|s| {
+            if is_break(s) || !bold {
+                s.clone()
+            } else {
+                TextSpan::styled(s.content.to_string(), s.style.add_modifier(Modifier::BOLD))
             }
-        }
-    }
-    let mut lines: Vec<Vec<TextSpan<'static>>> = Vec::new();
-    let mut cur: Vec<TextSpan<'static>> = Vec::new();
-    let mut used = 0usize;
-    for (word, style) in words {
-        let mut word = word;
-        loop {
-            let ww = UnicodeWidthStr::width(word.as_str());
-            let sep = usize::from(!cur.is_empty());
-            if used + sep + ww <= width {
-                if sep == 1 {
-                    cur.push(TextSpan::styled(" ", style));
-                    used += 1;
-                }
-                cur.push(TextSpan::styled(word, style));
-                used += ww;
-                break;
-            }
-            if !cur.is_empty() {
-                lines.push(std::mem::take(&mut cur));
-                used = 0;
-                continue; // retry the word on a fresh line
-            }
-            // The word alone exceeds the column: hard-break it.
-            let (head, tail) = split_at_width(&word, width);
-            cur.push(TextSpan::styled(head, style));
-            lines.push(std::mem::take(&mut cur));
-            used = 0;
-            word = tail;
-            if word.is_empty() {
-                break;
-            }
-        }
-    }
-    if !cur.is_empty() {
-        lines.push(cur);
-    }
-    if lines.is_empty() {
-        lines.push(Vec::new());
-    }
-    lines
+        })
+        .collect();
+    wrap_runs(&styled, width)
 }
 
 /// Split `s` at `width` display columns, always taking at least one char (so a
@@ -706,6 +928,11 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// All rendered lines as their plain text.
+    fn texts(lines: &[TextLine]) -> Vec<String> {
+        lines.iter().map(text_of).collect()
+    }
+
     /// The foreground colour of the first span carrying `needle`.
     fn color_of(lines: &[TextLine], needle: &str) -> Option<Color> {
         lines
@@ -713,6 +940,15 @@ mod tests {
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.contains(needle))
             .map(|s| s.style.fg.unwrap_or(Color::Reset))
+    }
+
+    /// The style of the first span carrying `needle`.
+    fn style_of(lines: &[TextLine], needle: &str) -> Option<Style> {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains(needle))
+            .map(|s| s.style)
     }
 
     #[test]
@@ -740,6 +976,135 @@ mod tests {
         let joined: String = lines.iter().map(text_of).collect();
         assert!(joined.contains('x'));
         assert!(joined.contains('y'));
+    }
+
+    #[test]
+    fn headings_render_a_hierarchy_with_no_hashes() {
+        let hl = Highlighter::new();
+        let lines = render("# Title\n\n### Sub\n\n##### Small", Some(40), &hl);
+        let joined: String = lines.iter().map(text_of).collect();
+        assert!(!joined.contains('#'), "no raw # marks: {joined:?}");
+        assert!(joined.contains("Title") && joined.contains("Sub") && joined.contains("Small"));
+        // H1 is bold cyan, H3 bold (default fg), H5 bold dim.
+        let h1 = style_of(&lines, "Title").unwrap();
+        assert!(h1.add_modifier.contains(Modifier::BOLD) && h1.fg == Some(Color::Cyan));
+        let h3 = style_of(&lines, "Sub").unwrap();
+        assert!(h3.add_modifier.contains(Modifier::BOLD) && h3.fg != Some(Color::Cyan));
+        let h5 = style_of(&lines, "Small").unwrap();
+        assert!(h5.add_modifier.contains(Modifier::BOLD) && h5.fg == Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn top_level_blocks_are_separated_by_one_blank_line() {
+        let hl = Highlighter::new();
+        let lines = render("para one\n\n# Heading\n\npara two", Some(40), &hl);
+        let t = texts(&lines);
+        assert_eq!(
+            t,
+            vec![
+                "para one".to_string(),
+                String::new(),
+                "Heading".to_string(),
+                String::new(),
+                "para two".to_string(),
+            ],
+            "one blank between each top-level block, none leading/trailing"
+        );
+    }
+
+    #[test]
+    fn no_block_spacing_when_not_wrapping() {
+        // The tight inline path stays dense (no inserted blank lines).
+        let hl = Highlighter::new();
+        let lines = render("para one\n\npara two", None, &hl);
+        let t = texts(&lines);
+        assert!(!t.iter().any(|l| l.is_empty()), "no blank lines: {t:?}");
+    }
+
+    #[test]
+    fn soft_and_hard_breaks_become_real_line_breaks() {
+        let hl = Highlighter::new();
+        // A single newline (soft break) and a trailing-space hard break both wrap.
+        let lines = render("alpha\nbeta", Some(40), &hl);
+        assert_eq!(texts(&lines), vec!["alpha".to_string(), "beta".to_string()]);
+        let hard = render("alpha  \nbeta", Some(40), &hl);
+        assert_eq!(texts(&hard), vec!["alpha".to_string(), "beta".to_string()]);
+        // In no-wrap mode the break collapses to a space (tight display).
+        let tight = render("alpha\nbeta", None, &hl);
+        assert_eq!(texts(&tight), vec!["alpha beta".to_string()]);
+    }
+
+    #[test]
+    fn adjacent_styles_keep_no_fabricated_space() {
+        let hl = Highlighter::new();
+        // `config.toml` (code) immediately followed by a comma, and a bold word
+        // followed by a period, and a link followed by a paren — all must stay
+        // flush when wrapping.
+        let lines = render("see `config.toml`, and **bold**. done", Some(40), &hl);
+        let joined: String = texts(&lines).join(" ");
+        assert!(
+            joined.contains("config.toml,"),
+            "code and comma stay flush: {joined:?}"
+        );
+        assert!(
+            joined.contains("bold."),
+            "bold and period stay flush: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn a_thematic_break_renders_a_dim_rule() {
+        let hl = Highlighter::new();
+        let lines = render("above\n\n---\n\nbelow", Some(20), &hl);
+        let t = texts(&lines);
+        let rule = t.iter().find(|l| l.contains('─')).expect("a rule line");
+        assert!(
+            UnicodeWidthStr::width(rule.as_str()) <= 20,
+            "the rule fits the pane: {rule:?}"
+        );
+        assert!(rule.chars().all(|c| c == '─'), "a solid rule: {rule:?}");
+        // No-wrap uses a short fixed rule.
+        let tight = render("---", None, &hl);
+        assert!(texts(&tight).iter().any(|l| l == "───"));
+    }
+
+    #[test]
+    fn br_tag_breaks_a_line() {
+        let hl = Highlighter::new();
+        let lines = render("alpha<br>beta", Some(40), &hl);
+        assert_eq!(texts(&lines), vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn an_ordered_list_honours_its_start_number() {
+        let hl = Highlighter::new();
+        let lines = render("5. five\n6. six", None, &hl);
+        assert_eq!(text_of(&lines[0]), "5. five");
+        assert_eq!(text_of(&lines[1]), "6. six");
+    }
+
+    #[test]
+    fn a_nested_list_indents_its_items() {
+        let hl = Highlighter::new();
+        let lines = render("- outer\n  - inner", None, &hl);
+        let t = texts(&lines);
+        assert!(t.iter().any(|l| l == "• outer"));
+        assert!(
+            t.iter().any(|l| l.starts_with("  ") && l.contains("inner")),
+            "the nested item is indented: {t:?}"
+        );
+    }
+
+    #[test]
+    fn a_footnote_reference_and_definition_render() {
+        let hl = Highlighter::new();
+        let lines = render("text[^1]\n\n[^1]: the note", Some(40), &hl);
+        let joined: String = texts(&lines).join("\n");
+        assert!(joined.contains("[1]"), "the reference marker: {joined:?}");
+        assert!(
+            joined.contains("the note"),
+            "the definition body: {joined:?}"
+        );
     }
 
     #[test]
@@ -771,6 +1136,20 @@ mod tests {
         assert!(joined.contains("just a quote"));
         assert!(!joined.contains("Note") && !joined.contains("[!"));
         assert!(joined.contains('▏'), "the quote bar is kept");
+    }
+
+    #[test]
+    fn blockquote_paragraphs_are_separated_by_a_bar_blank() {
+        let hl = Highlighter::new();
+        let lines = render("> one\n>\n> two", Some(40), &hl);
+        let t = texts(&lines);
+        // A bar-only line sits between the two quote paragraphs (no empty gap).
+        let bar_blank = t.iter().position(|l| l.trim() == "▏");
+        assert!(
+            bar_blank.is_some(),
+            "a bar-prefixed blank between paras: {t:?}"
+        );
+        assert!(t.iter().any(|l| l.contains("one")) && t.iter().any(|l| l.contains("two")));
     }
 
     #[test]
