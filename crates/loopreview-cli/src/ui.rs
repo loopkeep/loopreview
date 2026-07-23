@@ -1041,12 +1041,21 @@ impl App {
     fn apply_job(&mut self, result: Result<JobOutcome, String>) {
         match result {
             Ok(JobOutcome::Refreshed(threads)) => {
-                let (merged, cleaned) = crate::prsync::merge_drafts(&self.review, threads);
+                let (merged, cleaned, orphans) = crate::prsync::merge_drafts(&self.review, threads);
                 self.review.threads = merged;
-                self.status = Some(if cleaned > 0 {
-                    format!("refreshed from GitHub — cleaned {cleaned} stale draft(s)")
-                } else {
+                let mut notes = Vec::new();
+                if cleaned > 0 {
+                    notes.push(format!("cleaned {cleaned} stale draft(s)"));
+                }
+                if orphans > 0 {
+                    notes.push(format!(
+                        "{orphans} local note(s) removed — their thread was deleted on GitHub"
+                    ));
+                }
+                self.status = Some(if notes.is_empty() {
                     "refreshed from GitHub".to_string()
+                } else {
+                    format!("refreshed from GitHub — {}", notes.join("; "))
                 });
                 self.relayout();
             }
@@ -1327,6 +1336,13 @@ impl App {
 
     /// Stamp remote ids from a submitted review onto the local threads.
     fn apply_submitted(&mut self, submitted: crate::prsync::Submitted) {
+        // Some root ids weren't read back this round (a failed reconcile, or a POST
+        // whose response didn't parse) — they publish under a pending sentinel and
+        // recover their real id on the next pull.
+        let pending_ids = submitted
+            .published
+            .iter()
+            .any(|(_, id)| id == crate::prsync::PENDING_REMOTE_ID);
         for (thread_id, remote_id) in submitted.published {
             if let Some(thread) = self.review.thread_mut(&thread_id)
                 && let Some(root) = thread.comments.first_mut()
@@ -1366,6 +1382,10 @@ impl App {
                 submitted.failed_replies,
                 plural(submitted.failed_replies)
             )
+        } else if pending_ids {
+            // Posted, but some ids didn't come back — they reconcile on the next
+            // pull, so a refresh (not a resubmit) completes it.
+            "review posted — reconciling ids on the next refresh (Ctrl-R)".to_string()
         } else {
             "review submitted".to_string()
         });
@@ -2039,7 +2059,7 @@ impl App {
             }
             let Some(endpoint) = self.published_endpoint(&thread_id, &comment_id) else {
                 return Err(
-                    "this comment hasn't synced an id yet — refresh the PR (Ctrl-R)".to_string(),
+                    "this comment has no synced API id — refresh the PR (Ctrl-R); if that doesn't help, manage it on GitHub".to_string(),
                 );
             };
             // A submitted review's summary has no GitHub delete.
@@ -2236,7 +2256,7 @@ impl App {
         // A published comment needs an addressable id on GitHub to edit (a pulled
         // comment can report a null databaseId).
         if published && self.published_endpoint(&thread_id, &comment_id).is_none() {
-            self.status = Some("this comment has no editable id on GitHub".to_string());
+            self.status = Some("this comment has no synced API id — refresh the PR (Ctrl-R); if that doesn't help, manage it on GitHub".to_string());
             return;
         }
         self.input = Some(Compose {
@@ -8551,6 +8571,43 @@ mod tests {
     }
 
     #[test]
+    fn a_submit_with_unparsed_ids_publishes_pending_and_wont_resubmit() {
+        // The review POST returned 2xx but its id didn't parse: the root publishes
+        // under the pending sentinel. It must not stay a draft (that would let a
+        // resubmit duplicate the review); a refresh reconciles the real id.
+        let mut app = pr_app();
+        let (tid, _) = app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "root",
+            CommentKind::Draft,
+        );
+        app.apply_submitted(crate::prsync::Submitted {
+            published: vec![(tid, crate::prsync::PENDING_REMOTE_ID.to_string())],
+            replies: Vec::new(),
+            failed_replies: 0,
+            deferred_replies: 0,
+        });
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("reconciling ids on the next refresh"),
+            "status points at the refresh, not a resubmit: {:?}",
+            app.status
+        );
+        assert!(
+            app.review.threads[0].root().unwrap().is_published(),
+            "the root is marked published (no [draft])"
+        );
+        assert_eq!(
+            app.draft_summary().total(),
+            0,
+            "nothing left to resubmit — no duplicate POST"
+        );
+    }
+
+    #[test]
     fn a_deferred_reply_is_reported_with_a_recovery_hint() {
         // A reply whose root's id wasn't read back stays draft — never silently:
         // the status names the two-step refresh-and-resubmit recovery.
@@ -8995,7 +9052,7 @@ mod tests {
                 .status
                 .as_deref()
                 .unwrap_or("")
-                .contains("editable id")
+                .contains("no synced API id")
         );
     }
 
@@ -9874,7 +9931,7 @@ mod tests {
         assert!(
             app.delete_target()
                 .unwrap_err()
-                .contains("hasn't synced an id yet"),
+                .contains("no synced API id"),
             "reason: {:?}",
             app.delete_target()
         );
@@ -10009,6 +10066,36 @@ mod tests {
             thread.comments.len(),
             1,
             "the other published comment anchors it"
+        );
+    }
+
+    #[test]
+    fn a_refresh_reports_local_notes_orphaned_by_a_deleted_thread() {
+        let mut app = pr_app();
+        // A published thread carrying a local note of mine.
+        app.review.threads.push(Thread {
+            id: "T1".into(),
+            anchor: Anchor::line("a.rs", Side::New, 2),
+            state: ThreadState::Open,
+            comments: vec![
+                comment_of("root", "someone", Some("r1"), CommentKind::Draft),
+                comment_of("note", "tester", None, CommentKind::Local),
+            ],
+        });
+        app.relayout();
+        // The fresh pull no longer has the thread — it was deleted on GitHub.
+        app.apply_job(Ok(JobOutcome::Refreshed(Vec::new())));
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("local note(s) removed — their thread was deleted on GitHub"),
+            "the refresh reports the orphan drop, not silently: {:?}",
+            app.status
+        );
+        assert!(
+            app.review.threads.iter().all(|t| t.id != "T1"),
+            "the orphaned thread is gone"
         );
     }
 

@@ -312,7 +312,23 @@ impl GithubClient {
             &self.dir,
             Some(&payload),
         )?;
-        let review_id = parse_created_id(&out, "created review")?;
+        // The POST returned 2xx (a non-2xx exit is an error above), so the review
+        // is posted. If its id can't be parsed from the response, do NOT fail —
+        // that would leave the drafts to be re-submitted and duplicate the review.
+        // Instead report every comment id-pending; the next pull's anchor/body
+        // reconciliation recovers the real ids.
+        let review_id = match parse_created_id(&out, "created review") {
+            Ok(id) => id,
+            Err(_) => {
+                return Ok(SubmitOutcome {
+                    review_id: 0,
+                    published: planned
+                        .iter()
+                        .map(|p| (p.thread_id.clone(), None))
+                        .collect(),
+                });
+            }
+        };
 
         // Reconcile the created comment ids back onto the drafts. Only a review
         // with no inline comments has nothing to read back (a pending review still

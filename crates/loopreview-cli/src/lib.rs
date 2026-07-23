@@ -183,7 +183,10 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
         {
             Some(store) => {
                 let drafts = store.load_pr_drafts(&pr_key).unwrap_or_default();
-                let (threads, cleaned) = prsync::merge_drafts(&drafts, threads);
+                // Orphan drops are surfaced on an explicit refresh; at first load
+                // there is no prior view to have shown the note, so only the stale
+                // ghost count feeds the startup notice.
+                let (threads, cleaned, _orphans) = prsync::merge_drafts(&drafts, threads);
                 (loopreview_core::Review { threads }, cleaned)
             }
             None => (loopreview_core::Review { threads }, 0),

@@ -301,11 +301,14 @@ fn same_anchor_location(a: &Anchor, b: &Anchor) -> bool {
 
 /// Merge local drafts into a freshly-pulled thread list: keep fully-local draft
 /// threads, and re-attach draft replies (comments with no remote id) to their
-/// published thread by id. Returns the merged threads and the number of stale
-/// draft ghosts dropped (see below).
-pub fn merge_drafts(previous: &Review, fresh: Vec<Thread>) -> (Vec<Thread>, usize) {
+/// published thread by id. Returns the merged threads, the number of stale draft
+/// ghosts dropped, and the number of local notes dropped because their published
+/// thread was deleted on GitHub (so the UI can say so rather than lose them
+/// silently).
+pub fn merge_drafts(previous: &Review, fresh: Vec<Thread>) -> (Vec<Thread>, usize, usize) {
     let mut result = fresh;
     let mut cleaned = 0usize;
+    let mut orphans = 0usize;
     for old in &previous.threads {
         let root_published = old.root().is_some_and(|c| c.remote_id.is_some());
         if !root_published {
@@ -342,19 +345,27 @@ pub fn merge_drafts(previous: &Review, fresh: Vec<Thread>) -> (Vec<Thread>, usiz
         // and any draft reply under it is intentionally dropped here — it was never
         // sent (a reply cannot attach to an unreconciled root) and the real thread
         // arrives fresh from the pull. This is a rare, accepted edge.
+        let root_pending =
+            old.root().and_then(|c| c.remote_id.as_deref()) == Some(PENDING_REMOTE_ID);
         let drafts: Vec<_> = old
             .comments
             .iter()
             .filter(|c| c.remote_id.is_none())
             .cloned()
             .collect();
-        if !drafts.is_empty()
-            && let Some(fresh_thread) = result.iter_mut().find(|t| t.id == old.id)
-        {
-            fresh_thread.comments.extend(drafts);
+        if !drafts.is_empty() {
+            if let Some(fresh_thread) = result.iter_mut().find(|t| t.id == old.id) {
+                fresh_thread.comments.extend(drafts);
+            } else if !root_pending {
+                // No fresh thread matches and the root was a real published comment:
+                // it was deleted on GitHub. Its local notes have no thread to hang
+                // under and are dropped — counted so the refresh can report it. (The
+                // sentinel case above is an expected re-sync, not a deletion.)
+                orphans += drafts.len();
+            }
         }
     }
-    (result, cleaned)
+    (result, cleaned, orphans)
 }
 
 #[cfg(test)]
@@ -414,12 +425,32 @@ mod tests {
         // A fresh pull returns the published thread (without the draft reply).
         let fresh = vec![thread("T1", vec![comment("c1", Some("r1"))])];
 
-        let (merged, cleaned) = merge_drafts(&previous, fresh);
+        let (merged, cleaned, orphans) = merge_drafts(&previous, fresh);
         assert_eq!(cleaned, 0, "nothing stale to clean");
+        assert_eq!(orphans, 0, "the published thread is still there");
         assert_eq!(merged.len(), 2);
         let t1 = merged.iter().find(|t| t.id == "T1").unwrap();
         assert_eq!(t1.comments.len(), 2, "draft reply re-attached");
         assert!(merged.iter().any(|t| t.id == "local"), "local thread kept");
+    }
+
+    #[test]
+    fn merge_reports_local_notes_orphaned_by_a_deleted_remote_thread() {
+        // A published thread carried a local note, but the fresh pull no longer
+        // has it — the thread was deleted on GitHub. The note has no home; it is
+        // dropped and counted so the refresh can say so, not lose it silently.
+        let previous = Review {
+            threads: vec![thread(
+                "T1",
+                vec![comment("root", Some("r1")), comment("note", None)],
+            )],
+        };
+        let fresh: Vec<Thread> = Vec::new(); // the thread is gone remotely
+
+        let (merged, cleaned, orphans) = merge_drafts(&previous, fresh);
+        assert_eq!(cleaned, 0);
+        assert_eq!(orphans, 1, "the orphaned local note is counted");
+        assert!(merged.is_empty(), "and not carried into the merged review");
     }
 
     #[test]
@@ -433,7 +464,7 @@ mod tests {
         // The real published thread on the same line, same body ("b"), arrives fresh.
         let fresh = vec![thread("T9", vec![comment("real", Some("r9"))])];
 
-        let (merged, cleaned) = merge_drafts(&previous, fresh);
+        let (merged, cleaned, _orphans) = merge_drafts(&previous, fresh);
         assert_eq!(cleaned, 1, "the ghost draft was cleaned");
         assert_eq!(merged.len(), 1, "only the real published thread remains");
         assert!(
