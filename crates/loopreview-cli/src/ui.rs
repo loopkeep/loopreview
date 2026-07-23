@@ -1270,10 +1270,11 @@ impl App {
     }
 
     /// Open the current position on github.com in the browser (`open_github`,
-    /// default Ctrl-O). Only pull requests have a page; a plain local review has
-    /// nowhere to go. On a PR the target is a deep link to the published comment
-    /// under the Conversation cursor, else the PR page itself. A launcher that
-    /// won't run falls back to printing the URL for the user to open by hand.
+    /// default Ctrl-O). A pull request or an issue has a page; a plain local review
+    /// has nowhere to go. On a PR the target is a deep link to the published
+    /// comment under the Conversation cursor, else the PR page; an issue opens its
+    /// page. A launcher that won't run falls back to printing the URL for the user
+    /// to open by hand.
     fn open_github(&mut self) {
         let url = if let Some(pr) = self.pr.clone() {
             self.github_link(&pr)
@@ -1813,7 +1814,8 @@ impl App {
         }
     }
 
-    /// The tabs currently shown, left to right (Overview only on a PR).
+    /// The tabs currently shown, left to right (Overview on a pull request or an
+    /// issue; Files on anything with a diff, so an issue drops it).
     fn visible_views(&self) -> Vec<View> {
         View::ORDER
             .iter()
@@ -3694,10 +3696,11 @@ impl App {
         }
     }
 
-    /// Close the review. For a pull request this discards the local drafts
-    /// (published comments stay); otherwise it deletes the local review store.
+    /// Close the review. For a GitHub subject (pull request or issue) this
+    /// discards the local drafts (published comments stay) and rewrites just this
+    /// subject's draft bucket; otherwise it deletes the local review store.
     fn close_review(&mut self) {
-        if self.pr.is_some() {
+        if self.has_subject() {
             // Drop fully-local draft threads and draft replies; keep published.
             self.review
                 .threads
@@ -3705,6 +3708,8 @@ impl App {
             for thread in &mut self.review.threads {
                 thread.comments.retain(|c| c.remote_id.is_some());
             }
+            // Rewrites only `pr_drafts[key]` — never the shared store file, so a
+            // worktree review and every other subject's drafts are untouched.
             let _ = self.save_pr_drafts();
             self.status = Some("drafts discarded".to_string());
         } else {
@@ -3716,7 +3721,14 @@ impl App {
         }
         self.conv_cursor = 0;
         self.conv_scroll = 0;
-        self.view = View::Files;
+        // Land on a view that exists here. An issue has no Files tab, so return it
+        // to the Conversation it was just managing; a diff-bearing review (PR or
+        // worktree) keeps its Files landing.
+        self.view = if self.is_issue() {
+            View::Conversation
+        } else {
+            View::Files
+        };
         self.relayout();
     }
 
@@ -4158,11 +4170,13 @@ impl App {
 
     /// Save the review, returning a status message describing the outcome.
     fn persist(&self, done: &str) -> Option<String> {
-        // In a pull request, only the drafts are stored (published comments are
-        // re-pulled); they are sent on submit.
-        if self.pr.is_some() {
+        // For a GitHub subject (pull request or issue) only the drafts are stored
+        // under `pr_drafts[key]` — published comments are re-pulled, not saved into
+        // the worktree store; drafts are sent on submit (PR) or Ctrl-S (issue).
+        if self.has_subject() {
+            let verb = if self.is_issue() { "send" } else { "submit" };
             return match self.save_pr_drafts() {
-                Ok(()) => Some(format!("{done} — draft saved, Ctrl-S to submit")),
+                Ok(()) => Some(format!("{done} — draft saved, Ctrl-S to {verb}")),
                 Err(e) => Some(format!("{done}, but save failed: {e}")),
             };
         }
@@ -4246,9 +4260,10 @@ impl App {
     }
 
     /// The kind for a new human-authored comment: a note in a local review (never
-    /// sent), a draft in a pull request (queued for submit).
+    /// sent), a draft on a GitHub subject — queued for submit on a pull request,
+    /// for Ctrl-S send on an issue.
     fn human_new_kind(&self) -> CommentKind {
-        if self.pr.is_some() {
+        if self.has_subject() {
             CommentKind::Draft
         } else {
             CommentKind::Local
@@ -4510,10 +4525,11 @@ impl App {
         }
     }
 
-    /// Reload the current source (a control-plane `reload`). A pull request
-    /// re-pulls in the background; a git/patch source reloads synchronously.
+    /// Reload the current source (a control-plane `reload`). A GitHub subject (a
+    /// pull request or an issue) re-pulls in the background; a git/patch source
+    /// reloads synchronously.
     fn control_reload(&mut self) -> Result<ReloadResult, String> {
-        if self.pr.is_some() {
+        if self.has_subject() {
             self.refresh();
             self.status = Some("agent: reloading…".to_string());
             return Ok(ReloadResult { started: true });
@@ -4620,10 +4636,11 @@ impl App {
     }
 
     /// The kind for an agent-authored comment: a local note by default (agents
-    /// converse, they don't queue GitHub sends), a draft only on a PR with the
-    /// explicit `--draft` flag — so an agent's note is never sent by accident.
+    /// converse, they don't queue GitHub sends), a draft only on a GitHub subject
+    /// (pull request or issue) with the explicit `--draft` flag — so an agent's
+    /// note is never sent by accident, and a human still does the sending.
     fn agent_kind(&self, draft: bool) -> CommentKind {
-        if self.pr.is_some() && draft {
+        if self.has_subject() && draft {
             CommentKind::Draft
         } else {
             CommentKind::Local
@@ -4839,12 +4856,12 @@ impl App {
     }
 
     /// A targeted store deletion (not the union `save`), routed to the working
-    /// tree or the PR draft set.
+    /// tree or a GitHub subject's draft set (pull request or issue).
     fn store_remove(&self, thread_id: &str, comment_id: Option<&str>) {
         let Some(store) = &self.store else {
             return;
         };
-        if self.pr.is_some() {
+        if self.has_subject() {
             if let Some(key) = &self.pr_key {
                 let _ = store.remove_pr_draft(key, thread_id, comment_id);
             }
@@ -5782,7 +5799,7 @@ impl App {
 
     /// The visible tab labels, left to right, each paired with its view — shared
     /// by drawing and mouse hit-testing so their widths stay in sync. Overview is
-    /// present only on a pull request.
+    /// present on a pull request or an issue; an issue has no Files tab.
     fn tab_labels(&self) -> Vec<(View, String)> {
         self.visible_views()
             .into_iter()
@@ -6071,11 +6088,12 @@ impl App {
             " loopreview ",
             bar.fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )];
-        // The source label. On a pull request it is "PR #N": render "PR " plainly
-        // and the "#N" as an underlined link, recording its columns so a click on
-        // just that range opens the PR page. Elsewhere it is plain text.
+        // The source label. On a GitHub subject it carries "#N" (e.g. "PR #N" or
+        // "issue owner/repo#N"): render the text before "#" plainly and the "#N"
+        // as an underlined link, recording its columns so a click on just that
+        // range opens the subject's page. Elsewhere it is plain text.
         self.header_pr_link.set(None);
-        let hash = self.pr.is_some().then(|| self.label.find('#')).flatten();
+        let hash = self.has_subject().then(|| self.label.find('#')).flatten();
         if let Some(hash) = hash {
             // "· PR " plainly...
             spans.push(TextSpan::styled(
@@ -9391,6 +9409,119 @@ mod tests {
             app.review.threads[ti].root().unwrap().disposition(),
             CommentKind::Draft,
             "t promotes an issue conversation root to a draft"
+        );
+    }
+
+    /// A one-thread draft review, for seeding another subject's draft bucket.
+    fn one_draft() -> Review {
+        Review {
+            threads: vec![Thread {
+                id: generate_id(),
+                anchor: Anchor::Review,
+                state: ThreadState::Open,
+                comments: vec![comment_of("d", "someone", None, CommentKind::Draft)],
+            }],
+        }
+    }
+
+    #[test]
+    fn a_new_human_comment_is_a_draft_on_an_issue() {
+        // Regression: `c` on an issue used to make a local note (never sent), so
+        // Ctrl-S found nothing to send and the human had to `t`-promote first. A
+        // GitHub subject — pull request or issue — drafts by default.
+        assert_eq!(issue_app().human_new_kind(), CommentKind::Draft);
+        assert_eq!(pr_app().human_new_kind(), CommentKind::Draft);
+        assert_eq!(sample_app().human_new_kind(), CommentKind::Local);
+    }
+
+    #[test]
+    fn an_agent_draft_is_honored_on_an_issue() {
+        // --draft queues a sendable draft on an issue too (a human still sends);
+        // without it, and off any subject, an agent comment stays a local note.
+        assert_eq!(issue_app().agent_kind(true), CommentKind::Draft);
+        assert_eq!(issue_app().agent_kind(false), CommentKind::Local);
+        assert_eq!(pr_app().agent_kind(true), CommentKind::Draft);
+        assert_eq!(sample_app().agent_kind(true), CommentKind::Local);
+    }
+
+    #[test]
+    fn issue_drafts_persist_in_the_pr_draft_bucket() {
+        // Regression: an issue draft used to fall to store.save(&review) — lost
+        // across sessions (the loader reads pr_drafts) and leaking published issue
+        // comments into the worktree store. persist() must route it to
+        // save_pr_drafts[key] and leave the worktree review untouched.
+        let mut app = issue_app();
+        app.set_view(View::Conversation);
+        // A published issue comment (must NOT be stored) and a local draft (must).
+        app.review.threads.push(Thread {
+            id: "pub".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![comment_of(
+                "p",
+                "octocat",
+                Some("IC_9"),
+                CommentKind::Published,
+            )],
+        });
+        app.add_thread(Anchor::Review, "tester", "my draft", CommentKind::Draft);
+
+        let msg = app.persist("comment added").unwrap();
+        assert!(
+            msg.contains("Ctrl-S to send"),
+            "an issue persist points at send, not submit: {msg}"
+        );
+
+        let store = app.store.as_ref().unwrap();
+        let saved = store.load_pr_drafts("owner/repo#5").unwrap();
+        assert_eq!(
+            saved.threads.len(),
+            1,
+            "only the unpublished draft round-trips into the draft bucket"
+        );
+        assert!(saved.threads[0].root().unwrap().remote_id.is_none());
+        assert!(
+            store.load_or_recover().0.is_empty(),
+            "the worktree review store is not polluted with issue comments"
+        );
+    }
+
+    #[test]
+    fn closing_an_issue_review_keeps_other_subjects_drafts() {
+        // Regression (data loss): X on an issue fell to the non-subject branch and
+        // deleted the whole shared store file — every other PR/issue's drafts and
+        // the worktree review with it — then dropped to the hidden Files view. It
+        // must clear only this issue's own bucket and land on a visible view.
+        let mut app = issue_app();
+        app.set_view(View::Conversation);
+        // Another subject already has drafts in the same store file.
+        app.store
+            .as_ref()
+            .unwrap()
+            .save_pr_drafts("owner/repo#99", &one_draft())
+            .unwrap();
+        app.add_thread(Anchor::Review, "tester", "my note", CommentKind::Draft);
+        assert!(!app.pr_drafts().is_empty());
+
+        app.close_review();
+
+        assert_eq!(
+            app.view,
+            View::Conversation,
+            "an issue lands on a visible view, not the hidden Files"
+        );
+        assert!(
+            app.pr_drafts().is_empty(),
+            "this issue's own local drafts are discarded"
+        );
+        assert!(
+            !app.store
+                .as_ref()
+                .unwrap()
+                .load_pr_drafts("owner/repo#99")
+                .unwrap()
+                .is_empty(),
+            "another subject's drafts survive — the store file was not deleted"
         );
     }
 
@@ -13675,6 +13806,74 @@ mod tests {
             Color::Magenta,
             "the merged badge uses the merged color"
         );
+    }
+
+    #[test]
+    fn the_header_issue_number_is_a_clickable_link_with_a_badge() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // Regression: the #N link and the status badge were PR-gated, so an issue
+        // header showed a plain label with no link and no badge.
+        let mut app = issue_app();
+        app.label = "issue owner/repo#5".to_string(); // as the real issue load sets it
+        app.set_view(View::Overview);
+        let mut term = Terminal::new(TestBackend::new(120, 6)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let (x0, x1) = app
+            .header_pr_link
+            .get()
+            .expect("an issue records the #N link too");
+        assert_eq!(
+            (x1 - x0) as usize,
+            "#5".chars().count(),
+            "the link spans '#5'"
+        );
+        assert_eq!(hit_region(x0, 0, app.hit.get()), Region::PrLink);
+        let buf = term.backend().buffer();
+        let header: String = (0..120u16).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            header.contains("#5 Open"),
+            "the issue status badge sits just after #5: {header:?}"
+        );
+        // The badge is green for an open issue, and not inside the click columns.
+        let open_col = (0..114u16)
+            .find(|&x| (x..x + 4).map(|c| buf[(c, 0)].symbol()).collect::<String>() == "Open")
+            .expect("the badge text is rendered");
+        assert_eq!(
+            buf[(open_col, 0)].fg,
+            Color::Green,
+            "an open issue is green"
+        );
+    }
+
+    #[test]
+    fn tab_at_column_maps_clicks_to_tabs() {
+        // A click on a tab's label lands on that tab; the single space separating
+        // two tabs belongs to neither.
+        let app = pr_app(); // Overview | Files | Conversation
+        let labels = app.tab_labels();
+        assert_eq!(labels.len(), 3, "a PR shows all three tabs");
+        let mut x = 0u16;
+        for (view, label) in &labels {
+            let w = label.chars().count() as u16;
+            assert_eq!(
+                app.tab_at_column(x),
+                Some(*view),
+                "the left edge of {view:?}"
+            );
+            assert_eq!(
+                app.tab_at_column(x + w - 1),
+                Some(*view),
+                "the right edge of {view:?}"
+            );
+            x += w;
+            assert_eq!(
+                app.tab_at_column(x),
+                None,
+                "the gap after {view:?} hits nothing"
+            );
+            x += 1; // the separator space
+        }
     }
 
     /// Empirical: render, read the buffer to find the screen row of a known
