@@ -54,6 +54,7 @@ pub fn render(
         task: None,
         code: None,
         link: None,
+        image: None,
         table: None,
         started: false,
         fresh: false,
@@ -102,6 +103,8 @@ struct Renderer<'a> {
     code: Option<(String, String)>,
     /// A link's destination, while inside one.
     link: Option<String>,
+    /// An image's `(destination, alt-text-so-far)`, while inside one.
+    image: Option<(String, String)>,
     /// A table being built, while inside one.
     table: Option<TableBuild>,
     /// Whether any block has been emitted yet (so the first gets no leading gap).
@@ -117,11 +120,12 @@ impl Renderer<'_> {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(text) => {
-                if let Some((_, buf)) = &mut self.code {
+                if let Some((_, alt)) = &mut self.image {
+                    alt.push_str(&text); // an image's alt text, buffered for its label
+                } else if let Some((_, buf)) = &mut self.code {
                     buf.push_str(&text);
                 } else {
-                    self.spans
-                        .push(TextSpan::styled(text.into_string(), self.style));
+                    self.push_text(&text);
                 }
             }
             Event::Code(code) => {
@@ -137,14 +141,11 @@ impl Renderer<'_> {
             // break, so both soft and hard breaks become real breaks here — the
             // same text must not read differently on github.com and in lr.
             Event::SoftBreak | Event::HardBreak => self.spans.push(break_span()),
-            // Inline/raw HTML: only `<br>` is meaningful for us (a line break).
-            // Any other tag is dropped — its inner text still arrives as separate
-            // Text events, so content is kept, markup stripped.
-            Event::Html(html) | Event::InlineHtml(html) => {
-                if is_br(&html) {
-                    self.spans.push(break_span());
-                }
-            }
+            // Raw HTML: recognize `<br>` (a break), `<img>` (an image
+            // placeholder), and `<summary>` (a details title); every other tag is
+            // dropped — its inner text still arrives as separate Text events, so
+            // content is kept and markup stripped.
+            Event::Html(html) | Event::InlineHtml(html) => self.html(&html),
             Event::Rule => self.rule(),
             // A footnote reference renders as a compact `[label]` marker; the
             // definition is emitted as its own block (see FootnoteDefinition).
@@ -166,6 +167,9 @@ impl Renderer<'_> {
             Tag::Strong => self.style = self.style.add_modifier(Modifier::BOLD),
             Tag::Strikethrough => self.style = self.style.add_modifier(Modifier::CROSSED_OUT),
             Tag::Link { dest_url, .. } => self.link = Some(dest_url.into_string()),
+            Tag::Image { dest_url, .. } => {
+                self.image = Some((dest_url.into_string(), String::new()))
+            }
             Tag::List(start) => {
                 // Flush an enclosing item's pending inline text before its nested
                 // list, so the two don't run together on one line.
@@ -248,6 +252,11 @@ impl Renderer<'_> {
                     ));
                 }
             }
+            TagEnd::Image => {
+                if let Some((url, alt)) = self.image.take() {
+                    self.push_image(&url, &alt);
+                }
+            }
             TagEnd::Paragraph => self.flush_block(),
             TagEnd::Heading(level) => {
                 // No raw `#`: a visual hierarchy by level, like GitHub.
@@ -294,6 +303,96 @@ impl Renderer<'_> {
             TagEnd::Table => self.flush_table(),
             _ => {}
         }
+    }
+
+    /// Push a run of text, styling any bare `http(s)://` URL as a link (GitHub
+    /// autolinks these). Skipped inside a markdown link label, which is already a
+    /// link. The URL destination is kept on the span for a later click.
+    fn push_text(&mut self, text: &str) {
+        if self.link.is_some() {
+            self.spans
+                .push(TextSpan::styled(text.to_string(), self.style));
+            return;
+        }
+        let mut rest = text;
+        while let Some((pre, url, tail)) = next_url(rest) {
+            if !pre.is_empty() {
+                self.spans
+                    .push(TextSpan::styled(pre.to_string(), self.style));
+            }
+            self.spans.push(TextSpan::styled(
+                url.to_string(),
+                self.style
+                    .fg(palette::LINK_FG)
+                    .add_modifier(Modifier::UNDERLINED),
+            ));
+            rest = tail;
+        }
+        if !rest.is_empty() {
+            self.spans
+                .push(TextSpan::styled(rest.to_string(), self.style));
+        }
+    }
+
+    /// Emit an image as an inline `[Image]` / `[Image: alt]` placeholder (a link,
+    /// so it reads as "there is an image here" and can later open its URL).
+    fn push_image(&mut self, _url: &str, alt: &str) {
+        let alt = alt.trim();
+        let label = if alt.is_empty() {
+            "[Image]".to_string()
+        } else {
+            format!("[Image: {alt}]")
+        };
+        self.spans.push(TextSpan::styled(
+            label,
+            self.style
+                .fg(palette::LINK_FG)
+                .add_modifier(Modifier::UNDERLINED),
+        ));
+    }
+
+    /// Handle a raw-HTML fragment: `<br>` (a break), `<img>` (an image
+    /// placeholder), `<summary>` (a details title header). Anything else is
+    /// dropped — inner text still arrives as separate Text events.
+    fn html(&mut self, html: &str) {
+        if is_br(html) {
+            self.spans.push(break_span());
+        } else if let Some((src, alt)) = parse_img(html) {
+            if !src.is_empty() {
+                self.push_image(&src, &alt);
+            }
+        } else if let Some(summary) = parse_summary(html) {
+            self.emit_summary(&summary);
+        }
+    }
+
+    /// Emit a `<details>` title as a `▾ summary` header line. The body renders as
+    /// normal markdown after it (always shown for now; an interactive fold is a
+    /// follow-up).
+    fn emit_summary(&mut self, summary: &str) {
+        self.flush_block();
+        self.open_block();
+        let summary = summary.trim();
+        let label = if summary.is_empty() {
+            "Details"
+        } else {
+            summary
+        };
+        let mut spans = Vec::new();
+        let prefix = "▏ ".repeat(self.quotes.len());
+        if !prefix.is_empty() {
+            spans.push(TextSpan::styled(
+                prefix,
+                Style::default().fg(self.alert_color().unwrap_or(Color::DarkGray)),
+            ));
+        }
+        spans.push(TextSpan::styled("▾ ", Style::default().fg(Color::DarkGray)));
+        spans.push(TextSpan::styled(
+            label.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        self.out.push(TextLine::from(spans));
+        self.mark_emitted();
     }
 
     /// Place the inter-block separator before the next block, when wrapping. Top
@@ -468,6 +567,96 @@ fn is_br(html: &str) -> bool {
     let t = html.trim().trim_start_matches("</").trim_start_matches('<');
     let t = t.trim_end_matches('>').trim_end_matches('/').trim();
     t.eq_ignore_ascii_case("br")
+}
+
+/// Parse an `<img …>` tag into `(src, alt)`; `None` when it is not an img.
+fn parse_img(html: &str) -> Option<(String, String)> {
+    if !html.trim_start().to_ascii_lowercase().starts_with("<img") {
+        return None;
+    }
+    let src = html_attr(html, "src").unwrap_or_default();
+    let alt = html_attr(html, "alt").unwrap_or_default();
+    Some((src, alt))
+}
+
+/// The value of an HTML attribute `name=` (quoted or bare), if present.
+fn html_attr(html: &str, name: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let key = format!("{name}=");
+    let at = lower.find(&key)? + key.len();
+    let rest = &html[at..];
+    let mut chars = rest.chars();
+    match chars.next()? {
+        q @ ('"' | '\'') => {
+            let body = &rest[1..];
+            let end = body.find(q)?;
+            Some(body[..end].to_string())
+        }
+        _ => {
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '>')
+                .unwrap_or(rest.len());
+            Some(rest[..end].to_string())
+        }
+    }
+}
+
+/// Extract the text of a `<summary>…</summary>`, tags stripped; `None` when the
+/// fragment has no summary.
+fn parse_summary(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let open = lower.find("<summary")?;
+    let gt = html[open..].find('>')? + open + 1;
+    let rest = &html[gt..];
+    let end = rest
+        .to_ascii_lowercase()
+        .find("</summary>")
+        .unwrap_or(rest.len());
+    Some(strip_tags(rest[..end].trim()))
+}
+
+/// Remove `<…>` tags from a fragment, keeping the text between them.
+fn strip_tags(s: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0usize;
+    for ch in s.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Find the first bare `http(s)://` URL in `s`, returning `(before, url, after)`.
+/// Conservative: the URL ends at whitespace or an enclosing character, and
+/// trailing sentence punctuation is left outside it.
+fn next_url(s: &str) -> Option<(&str, &str, &str)> {
+    let start = [s.find("https://"), s.find("http://")]
+        .into_iter()
+        .flatten()
+        .min()?;
+    let after = &s[start..];
+    let mut end = after.len();
+    for (i, ch) in after.char_indices() {
+        if ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '\'' | '`' | '|' | '[' | ']') {
+            end = i;
+            break;
+        }
+    }
+    let mut url = &after[..end];
+    url = url.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+    if url.ends_with(')') && !url.contains('(') {
+        url = &url[..url.len() - 1];
+    }
+    if url.len() <= "https://".len() {
+        // Nothing past the scheme — not worth linking (avoids a bare "http://").
+        return None;
+    }
+    let real_end = start + url.len();
+    Some((&s[..start], &s[start..real_end], &s[real_end..]))
 }
 
 /// A heading's `(colour, bold)` by level: H1/H2 accent (cyan), H3/H4 plain bold,
@@ -1211,6 +1400,86 @@ mod tests {
         }
         // The long cell wrapped to more than the header + rule + one line.
         assert!(lines.len() > 3, "the cell wrapped across lines");
+    }
+
+    #[test]
+    fn a_markdown_image_renders_a_link_placeholder() {
+        let hl = Highlighter::new();
+        let lines = render("see ![a shot](https://ex.com/a.png) here", Some(60), &hl);
+        let joined = texts(&lines).join(" ");
+        assert!(
+            joined.contains("[Image: a shot]"),
+            "alt in the placeholder: {joined:?}"
+        );
+        assert!(
+            !joined.contains("ex.com"),
+            "the url is not shown inline: {joined:?}"
+        );
+        let img = style_of(&lines, "[Image").unwrap();
+        assert!(
+            img.add_modifier.contains(Modifier::UNDERLINED) && img.fg == Some(palette::LINK_FG),
+            "the placeholder is styled as a link"
+        );
+    }
+
+    #[test]
+    fn an_html_img_becomes_a_placeholder_and_other_html_is_stripped() {
+        let hl = Highlighter::new();
+        let lines = render(
+            "<img src=\"https://e.com/x.png\" alt=\"pic\"> tail",
+            Some(60),
+            &hl,
+        );
+        let joined = texts(&lines).join(" ");
+        assert!(joined.contains("[Image: pic]"), "{joined:?}");
+        assert!(joined.contains("tail"), "trailing text is kept: {joined:?}");
+        // A src-less img is ignored (nothing to point at).
+        let none = render("<img alt=\"x\"> body", Some(60), &hl);
+        assert!(
+            !texts(&none).join(" ").contains("[Image"),
+            "no src → no placeholder"
+        );
+    }
+
+    #[test]
+    fn a_bare_url_is_autolinked() {
+        let hl = Highlighter::new();
+        let lines = render("see https://example.com/path, ok", Some(60), &hl);
+        let url = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.as_ref() == "https://example.com/path")
+            .expect("the url is its own span");
+        assert!(
+            url.style.add_modifier.contains(Modifier::UNDERLINED)
+                && url.style.fg == Some(palette::LINK_FG),
+            "the url is styled as a link"
+        );
+        let joined = texts(&lines).join("");
+        assert!(
+            joined.contains("https://example.com/path,"),
+            "trailing punctuation stays outside the link: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn details_shows_its_summary_and_body() {
+        let hl = Highlighter::new();
+        let src = "before\n\n<details>\n<summary>Click me</summary>\n\nHidden **body** here.\n\n</details>\n\nafter";
+        let lines = render(src, Some(60), &hl);
+        let joined = texts(&lines).join("\n");
+        assert!(
+            joined.contains("▾ Click me"),
+            "the summary shows as a header: {joined:?}"
+        );
+        assert!(
+            joined.contains("Hidden body here."),
+            "the body renders: {joined:?}"
+        );
+        assert!(
+            !joined.contains("<summary") && !joined.contains("details>"),
+            "the raw detail tags are gone: {joined:?}"
+        );
     }
 
     #[test]
