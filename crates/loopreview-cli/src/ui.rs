@@ -2981,6 +2981,29 @@ impl App {
         }
     }
 
+    /// Scroll the diff pane to preview `file` while the sidebar keeps focus. The
+    /// sidebar is a table of contents, so moving its selection (j/k, g/G) brings
+    /// the file's header to the top of the diff viewport — mirroring how the
+    /// Conversation index already tracks the selected thread in the right pane.
+    /// This is a peek only: it never moves the body cursor or steals focus.
+    /// `l`/Enter is the confirm-move that commits the cursor into the body.
+    fn preview_file_in_diff(&mut self, file: usize) {
+        if self.view != View::Files || self.clines.is_empty() {
+            return;
+        }
+        let Some(header) = self.file_first.get(file).copied().flatten() else {
+            return;
+        };
+        let row = if self.sbs() {
+            self.line_srow[header]
+        } else {
+            self.line_urow[header]
+        };
+        let height = self.body_height.get().max(1);
+        let max = self.rows_len().saturating_sub(height);
+        self.scroll = row.min(max);
+    }
+
     /// Scroll the sidebar list under the wheel (independent of the selection),
     /// clamped so the last row stays reachable. Rows count display rows — file
     /// rows plus directory headers, or the threads in the Conversation index.
@@ -3031,6 +3054,7 @@ impl App {
         let next = (pos as isize + delta).clamp(0, order.len() as isize - 1) as usize;
         self.sidebar_cursor = order[next];
         self.follow_sidebar();
+        self.preview_file_in_diff(self.sidebar_cursor);
     }
 
     /// Jump the sidebar cursor to the first/last file row in display order.
@@ -3043,6 +3067,7 @@ impl App {
         if let Some(&file) = target {
             self.sidebar_cursor = file;
             self.follow_sidebar();
+            self.preview_file_in_diff(file);
         }
     }
 
@@ -11159,6 +11184,106 @@ mod tests {
         assert!(app.selected_collapsed(), "h folds the open thread first");
         app.conversation_action(Action::NavOut);
         assert_eq!(app.focus, Focus::Sidebar, "h on a collapsed thread → index");
+    }
+
+    #[test]
+    fn sidebar_jk_scrolls_the_diff_to_the_selected_file() {
+        let mut app = multi_file_app(&["a.rs", "b.rs", "c.rs", "d.rs"]);
+        app.relayout();
+        app.body_height.set(3);
+        app.body_width.set(120);
+        app.focus_sidebar();
+        assert_eq!(app.focus, Focus::Sidebar);
+        let cursor_before = app.cursor;
+        assert_eq!(
+            app.scroll, 0,
+            "entering the sidebar does not scroll the diff"
+        );
+
+        // j down to the third file: the diff pane follows, anchoring that file's
+        // header at the top of the viewport (clamped to the last scroll row).
+        app.sidebar_action(Action::MoveDown);
+        app.sidebar_action(Action::MoveDown);
+        assert_eq!(app.sidebar_cursor, 2, "j moved the sidebar selection");
+
+        let header = app.file_first[2].expect("file 2 has a header");
+        let max = app.rows_len().saturating_sub(app.body_height.get());
+        let want = app.line_urow[header].min(max);
+        assert!(want > 0, "the third file is below the fold (real follow)");
+        assert_eq!(app.scroll, want, "the diff scrolled to the selected file");
+        assert_eq!(
+            app.cursor, cursor_before,
+            "a peek does not move the body cursor"
+        );
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar,
+            "a peek keeps focus in the sidebar"
+        );
+
+        // g jumps to the first file and the diff follows back to the top.
+        app.sidebar_action(Action::Top);
+        assert_eq!(app.sidebar_cursor, 0);
+        assert_eq!(app.scroll, 0, "g follows the diff back to the first file");
+    }
+
+    #[test]
+    fn sidebar_preview_peeks_but_enter_confirms() {
+        let mut app = multi_file_app(&["a.rs", "b.rs", "c.rs"]);
+        app.collapsed_files.insert("c.rs".into());
+        app.relayout();
+        app.body_height.set(3);
+        app.focus_sidebar();
+        let cursor_before = app.cursor;
+
+        // Peek at c.rs: the selection and the diff scroll move, focus/cursor stay.
+        app.sidebar_action(Action::MoveDown);
+        app.sidebar_action(Action::MoveDown);
+        assert_eq!(app.sidebar_cursor, 2);
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar,
+            "a peek keeps focus in the sidebar"
+        );
+        assert_eq!(
+            app.cursor, cursor_before,
+            "a peek does not move the body cursor"
+        );
+
+        // Enter confirms: c.rs expands, the body takes focus, the cursor lands in it.
+        app.sidebar_action(Action::NavIn);
+        assert_eq!(app.focus, Focus::Body, "Enter hands focus to the body");
+        assert_eq!(
+            app.current_file(),
+            2,
+            "the cursor lands in the confirmed file"
+        );
+        assert!(
+            !app.collapsed_files.contains("c.rs"),
+            "Enter expands the collapsed file"
+        );
+    }
+
+    #[test]
+    fn a_body_focused_diff_is_unaffected_by_the_sidebar_follow() {
+        let mut app = multi_file_app(&["a.rs", "b.rs", "c.rs"]);
+        app.relayout();
+        app.body_height.set(3);
+        app.focus = Focus::Body;
+
+        // With the diff focused, the scroll tracks the body cursor (reveal with a
+        // scrolloff margin) — never the sidebar's file-header anchor.
+        app.set_cursor(app.clines.len() - 1);
+        let row = app.cursor_row();
+        assert!(
+            (app.scroll..app.scroll + app.body_height.get()).contains(&row),
+            "the body cursor stays in view while the diff has focus"
+        );
+        assert_eq!(
+            app.focus,
+            Focus::Body,
+            "browsing the diff does not change focus"
+        );
     }
 
     #[test]
