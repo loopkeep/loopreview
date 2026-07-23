@@ -222,6 +222,21 @@ pub(crate) fn plan_inline_comments(threads: &[Thread]) -> Vec<PlannedComment> {
     planned
 }
 
+/// Whether a review POST would carry something GitHub accepts.
+///
+/// GitHub rejects an empty review — a `COMMENT` (or pending) review with no
+/// inline comments and no summary body 422s ("Review must contain body or
+/// comments"). So a reply-only batch (replies to already-published threads, no
+/// new inline drafts, no summary) must **not** POST a review at all; its replies
+/// are posted individually instead. An `APPROVE` / `REQUEST_CHANGES` review is
+/// meaningful even with an empty body, so those always warrant the POST.
+pub fn review_post_carries_content(event: ReviewEvent, body: &str, threads: &[Thread]) -> bool {
+    let has_inline = !plan_inline_comments(threads).is_empty();
+    let has_summary = !body.trim().is_empty();
+    let is_verdict = matches!(event, ReviewEvent::Approve | ReviewEvent::RequestChanges);
+    has_inline || has_summary || is_verdict
+}
+
 /// A draft reply to post against an already-published thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedReply {
@@ -532,6 +547,58 @@ mod tests {
         assert_eq!(planned[0].input.start_line, None);
         assert_eq!(planned[0].input.start_side, None);
         assert_eq!(planned[1].input.side, "LEFT");
+    }
+
+    #[test]
+    fn an_empty_review_is_not_posted() {
+        // Reply-only: a published inline root with a draft reply, no new inline
+        // drafts, no summary. A COMMENT review here would be empty and 422 — so it
+        // must not be posted; the reply is sent on its own.
+        let reply_only = Thread {
+            id: "t1".to_string(),
+            anchor: Anchor::Line {
+                file: "a.rs".to_string(),
+                side: Side::New,
+                start: 7,
+                end: 7,
+                commit: None,
+                context: Vec::new(),
+            },
+            state: ThreadState::Open,
+            comments: vec![
+                published_comment("c1", "500", "root"),
+                draft_comment("c2", "reply"),
+            ],
+        };
+        let one = std::slice::from_ref(&reply_only);
+        assert!(
+            !review_post_carries_content(ReviewEvent::Comment, "", one),
+            "a reply-only COMMENT batch posts no review"
+        );
+        assert!(
+            !review_post_carries_content(ReviewEvent::Pending, "  ", one),
+            "nor a blank-summary pending one"
+        );
+        // A summary body warrants the review POST.
+        assert!(review_post_carries_content(
+            ReviewEvent::Comment,
+            "overall LGTM",
+            one
+        ));
+        // A new inline draft warrants it.
+        let new_draft = line_thread("t2", Side::New, 3, draft_comment("c3", "new"));
+        assert!(review_post_carries_content(
+            ReviewEvent::Comment,
+            "",
+            std::slice::from_ref(&new_draft)
+        ));
+        // A verdict is meaningful with an empty body and no comments.
+        assert!(review_post_carries_content(ReviewEvent::Approve, "", one));
+        assert!(review_post_carries_content(
+            ReviewEvent::RequestChanges,
+            "",
+            &[]
+        ));
     }
 
     #[test]

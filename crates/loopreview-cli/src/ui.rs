@@ -1212,7 +1212,10 @@ impl App {
             "Submitting review",
             Box::new(move |progress| {
                 progress("submitting review…");
-                Ok(JobOutcome::Submitted(pr.submit(event, &body, &threads)?))
+                let submitted = pr
+                    .submit(event, &body, &threads)
+                    .map_err(friendly_github_write_error)?;
+                Ok(JobOutcome::Submitted(submitted))
             }),
         );
     }
@@ -7005,6 +7008,12 @@ fn one_line_excerpt(body: &str, max: usize) -> String {
 /// comment isn't the viewer's own, or `gh` auth has lapsed.
 fn friendly_github_write_error(reason: String) -> String {
     let low = reason.to_lowercase();
+    // GitHub allows only one pending review per pull request; a leftover one
+    // makes a fresh comment/reply POST 422. Point at the fix (it lives on GitHub).
+    if low.contains("pending") && low.contains("review") {
+        return "a pending review already exists on GitHub — submit or discard it there first"
+            .to_string();
+    }
     if low.contains("403")
         || low.contains("forbidden")
         || low.contains("404")
@@ -8796,6 +8805,13 @@ mod tests {
                 .contains("check the comment is yours")
         );
         assert!(friendly_github_write_error("gh: Not Found (HTTP 404)".into()).contains("auth"));
+        assert!(
+            friendly_github_write_error(
+                "HTTP 422: A pending review already exists (create a review)".into()
+            )
+            .contains("pending review already exists"),
+            "a pending-review 422 gets a pointed explanation"
+        );
         assert_eq!(
             friendly_github_write_error("network down".into()),
             "network down",

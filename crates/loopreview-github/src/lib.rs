@@ -285,6 +285,16 @@ impl GithubClient {
         body: &str,
         threads: &[Thread],
     ) -> Result<SubmitOutcome, GithubError> {
+        // An empty review (no inline comments, no summary, plain COMMENT/pending)
+        // is not a valid GitHub review — POSTing it 422s, which used to abort a
+        // reply-only submit before its replies were sent. Nothing to submit here:
+        // return an empty outcome and let the caller post the replies.
+        if !push::review_post_carries_content(event, body, threads) {
+            return Ok(SubmitOutcome {
+                review_id: 0,
+                published: Vec::new(),
+            });
+        }
         let planned = push::plan_inline_comments(threads);
         let inputs: Vec<ReviewCommentInput> = planned.iter().map(|p| p.input.clone()).collect();
 
