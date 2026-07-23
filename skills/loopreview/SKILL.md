@@ -121,7 +121,8 @@ lr session comment rm --repo . --comment <id>                     # withdraw a l
 - `comment rm` withdraws one of your own unpublished comments — `--comment <id>`
   removes that comment (and its thread if it empties), `--thread <id>` removes
   the whole thread (exactly one is required). It refuses anything published to
-  GitHub.
+  GitHub. Both `comment rm` and `comment edit` take the id as a **flag**
+  (`--comment` / `--thread`), never as a positional argument.
 
 ## Waiting for the human
 

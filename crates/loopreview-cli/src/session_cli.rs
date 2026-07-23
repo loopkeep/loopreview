@@ -448,12 +448,22 @@ fn emit<T: Serialize>(value: &T) -> Result<()> {
 
 /// Print a review summary (files and threads).
 fn print_review(info: &protocol::ReviewInfo) {
-    println!("{}", info.source);
+    print!("{}", review_text(info));
+}
+
+/// Render a review as text: the source, a file summary, each file's hunks when
+/// the patch was requested (a diff — the `@@` header then `+`/`-`/space-prefixed
+/// lines), then the thread list. Pure over its input, so the output is testable.
+fn review_text(info: &protocol::ReviewInfo) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "{}", info.source);
     let (added, removed): (u32, u32) = info
         .files
         .iter()
         .fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
-    println!(
+    let _ = writeln!(
+        out,
         "{} file{} changed, +{added} -{removed}",
         info.files.len(),
         plural(info.files.len())
@@ -465,21 +475,45 @@ fn print_review(info: &protocol::ReviewInfo) {
             .map(|old| format!(" (from {old})"))
             .unwrap_or_default();
         let binary = if file.binary { " [binary]" } else { "" };
-        println!(
+        let _ = writeln!(
+            out,
             "  {:8} {}{rename}{binary}  +{} -{}",
             file.status, file.path, file.added, file.removed
         );
+        // With --patch each hunk carries its lines; print them as a diff. Without
+        // --patch `lines` is `None`, so this is skipped (a summary-only view).
+        for hunk in &file.hunks {
+            let Some(lines) = &hunk.lines else {
+                continue;
+            };
+            let section = hunk
+                .section
+                .as_deref()
+                .map(|s| format!(" {s}"))
+                .unwrap_or_default();
+            let _ = writeln!(out, "    {}{section}", hunk.header);
+            for line in lines {
+                let sign = match line.kind.as_str() {
+                    "addition" => '+',
+                    "deletion" => '-',
+                    _ => ' ',
+                };
+                let _ = writeln!(out, "    {sign}{}", line.text);
+            }
+        }
     }
     if !info.threads.is_empty() {
-        println!(
+        let _ = writeln!(
+            out,
             "{} thread{}:",
             info.threads.len(),
             plural(info.threads.len())
         );
         for thread in &info.threads {
-            println!("{}", thread_line(thread));
+            let _ = writeln!(out, "{}", thread_line(thread));
         }
     }
+    out
 }
 
 /// A one-line summary of a thread.
@@ -541,5 +575,80 @@ fn event_kind(event: WaitEvent) -> EventKind {
         WaitEvent::Resolve => EventKind::Resolve,
         WaitEvent::Submit => EventKind::Submit,
         WaitEvent::Reload => EventKind::Reload,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loopreview_control::protocol::{FileInfo, HunkInfo, LineInfo, ReviewInfo};
+
+    fn one_file_review(with_patch: bool) -> ReviewInfo {
+        ReviewInfo {
+            source: "working tree".into(),
+            base: None,
+            head: None,
+            files: vec![FileInfo {
+                path: "a.rs".into(),
+                old_path: None,
+                status: "modified".into(),
+                binary: false,
+                added: 1,
+                removed: 1,
+                hunks: vec![HunkInfo {
+                    header: "@@ -1,2 +1,2 @@".into(),
+                    old_start: 1,
+                    old_lines: 2,
+                    new_start: 1,
+                    new_lines: 2,
+                    section: Some("fn main".into()),
+                    lines: with_patch.then(|| {
+                        vec![
+                            LineInfo {
+                                kind: "context".into(),
+                                old: Some(1),
+                                new: Some(1),
+                                text: "keep".into(),
+                            },
+                            LineInfo {
+                                kind: "deletion".into(),
+                                old: Some(2),
+                                new: None,
+                                text: "old".into(),
+                            },
+                            LineInfo {
+                                kind: "addition".into(),
+                                old: None,
+                                new: Some(2),
+                                text: "new".into(),
+                            },
+                        ]
+                    }),
+                }],
+            }],
+            threads: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn review_text_prints_hunk_lines_only_with_the_patch() {
+        // Without --patch: file summary only, no hunk header or diff lines.
+        let plain = review_text(&one_file_review(false));
+        assert!(plain.contains("a.rs"), "the file summary is always shown");
+        assert!(
+            !plain.contains("@@"),
+            "no hunk header without --patch:\n{plain}"
+        );
+        assert!(!plain.contains("+new"), "no diff lines without --patch");
+
+        // With --patch: the hunk header (+ section) and +/-/space lines appear.
+        let patched = review_text(&one_file_review(true));
+        assert!(
+            patched.contains("@@ -1,2 +1,2 @@ fn main"),
+            "hunk header with its section:\n{patched}"
+        );
+        assert!(patched.contains(" keep"), "a context line, space-prefixed");
+        assert!(patched.contains("-old"), "a deletion line, `-`-prefixed");
+        assert!(patched.contains("+new"), "an addition line, `+`-prefixed");
     }
 }
