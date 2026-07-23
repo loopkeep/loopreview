@@ -98,8 +98,10 @@ lr show               # review the last commit's own changes (like git show)
 lr show HEAD~2        # review a specific commit
 lr patch fix.patch    # review a saved patch...
 git diff | lr         # ...or one piped in
-lr pr 123             # review GitHub pull request #123 in the TUI
-lr pr "#123"          # quote #N — a bare # is a shell comment
+lr 123                # review GitHub pull request #123 in the TUI
+lr "#123"             # quote #N — a bare # is a shell comment
+lr owner/repo#123     # a PR in another repo (or paste its URL)
+lr --detect           # the pull request for the current branch
 ```
 
 `lr show [target]` reviews a single commit's own changes (default `HEAD`),
@@ -257,9 +259,11 @@ history — you can still read and reply to it.
 
 ### Pull requests
 
-`lr pr <number | url | owner/repo#n | #n>` (or `lr pr --detect` for the current
+A bare `lr <number | url | owner/repo#n | #n>` (or `lr --detect` for the current
 branch) opens a pull request in the same TUI, fetching the diff and existing
-review threads without touching your working tree. Your comments and replies are
+review threads without touching your working tree. There is no `pr` subcommand —
+a GitHub reference is the entry point (quote `#N`, since most shells treat a bare
+`#` as a comment). Your comments and replies are
 kept as **drafts** (a `[draft]` badge) — they persist across sessions — until you
 submit. `Ctrl-S` opens the submit modal, which lists what will be sent and by
 whom (flagging any draft not authored by you, since it goes out under your
@@ -335,8 +339,8 @@ example is
 [`herdr-plugin-loopreview`](https://github.com/loopkeep/herdr-plugin-loopreview),
 a plugin for [herdr](https://herdr.dev) (a terminal multiplexer for coding
 agents): a single popup lists the repository's git worktrees and open GitHub pull
-requests, and picking one opens its diff with `lr` (or `lr pr <ref>`) in a pane
-the plugin reuses — swapping that one pane between targets instead of spawning
+requests, and picking one opens its diff with `lr` (or `lr <ref>` for a PR) in a
+pane the plugin reuses — swapping that one pane between targets instead of spawning
 more — and it cleans up throwaway agent worktrees safely. Install it with herdr:
 
 ```sh
@@ -397,8 +401,8 @@ loopreview keeps a deliberately small footprint at runtime:
 - **`git`** — the only requirement for reviewing diffs (worktree, ref, or a
   piped/saved patch). No library binding; loopreview shells out to `git`.
 - **`gh`** — the GitHub CLI, needed only for the pull-request features
-  (`lr pr`, submitting a review, resolving a published thread, and editing your
-  own published comments). Install it and run `gh auth login`; loopreview never
+  (opening a PR with `lr <ref>`, submitting a review, resolving a published
+  thread, and editing your own published comments). Install it and run `gh auth login`; loopreview never
   handles a token itself. Local reviews need none of this — every local-review
   feature works with `git` alone.
 

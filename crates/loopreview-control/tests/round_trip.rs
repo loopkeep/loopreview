@@ -32,6 +32,7 @@ fn serve_one(socket: String, session_id: String) {
                 pid: std::process::id(),
                 repo: Some("/repo".into()),
                 source: "working tree".into(),
+                subject: None,
             })))
             .expect("write reply");
         }

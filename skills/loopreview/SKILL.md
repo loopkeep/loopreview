@@ -6,28 +6,30 @@ description: Read and steer a live loopreview diff-review session over its contr
 # loopreview session control
 
 loopreview (`lr`) is an interactive terminal diff reviewer. **The TUI belongs to
-the human** — do not run `lr`, `lr diff`, `lr pr`, or other UI commands yourself.
-Instead use `lr session *` to inspect and steer the review the human already has
-open, through its local socket.
+the human** — do not run `lr`, `lr diff`, `lr <pr-ref>`, or other UI commands
+yourself. Instead use `lr session *` to inspect and steer the review the human
+already has open, through its local socket.
 
 Each running `lr` hosts its own socket and registers itself; there is no daemon.
 If no session is live, ask the human to open one (`lr` in their repository, or
-`lr pr <n>` for a pull request).
+`lr <ref>` — a number, `#N`, `owner/repo#N`, or a URL — for a pull request).
 
 ## Golden workflow
 
 ```text
 1. lr session list                      # find live sessions
-2. lr session review --json             # understand the diff structure + threads
-3. lr session review --patch --json     # read the actual lines for a closer look
-4. lr session navigate --file F --line N  # steer the human's view to what matters
-5. lr session comment add ...           # leave one focused local note (--draft to queue for GitHub)
-6. lr session wait --for reply          # block until the human answers, then continue
+2. lr session get --json                # on a PR, read subject.title/body — the change's intent
+3. lr session review --json             # understand the diff structure + threads
+4. lr session review --patch --json     # read the actual lines for a closer look
+5. lr session navigate --file F --line N  # steer the human's view to what matters
+6. lr session comment add ...           # leave one focused local note (--draft to queue for GitHub)
+7. lr session wait --for reply          # block until the human answers, then continue
 ```
 
-Read structure first (`review --json`), pull the patch text only for the files
-you truly need, navigate before you comment so the human sees what you mean, and
-wait on events instead of polling.
+On a pull request, read the `subject` (title + description) first — it is the
+stated intent you judge the diff against. Then read structure (`review --json`),
+pull the patch text only for the files you truly need, navigate before you
+comment so the human sees what you mean, and wait on events instead of polling.
 
 ## Selecting a session
 
@@ -53,6 +55,12 @@ lr session comment list [<id>|--repo .] [--json]
   commit's changes), or `pull request`. When a repo has more than one live
   session (say a worktree review and a `lr show`), match on the source string to
   pick the id you want.
+- On a **pull-request** session, `get` also carries a `subject` object:
+  `{kind: "pr", number, title, status, author, base, head, body, url}` (`status`
+  is lowercase — `draft`/`open`/`merged`/`closed`; `body` is the PR description in
+  markdown). **Read it before you start reviewing** — the title and description
+  are the change's stated intent, the primary context for judging the diff. A
+  plain diff session has no `subject`.
 - `context` reports the human's current view (`files`/`conversation`), the line
   under their cursor, the thread there (if any), and `event_seq` — the latest
   event number, which you pass to `wait --after` to avoid missing events.
@@ -109,6 +117,11 @@ lr session comment rm --repo . --comment <id>                     # withdraw a l
   whole change (an overall verdict or summary, tied to no line) — the two are
   mutually exclusive. Like any agent comment it is local by default; `--draft`
   queues it to submit as a PR comment.
+- Comment `--body` is **markdown**: headings, emphasis, inline/fenced code, lists,
+  block quotes, GitHub alerts (`> [!NOTE]` / `[!TIP]` / `[!IMPORTANT]` /
+  `[!WARNING]` / `[!CAUTION]`), task lists (`- [ ]`), and tables all render.
+  Reach for an alert only where it genuinely earns attention — a real risk or a
+  must-read caveat — not as decoration on ordinary notes.
 - `--draft` queues a comment for the human to submit; without it the comment (or
   reply) is a local note. `--draft` only matters on a pull request. A `--draft`
   **reply** is refused under a local-note root — it could never be sent while the

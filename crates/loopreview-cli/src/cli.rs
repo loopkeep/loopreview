@@ -1,11 +1,13 @@
 //! The command-line surface.
 //!
-//! Bare `lr` is dispatch sugar (a piped patch, otherwise the working tree).
-//! `lr diff` reviews a VCS diff and never reads stdin; `lr patch` reviews a
-//! unified-diff patch from a file or stdin; `lr show [target]` reviews one
-//! commit's own changes. The hidden `daemon` verb stays reserved for a later
-//! milestone so the namespace stays stable (`pr`, `session`, and `update` are
-//! implemented). `--help` / `--version` are handled by clap before the TTY guard.
+//! Bare `lr` is dispatch sugar: a GitHub reference (`lr 123` / `lr owner/repo#N`
+//! / a URL) or `lr --detect` opens a pull request; otherwise a piped patch, else
+//! the working tree. `lr diff` reviews a VCS diff and never reads stdin; `lr
+//! patch` reviews a unified-diff patch from a file or stdin; `lr show [target]`
+//! reviews one commit's own changes. The hidden `daemon` verb stays reserved for
+//! a later milestone so the namespace stays stable (`session` and `update` are
+//! implemented; there is no `pr` verb — a bare reference is the entry point).
+//! `--help` / `--version` are handled by clap before the TTY guard.
 
 use std::path::PathBuf;
 
@@ -51,15 +53,27 @@ pub enum WaitEvent {
 #[command(
     name = "loopreview",
     version,
-    about = "Review a diff in an interactive terminal UI",
+    about = "Review a diff, or a GitHub pull request, in an interactive terminal UI",
     long_about = "loopreview (lr) opens a diff for review in an interactive terminal UI.\n\n\
-        With no subcommand it shows the working tree, or a patch piped in with `git diff | lr`.\n\
-        `lr diff <target>` compares git refs; `lr patch <file>` reviews a saved patch.",
-    disable_help_subcommand = true
+        With no arguments it shows the working tree, or a patch piped in with `git diff | lr`.\n\
+        `lr <ref>` reviews a GitHub pull request — a number (`123`), `#N`, `owner/repo#N`, or a URL \
+        (quote `#N`, since most shells treat a bare `#` as a comment); `lr --detect` opens the \
+        current branch's pull request.\n\
+        `lr diff <target>` compares git refs; `lr patch <file>` reviews a saved patch; \
+        `lr show [commit]` reviews one commit's own changes.",
+    disable_help_subcommand = true,
+    args_conflicts_with_subcommands = true
 )]
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// A GitHub pull request to review: a number (`123`), `#N`, `owner/repo#N`,
+    /// or a URL. Quote `#N` — most shells treat a bare `#` as a comment.
+    #[arg(value_name = "PR")]
+    target: Option<String>,
+    /// Review the pull request for the current branch (no reference needed).
+    #[arg(long)]
+    detect: bool,
     /// Do not auto-refresh a live diff as the working tree changes.
     #[arg(long, global = true)]
     no_watch: bool,
@@ -111,16 +125,6 @@ enum Command {
         /// Limit the diff to these paths (after `--`).
         #[arg(last = true, value_name = "PATHSPEC")]
         pathspec: Vec<String>,
-    },
-    /// Review a GitHub pull request (by number, URL, owner/repo#N, or #N).
-    Pr {
-        /// The pull request: a number (`123`), a URL, `owner/repo#N`, or `#N`.
-        /// Quote `#N` — most shells treat a bare `#` as a comment (`lr pr "#123"`,
-        /// or just `lr pr 123`).
-        query: Option<String>,
-        /// Detect the pull request for the current branch.
-        #[arg(long)]
-        detect: bool,
     },
     /// Inspect and steer a live review session (for agents and scripts).
     Session(SessionArgs),
@@ -387,10 +391,12 @@ pub enum Action {
     PatchFile(PathBuf),
     /// `lr patch`: a patch from standard input.
     PatchStdin,
-    /// `lr pr [query] [--detect]`: review a GitHub pull request.
+    /// A GitHub pull request, from a bare `lr <ref>` or `lr --detect`.
     Pr { query: Option<String>, detect: bool },
     /// A reserved verb that is not implemented yet.
     NotYet(&'static str),
+    /// The arguments don't name anything to review — report `message` and exit.
+    Invalid(String),
 }
 
 /// What the parsed command line dispatches to: the review UI, or a control-plane
@@ -413,6 +419,8 @@ impl Cli {
     pub fn dispatch(self) -> Dispatch {
         let Cli {
             command,
+            target,
+            detect,
             no_watch,
             exclude_untracked,
             mode,
@@ -423,6 +431,8 @@ impl Cli {
             command => Dispatch::Tui(
                 Cli {
                     command,
+                    target,
+                    detect,
                     no_watch,
                     exclude_untracked,
                     mode,
@@ -447,8 +457,38 @@ impl Cli {
 
     /// Resolve the parsed command line into an [`Action`].
     pub fn action(self) -> Action {
-        match self.command {
-            None => Action::Dispatch,
+        let Cli {
+            command,
+            target,
+            detect,
+            ..
+        } = self;
+        match command {
+            // Bare `lr`: a GitHub reference (or `--detect`) opens a pull request;
+            // otherwise dispatch (a piped patch or the working tree) at run time.
+            None => match (detect, target) {
+                (true, Some(_)) => Action::Invalid(
+                    "`--detect` opens the current branch's pull request — drop the reference (or drop `--detect`)"
+                        .to_string(),
+                ),
+                (true, None) => Action::Pr {
+                    query: None,
+                    detect: true,
+                },
+                (false, Some(reference))
+                    if loopreview_github::parse_pr_query(&reference).is_some() =>
+                {
+                    Action::Pr {
+                        query: Some(reference),
+                        detect: false,
+                    }
+                }
+                (false, Some(reference)) => Action::Invalid(format!(
+                    "`{reference}` isn't something to review — pass a pull request (a number, `#N`, \
+                     `owner/repo#N`, or a URL), a git diff (`lr diff {reference}`), or a patch (`lr patch`)"
+                )),
+                (false, None) => Action::Dispatch,
+            },
             Some(Command::Diff {
                 target: Some(target),
                 pathspec,
@@ -461,7 +501,6 @@ impl Cli {
             }) => Action::Worktree { staged, pathspec },
             Some(Command::Patch { file: Some(path) }) => Action::PatchFile(path),
             Some(Command::Patch { file: None }) => Action::PatchStdin,
-            Some(Command::Pr { query, detect }) => Action::Pr { query, detect },
             Some(Command::Show { target, pathspec }) => Action::Show {
                 target: target.unwrap_or_else(|| "HEAD".to_string()),
                 pathspec,
@@ -582,21 +621,59 @@ mod tests {
     }
 
     #[test]
-    fn pr_verb_parses_query_and_detect() {
+    fn a_bare_github_reference_opens_a_pull_request() {
+        for reference in [
+            "123",
+            "#123",
+            "octo/hello#123",
+            "https://github.com/octo/hello/pull/123",
+        ] {
+            assert_eq!(
+                action_of(&["lr", reference]),
+                Action::Pr {
+                    query: Some(reference.to_string()),
+                    detect: false,
+                },
+                "`{reference}` opens a pull request",
+            );
+        }
+    }
+
+    #[test]
+    fn detect_opens_the_current_branch_pr() {
         assert_eq!(
-            action_of(&["lr", "pr", "123"]),
-            Action::Pr {
-                query: Some("123".to_string()),
-                detect: false,
-            }
-        );
-        assert_eq!(
-            action_of(&["lr", "pr", "--detect"]),
+            action_of(&["lr", "--detect"]),
             Action::Pr {
                 query: None,
                 detect: true,
             }
         );
+    }
+
+    #[test]
+    fn detect_and_a_reference_conflict() {
+        assert!(matches!(
+            action_of(&["lr", "--detect", "123"]),
+            Action::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn a_non_reference_positional_is_rejected() {
+        // Not a PR reference and not a subcommand — a helpful error, not a silent
+        // worktree open.
+        assert!(matches!(
+            action_of(&["lr", "foo.patch"]),
+            Action::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn the_pr_verb_is_gone() {
+        // `pr` is no longer a subcommand — bare `lr pr` is a non-reference
+        // positional (rejected), and `lr pr 123` is a clap parse error.
+        assert!(matches!(action_of(&["lr", "pr"]), Action::Invalid(_)));
+        assert!(Cli::try_parse_from(["lr", "pr", "123"]).is_err());
     }
 
     #[test]

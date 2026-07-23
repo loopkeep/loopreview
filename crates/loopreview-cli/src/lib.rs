@@ -65,9 +65,12 @@ fn try_run() -> Result<()> {
         Dispatch::Tui(invocation) => invocation,
     };
 
-    // A reserved verb is a usage error; report it regardless of the terminal.
-    if let Action::NotYet(message) = &action {
-        bail!("{message}");
+    // A reserved verb or an unrecognized argument is a usage error; report it
+    // regardless of the terminal.
+    match &action {
+        Action::NotYet(message) => bail!("{message}"),
+        Action::Invalid(message) => bail!("{message}"),
+        _ => {}
     }
 
     // TTY guard, applied after argument processing: the UI draws to stdout and
@@ -80,8 +83,15 @@ fn try_run() -> Result<()> {
     }
 
     // A pull-request review loads its diff and comments over the network, so it
-    // opens on a spinner and fetches on a background thread.
+    // opens on a spinner and fetches on a background thread. A piped patch and a
+    // pull-request reference don't mix — refuse rather than silently ignore one.
     if let Action::Pr { query, detect } = action {
+        if !io::stdin().is_terminal() {
+            bail!(
+                "a piped patch and a pull-request reference don't mix — drop one (review the patch \
+                 with `lr patch`, or open the pull request without a pipe)."
+            );
+        }
         return run_pr(query, detect, mode);
     }
 
@@ -286,7 +296,9 @@ fn build_source(
         }
         // Handled in try_run before build_source is reached.
         Action::Pr { .. } => unreachable!("pull requests are handled by run_pr"),
-        Action::NotYet(_) => unreachable!("reserved verbs are reported earlier"),
+        Action::NotYet(_) | Action::Invalid(_) => {
+            unreachable!("usage errors are reported earlier")
+        }
     }
 }
 

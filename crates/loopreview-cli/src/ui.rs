@@ -35,7 +35,7 @@ use unicode_width::UnicodeWidthChar;
 use loopreview_control::events::EventLog;
 use loopreview_control::protocol::{
     self, ContextInfo, EventKind, NavigateResult, ReloadResult, Reply, Request, Response,
-    ReviewInfo, SessionInfo,
+    ReviewInfo, SessionInfo, SubjectInfo,
 };
 
 use loopreview_core::{
@@ -4182,7 +4182,30 @@ impl App {
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
             source: self.label.clone(),
+            subject: self.subject_info(),
         }
+    }
+
+    /// The PR facts for `lr session get`, so an agent reads the change's intent
+    /// before reviewing — built from the overview already held (no gh call). A
+    /// plain diff (no PR) has no subject.
+    fn subject_info(&self) -> Option<Box<SubjectInfo>> {
+        let ov = self.pr_overview.as_ref()?;
+        Some(Box::new(SubjectInfo {
+            kind: "pr".to_string(),
+            number: ov.number,
+            title: ov.title.clone(),
+            status: ov.status.label().to_lowercase(),
+            author: ov.author.clone(),
+            base: Some(ov.base_ref.clone()),
+            head: Some(ov.head_ref.clone()),
+            body: ov.body.clone(),
+            url: self
+                .pr
+                .as_deref()
+                .map(|p| p.url().to_string())
+                .unwrap_or_default(),
+        }))
     }
 
     /// The human reviewer's current focus, for `lr session context`.

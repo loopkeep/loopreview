@@ -380,6 +380,7 @@ mod tests {
                         pid: std::process::id(),
                         repo: Some("/repo".into()),
                         source: "working tree".into(),
+                        subject: None,
                     })),
                     _ => Response::Error("unsupported in test".into()),
                 };

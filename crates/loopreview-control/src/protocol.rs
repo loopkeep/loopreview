@@ -225,6 +225,38 @@ pub struct SessionInfo {
     pub repo: Option<String>,
     /// A human-readable description of the diff source.
     pub source: String,
+    /// The pull request (or, in future, issue) under review — absent for a plain
+    /// diff. Optional and skipped when absent, so older clients decode either way.
+    /// Boxed to keep `SessionInfo` (and so the `Response` enum) small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<Box<SubjectInfo>>,
+}
+
+/// The pull request (or issue) a session reviews — its facts and description, so
+/// an agent can read the change's intent before reviewing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubjectInfo {
+    /// `pr` today; `issue` once issue review lands.
+    pub kind: String,
+    /// The pull-request / issue number.
+    pub number: u64,
+    /// The title.
+    pub title: String,
+    /// The lifecycle status, lowercase (machine-readable): a PR is
+    /// `draft` / `open` / `merged` / `closed`; an issue adds `not_planned`.
+    pub status: String,
+    /// The author's login (empty when unknown).
+    pub author: String,
+    /// The base branch — a pull request only; absent for an issue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// The head branch — a pull request only; absent for an issue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    /// The description body (markdown).
+    pub body: String,
+    /// The canonical URL.
+    pub url: String,
 }
 
 /// The human reviewer's current focus.
@@ -559,6 +591,46 @@ mod tests {
     }
 
     #[test]
+    fn session_info_carries_an_optional_subject() {
+        // A PR session's subject round-trips, base/head included.
+        let info = SessionInfo {
+            id: "s".into(),
+            pid: 1,
+            repo: Some("/repo".into()),
+            source: "pull request".into(),
+            subject: Some(Box::new(SubjectInfo {
+                kind: "pr".into(),
+                number: 7,
+                title: "Add the thing".into(),
+                status: "open".into(),
+                author: "octocat".into(),
+                base: Some("main".into()),
+                head: Some("feat".into()),
+                body: "does the thing".into(),
+                url: "https://github.com/o/r/pull/7".into(),
+            })),
+        };
+        assert_eq!(round_trip(&info), info);
+
+        // A legacy reply with no `subject` field still decodes (subject = None).
+        let legacy: SessionInfo =
+            serde_json::from_str(r#"{"id":"s","pid":1,"repo":null,"source":"working tree"}"#)
+                .unwrap();
+        assert!(legacy.subject.is_none());
+
+        // A plain-diff session omits the field entirely on the wire.
+        let plain = SessionInfo {
+            subject: None,
+            ..info
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !json.contains("subject"),
+            "an absent subject is omitted: {json}"
+        );
+    }
+
+    #[test]
     fn responses_round_trip() {
         let ok = Response::Ok(Reply::Wait(WaitResult {
             event: Some(Event {
@@ -609,6 +681,7 @@ mod tests {
                 pid: 1,
                 repo: None,
                 source: "working tree".into(),
+                subject: None,
             }),
             Reply::Context(ContextInfo {
                 view: "files".into(),

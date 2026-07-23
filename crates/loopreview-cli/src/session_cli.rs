@@ -34,6 +34,22 @@ pub fn run(args: SessionArgs) -> Result<()> {
                 println!("  pid:    {}", info.pid);
                 println!("  repo:   {}", info.repo.as_deref().unwrap_or("-"));
                 println!("  source: {}", info.source);
+                if let Some(subject) = &info.subject {
+                    println!(
+                        "  {} #{}: {} [{}] by {}",
+                        subject.kind, subject.number, subject.title, subject.status, subject.author
+                    );
+                    if let (Some(base), Some(head)) = (&subject.base, &subject.head) {
+                        println!("    {base} ← {head}");
+                    }
+                    println!("    {}", subject.url);
+                    if !subject.body.trim().is_empty() {
+                        println!("  ---");
+                        for line in subject.body.lines() {
+                            println!("  {line}");
+                        }
+                    }
+                }
                 Ok(())
             }
         }
