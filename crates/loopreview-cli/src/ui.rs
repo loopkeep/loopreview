@@ -5085,17 +5085,18 @@ impl App {
         }
     }
 
-    /// The footer's key hints: a movement prefix, then the top few actions that
-    /// [`Self::action_available`] reports for the cursor's spot, in priority
-    /// order and capped so the bar stays readable. Submit and `? all` are added
-    /// by the caller.
+    /// The footer's key hints: the top few actions that [`Self::action_available`]
+    /// reports for the cursor's spot, in priority order and capped so the bar
+    /// stays readable. Movement keys (`j`/`k`) are universal and omitted; submit
+    /// and `? all` are added by the caller. In a visual selection the bar is a
+    /// dedicated sub-mode instead.
     fn footer_ops(&self) -> String {
         use Action::*;
         let key = |a: Action| self.keymap.key_for(a).unwrap_or("?").to_string();
         let in_sidebar =
             self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some();
-        // A visual line selection has its own sub-mode: extend the range, comment
-        // or suggest over it, or cancel.
+        // A visual line selection has its own sub-mode: extend the range (a
+        // context-specific move worth naming), comment or suggest over it, cancel.
         if !in_sidebar && self.view == View::Files && self.selection.is_some() {
             let mut parts = vec![
                 format!("{}/{} extend", key(MoveDown), key(MoveUp)),
@@ -5107,27 +5108,21 @@ impl App {
             parts.push("esc cancel".to_string());
             return parts.join(" · ");
         }
-        // j/k steps comments in the Conversation body, files/lines otherwise.
-        let move_label = if !in_sidebar && self.view == View::Conversation {
-            "comment"
-        } else {
-            "move"
-        };
-        let mut parts = vec![format!("{}/{} {move_label}", key(MoveDown), key(MoveUp))];
         // Priority-ordered candidates per context, in "what you'd do next here"
         // order; only the available ones show, capped so the bar stays readable.
         // On a diff line the act-on-this-line trio (comment / suggest / select)
-        // leads; `reply` and `kind` are kept high enough never to be crowded out
-        // when they apply; destructive `del` sits low.
+        // leads. Wherever `reply` applies (the cursor is on a comment/thread), its
+        // siblings `edit` and `delete` rank right behind it, so the three that act
+        // on that comment appear together when they are all yours to run.
         let candidates: &[(Action, &str)] = if in_sidebar {
             &[(NavIn, "open"), (Fold, "fold")]
         } else if self.view == View::Conversation {
             &[
                 (Reply, "reply"),
                 (Edit, "edit"),
+                (Delete, "del"),
                 (ToggleKind, "kind"),
                 (Resolve, "resolve"),
-                (Delete, "del"),
                 (Fold, "fold"),
             ]
         } else {
@@ -5137,13 +5132,14 @@ impl App {
                 (Suggest, "suggest"),
                 (Select, "select"),
                 (Reply, "reply"),
-                (Resolve, "resolve"),
                 (Edit, "edit"),
-                (ToggleKind, "kind"),
                 (Delete, "del"),
+                (ToggleKind, "kind"),
+                (Resolve, "resolve"),
                 (Fold, "fold"),
             ]
         };
+        let mut parts = Vec::new();
         for (action, label) in candidates {
             if parts.len() >= 6 {
                 break;
@@ -10395,6 +10391,39 @@ mod tests {
         assert!(!f.contains("edit"), "not my comment — no edit: {f}");
         assert!(!f.contains("del"), "nor delete: {f}");
         assert!(f.contains("reply"), "but there's a thread to reply to: {f}");
+    }
+
+    #[test]
+    fn footer_omits_the_move_prefix_and_groups_comment_actions() {
+        // Movement keys are universal — the bar no longer spends space naming
+        // them (outside the visual-selection sub-mode's `extend`).
+        let mut app = sample_app();
+        app.mode = Mode::Unified;
+        app.view = View::Files;
+        app.cursor = 1;
+        assert!(
+            !app.footer_ops().contains("j/k"),
+            "no j/k movement prefix: {}",
+            app.footer_ops()
+        );
+
+        // Where `reply` applies (on your own comment), `edit` and `delete` show
+        // alongside it — the freed slot lets the three comment actions group.
+        let mut pr = pr_app(); // viewer "tester"
+        pr.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "mine",
+            CommentKind::Draft,
+        );
+        pr.relayout();
+        pr.view = View::Conversation;
+        pr.conv_cursor = 0;
+        let f = pr.footer_ops();
+        assert!(f.contains("reply"), "reply shows: {f}");
+        assert!(f.contains("edit"), "edit shows alongside it: {f}");
+        assert!(f.contains("del"), "delete shows alongside it: {f}");
+        assert!(!f.contains("j/k"), "and still no movement prefix: {f}");
     }
 
     #[test]
