@@ -836,6 +836,15 @@ struct App {
     pr_overview: Option<SubjectOverview>,
     /// The Overview tab's read-only scroll offset (in rendered lines).
     overview_scroll: usize,
+    /// Session fold overrides for the Overview body's `<details>` (index → open),
+    /// over each block's `open` attribute; not persisted.
+    overview_folds: HashMap<usize, bool>,
+    /// The Overview body's click regions from the last render (links, images,
+    /// `<details>` toggles), for mouse hit-testing.
+    overview_regions: RefCell<Vec<crate::markdown::MdRegion>>,
+    /// The Overview `<details>` effective open state from the last render, so a
+    /// toggle flips the current value.
+    overview_effective: RefCell<HashMap<usize, bool>>,
     /// The store key for the current PR's drafts (`owner/repo#number`).
     pr_key: Option<String>,
     /// The repo directory, for reconstructing outdated lines from history.
@@ -963,6 +972,9 @@ impl App {
             issue: None,
             pr_overview: None,
             overview_scroll: 0,
+            overview_folds: HashMap::new(),
+            overview_regions: RefCell::new(Vec::new()),
+            overview_effective: RefCell::new(HashMap::new()),
             pr_key: None,
             repo_dir,
             source: None,
@@ -5035,6 +5047,15 @@ impl App {
                 // focus, so a diff-line click, drag-select, or comment-action click
                 // pulls focus out of the sidebar (a sidebar click keeps it there).
                 self.focus = Focus::Body;
+                // Overview: a click on a link/image opens it, on a <details>
+                // summary folds it. The body scroll maps a pane row to a line.
+                if self.view == View::Overview {
+                    let line = self.overview_scroll + row;
+                    if let Some(action) = self.overview_action_at(line, col) {
+                        self.run_overview_md_action(action);
+                    }
+                    return;
+                }
                 // Conversation: a thread header toggles its fold (and selects);
                 // a body line just selects.
                 if self.view == View::Conversation {
@@ -5856,8 +5877,21 @@ impl App {
     /// The Overview tab's rendered lines: a small facts block (number + status
     /// badge, title, author, `base ← head`, timestamps) then the markdown body.
     fn overview_lines(&self, width: usize) -> Vec<TextLine<'static>> {
+        self.overview_render(width).lines
+    }
+
+    /// Build the Overview pane: the facts preamble plus the markdown body, with
+    /// its clickable regions (links, images, `<details>` toggles) offset to the
+    /// full line list. Caches the regions and the details' effective fold state
+    /// so a click can be resolved and a toggle can flip the right index.
+    fn overview_render(&self, width: usize) -> crate::markdown::Rendered {
         let Some(ov) = &self.pr_overview else {
-            return vec![TextLine::from("")];
+            self.overview_regions.replace(Vec::new());
+            self.overview_effective.replace(HashMap::new());
+            return crate::markdown::Rendered {
+                lines: vec![TextLine::from("")],
+                regions: Vec::new(),
+            };
         };
         let mut lines: Vec<TextLine<'static>> = Vec::new();
         // #N + the lifecycle badge.
@@ -5915,22 +5949,77 @@ impl App {
                 "No description provided.",
                 Style::default().fg(Color::DarkGray),
             )));
-        } else {
-            lines.extend(crate::markdown::render(
-                &ov.body,
-                Some(width.max(1)),
-                &self.highlighter,
-            ));
+            self.overview_regions.replace(Vec::new());
+            self.overview_effective.replace(HashMap::new());
+            return crate::markdown::Rendered {
+                lines,
+                regions: Vec::new(),
+            };
         }
-        lines
+        // Render the body interactively: fold state comes from `overview_folds`
+        // (an override over each `<details>`'s `open` attribute), and the effective
+        // state per index is recorded so a toggle flips the current value.
+        let effective = RefCell::new(HashMap::new());
+        let is_open = |index: usize, default: bool| {
+            let open = self.overview_folds.get(&index).copied().unwrap_or(default);
+            effective.borrow_mut().insert(index, open);
+            open
+        };
+        let mut body =
+            crate::markdown::render_rich(&ov.body, Some(width.max(1)), &self.highlighter, &is_open);
+        let preamble = lines.len();
+        for region in &mut body.regions {
+            region.line += preamble;
+        }
+        lines.extend(body.lines);
+        self.overview_effective.replace(effective.into_inner());
+        self.overview_regions.replace(body.regions.clone());
+        crate::markdown::Rendered {
+            lines,
+            regions: body.regions,
+        }
     }
 
     fn draw_overview(&self, f: &mut Frame, area: Rect) {
-        let lines = self.overview_lines(area.width as usize);
+        // overview_render caches the click regions for mouse_down as it builds.
+        let lines = self.overview_render(area.width as usize).lines;
         let height = area.height as usize;
         let start = self.overview_scroll.min(lines.len().saturating_sub(1));
         let end = (start + height).min(lines.len());
         f.render_widget(Paragraph::new(lines[start..end].to_vec()), area);
+    }
+
+    /// The click action at absolute Overview line `line`, column `col` (pane
+    /// coordinates), from the regions cached by the last render.
+    fn overview_action_at(&self, line: usize, col: u16) -> Option<crate::markdown::MdAction> {
+        self.overview_regions
+            .borrow()
+            .iter()
+            .find(|r| r.line == line && col >= r.start && col < r.end)
+            .map(|r| r.action.clone())
+    }
+
+    /// Run a markdown click action: open a URL, or toggle a `<details>` fold in
+    /// the Overview (re-clamping the scroll to the new, folded height).
+    fn run_overview_md_action(&mut self, action: crate::markdown::MdAction) {
+        match action {
+            crate::markdown::MdAction::Open(url) => {
+                self.status = Some(match crate::opener::open_url(&url) {
+                    Ok(()) => format!("opened {url}"),
+                    Err(_) => format!("open it yourself: {url}"),
+                });
+            }
+            crate::markdown::MdAction::ToggleDetails(index) => {
+                let current = self
+                    .overview_effective
+                    .borrow()
+                    .get(&index)
+                    .copied()
+                    .unwrap_or(false);
+                self.overview_folds.insert(index, !current);
+                self.overview_scroll = self.overview_scroll.min(self.overview_max_scroll());
+            }
+        }
     }
 
     fn draw_conversation(&self, f: &mut Frame, area: Rect) {
@@ -13874,6 +13963,91 @@ mod tests {
             );
             x += 1; // the separator space
         }
+    }
+
+    /// The plain text of a rendered markdown line list.
+    fn md_text(r: &crate::markdown::Rendered) -> String {
+        r.lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn an_overview_link_click_opens_it() {
+        let mut app = issue_app();
+        if let Some(ov) = app.pr_overview.as_mut() {
+            ov.body = "See https://example.com/xyz here".into();
+        }
+        let rendered = app.overview_render(60);
+        let link = rendered
+            .regions
+            .iter()
+            .find(|r| matches!(&r.action, crate::markdown::MdAction::Open(u) if u.contains("xyz")))
+            .expect("a link region in the overview body");
+        // Resolve the click through the cached regions and run it.
+        let action = app
+            .overview_action_at(link.line, link.start)
+            .expect("the region is hit at its own coordinates");
+        app.run_overview_md_action(action);
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("example.com/xyz"),
+            "the status names the opened url: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn an_overview_details_click_toggles_the_fold() {
+        let mut app = issue_app();
+        if let Some(ov) = app.pr_overview.as_mut() {
+            ov.body = "<details>\n<summary>More</summary>\n\nhidden body\n\n</details>".into();
+        }
+        // Closed by default: the summary shows with a toggle, the body is hidden.
+        let rendered = app.overview_render(60);
+        let toggle = rendered
+            .regions
+            .iter()
+            .find(|r| r.action == crate::markdown::MdAction::ToggleDetails(0))
+            .expect("a details toggle region");
+        let closed = md_text(&rendered);
+        assert!(
+            closed.contains("▸ More") && !closed.contains("hidden body"),
+            "folded by default: {closed:?}"
+        );
+        // Clicking the summary flips the fold; a re-render shows the body.
+        let action = app
+            .overview_action_at(toggle.line, toggle.start)
+            .expect("the toggle is hit");
+        app.run_overview_md_action(action);
+        assert_eq!(app.overview_folds.get(&0), Some(&true), "now open");
+        let opened = md_text(&app.overview_render(60));
+        assert!(
+            opened.contains("▾ More") && opened.contains("hidden body"),
+            "the body shows after unfolding: {opened:?}"
+        );
+    }
+
+    #[test]
+    fn an_overview_click_off_any_region_is_a_noop() {
+        // A plain-text body has no regions, so a content click resolves to nothing
+        // (and never touches diff/conversation state).
+        let mut app = issue_app();
+        if let Some(ov) = app.pr_overview.as_mut() {
+            ov.body = "just plain text".into();
+        }
+        let _ = app.overview_render(60);
+        assert!(app.overview_action_at(0, 0).is_none());
+        assert!(app.overview_action_at(99, 99).is_none());
     }
 
     /// Empirical: render, read the buffer to find the screen row of a known

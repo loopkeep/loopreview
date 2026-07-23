@@ -3,10 +3,15 @@
 //! Parses with `pulldown-cmark` and paints to ratatui lines: headings (a visual
 //! hierarchy, no raw `#`), emphasis, inline and fenced code (syntax-highlighted
 //! via [`Highlighter`]), lists, block quotes, GitHub alerts (`> [!NOTE]` …), task
-//! lists, GFM tables, thematic breaks, and footnotes. In wrap mode (the
-//! Conversation and Overview panes) paragraphs word-wrap and top-level blocks are
-//! separated by a blank line, matching how GitHub renders the same text; in
-//! no-wrap mode (tight inline display) each block stays on one clipped line.
+//! lists, GFM tables, thematic breaks, footnotes, images, and `<details>` folds.
+//! In wrap mode (the Conversation and Overview panes) paragraphs word-wrap and
+//! top-level blocks are separated by a blank line, matching how GitHub renders
+//! the same text; in no-wrap mode (tight inline display) each block stays on one
+//! clipped line.
+//!
+//! [`render_rich`] also returns [`MdRegion`]s — the columns of links, images, and
+//! `<details>` summaries — so the UI can open a URL or fold a section on click.
+//! [`render`] is the plain lines-only wrapper (details always expanded).
 
 use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
@@ -19,34 +24,99 @@ use crate::palette;
 
 use crate::highlight::Highlighter;
 
-/// The sentinel span marking a forced in-paragraph line break (a soft/hard break
-/// or a `<br>`). A lone newline never appears inside a normal inline span, so it
-/// is safe to recognize by content.
+/// The action a rendered [`MdRegion`] triggers when clicked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MdAction {
+    /// Open a URL (a link, autolink, or image) in the browser.
+    Open(String),
+    /// Fold or unfold the nth `<details>` in this render (0-based).
+    ToggleDetails(usize),
+}
+
+/// A clickable region on a rendered line: columns `[start, end)` carry `action`.
+/// Columns are display cells from the line's left edge (prefixes included).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MdRegion {
+    /// Index into [`Rendered::lines`].
+    pub line: usize,
+    /// Inclusive start column.
+    pub start: u16,
+    /// Exclusive end column.
+    pub end: u16,
+    /// What a click here does.
+    pub action: MdAction,
+}
+
+/// A rich render: styled lines plus the clickable regions over them.
+pub struct Rendered {
+    pub lines: Vec<TextLine<'static>>,
+    pub regions: Vec<MdRegion>,
+}
+
+/// The sentinel marking a forced in-paragraph line break (a soft/hard break or a
+/// `<br>`). A lone newline never appears inside a normal inline span.
 const BREAK: &str = "\n";
 
-fn break_span() -> TextSpan<'static> {
-    TextSpan::raw(BREAK)
+/// A styled span plus an optional click action, carried through wrapping so the
+/// final positions of links/images can be reported as regions.
+#[derive(Clone)]
+struct Piece {
+    span: TextSpan<'static>,
+    action: Option<MdAction>,
 }
 
-fn is_break(span: &TextSpan<'_>) -> bool {
-    span.content.as_ref() == BREAK
+impl Piece {
+    fn plain(span: TextSpan<'static>) -> Piece {
+        Piece { span, action: None }
+    }
+    fn is_break(&self) -> bool {
+        self.span.content.as_ref() == BREAK
+    }
 }
 
-/// A wrap unit: a run of non-space text that may cross several styles. Kept
-/// together with no fabricated space at a style boundary.
-type Word = Vec<(String, Style)>;
+fn break_piece() -> Piece {
+    Piece::plain(TextSpan::raw(BREAK))
+}
 
-/// Render markdown `text` to styled lines. `wrap` is the wrap width, or `None`
-/// to keep each block on one (clipped) line.
+/// A wrap run: `(text, style, action)`. A word is a run sequence with no space.
+type Run = (String, Style, Option<MdAction>);
+type Word = Vec<Run>;
+
+/// A `<details>` fold context on the stack.
+struct DetailsFrame {
+    /// The 0-based index of this `<details>` in the render (its toggle key).
+    index: usize,
+    /// Whether it is expanded (its body shows).
+    open: bool,
+    /// Whether a `<summary>` has been seen (a summary-less details never hides).
+    has_summary: bool,
+}
+
+/// Render markdown `text` to styled lines (details always expanded). `wrap` is
+/// the wrap width, or `None` to keep each block on one (clipped) line.
 pub fn render(
     text: &str,
     wrap: Option<usize>,
     highlighter: &Highlighter,
 ) -> Vec<TextLine<'static>> {
+    render_rich(text, wrap, highlighter, &|_, _| true).lines
+}
+
+/// Render markdown with interactivity. `is_open(index, default_open)` decides
+/// whether the nth `<details>` is expanded — `default_open` is its `open`
+/// attribute, which the caller may override with session fold state.
+pub fn render_rich(
+    text: &str,
+    wrap: Option<usize>,
+    highlighter: &Highlighter,
+    is_open: &dyn Fn(usize, bool) -> bool,
+) -> Rendered {
     let mut renderer = Renderer {
         wrap,
         highlighter,
+        is_open,
         out: Vec::new(),
+        regions: Vec::new(),
         spans: Vec::new(),
         style: Style::default(),
         list: Vec::new(),
@@ -56,11 +126,11 @@ pub fn render(
         link: None,
         image: None,
         table: None,
+        details: Vec::new(),
+        details_count: 0,
         started: false,
         fresh: false,
     };
-    // GFM adds alert blockquotes (`> [!NOTE]`); tables and task lists are the
-    // other GFM constructs a PR body leans on. Footnotes appear in issue bodies.
     let options = Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_GFM
         | Options::ENABLE_TABLES
@@ -89,9 +159,11 @@ struct TableBuild {
 struct Renderer<'a> {
     wrap: Option<usize>,
     highlighter: &'a Highlighter,
+    is_open: &'a dyn Fn(usize, bool) -> bool,
     out: Vec<TextLine<'static>>,
-    /// Inline spans accumulating for the current block (or table cell).
-    spans: Vec<TextSpan<'static>>,
+    regions: Vec<MdRegion>,
+    /// Inline pieces accumulating for the current block (or table cell).
+    spans: Vec<Piece>,
     /// The active inline style (emphasis/strong/strikethrough).
     style: Style,
     list: Vec<List>,
@@ -107,6 +179,10 @@ struct Renderer<'a> {
     image: Option<(String, String)>,
     /// A table being built, while inside one.
     table: Option<TableBuild>,
+    /// The open `<details>` frames.
+    details: Vec<DetailsFrame>,
+    /// How many `<details>` have been seen (the next one's index).
+    details_count: usize,
     /// Whether any block has been emitted yet (so the first gets no leading gap).
     started: bool,
     /// Whether the next block is the first inside a freshly-entered list or
@@ -129,31 +205,25 @@ impl Renderer<'_> {
                 }
             }
             Event::Code(code) => {
-                self.spans.push(TextSpan::styled(
-                    code.into_string(),
-                    self.style.fg(palette::CODE_FG).bg(palette::CODE_INLINE_BG),
-                ));
+                let style = self.style.fg(palette::CODE_FG).bg(palette::CODE_INLINE_BG);
+                self.spans
+                    .push(Piece::plain(TextSpan::styled(code.into_string(), style)));
             }
             // A `- [ ]` / `- [x]` marker: remembered so the item's bullet becomes
             // a checkbox (rather than adding a second glyph beside the bullet).
             Event::TaskListMarker(checked) => self.task = Some(checked),
             // GitHub renders a single newline in a comment/issue body as a line
-            // break, so both soft and hard breaks become real breaks here — the
-            // same text must not read differently on github.com and in lr.
-            Event::SoftBreak | Event::HardBreak => self.spans.push(break_span()),
-            // Raw HTML: recognize `<br>` (a break), `<img>` (an image
-            // placeholder), and `<summary>` (a details title); every other tag is
-            // dropped — its inner text still arrives as separate Text events, so
-            // content is kept and markup stripped.
+            // break, so both soft and hard breaks become real breaks here.
+            Event::SoftBreak | Event::HardBreak => self.spans.push(break_piece()),
+            // Raw HTML: `<br>` (a break), `<img>` (an image placeholder),
+            // `<details>`/`<summary>` (a fold); everything else is dropped — its
+            // inner text still arrives as Text events, so content is kept.
             Event::Html(html) | Event::InlineHtml(html) => self.html(&html),
             Event::Rule => self.rule(),
-            // A footnote reference renders as a compact `[label]` marker; the
-            // definition is emitted as its own block (see FootnoteDefinition).
             Event::FootnoteReference(label) => {
-                self.spans.push(TextSpan::styled(
-                    format!("[{label}]"),
-                    self.style.fg(palette::LINK_FG),
-                ));
+                let style = self.style.fg(palette::LINK_FG);
+                self.spans
+                    .push(Piece::plain(TextSpan::styled(format!("[{label}]"), style)));
             }
             _ => {}
         }
@@ -171,8 +241,6 @@ impl Renderer<'_> {
                 self.image = Some((dest_url.into_string(), String::new()))
             }
             Tag::List(start) => {
-                // Flush an enclosing item's pending inline text before its nested
-                // list, so the two don't run together on one line.
                 self.flush_block();
                 self.open_block();
                 self.list.push(List { next: start });
@@ -224,15 +292,13 @@ impl Renderer<'_> {
                 }
             }
             Tag::TableCell => self.spans.clear(),
-            // A footnote definition renders as a block led by its `[label]`.
             Tag::FootnoteDefinition(label) => {
                 self.open_block();
-                self.spans.push(TextSpan::styled(
-                    format!("[{label}] "),
-                    Style::default()
-                        .fg(palette::LINK_FG)
-                        .add_modifier(Modifier::BOLD),
-                ));
+                let style = Style::default()
+                    .fg(palette::LINK_FG)
+                    .add_modifier(Modifier::BOLD);
+                self.spans
+                    .push(Piece::plain(TextSpan::styled(format!("[{label}] "), style)));
                 self.fresh = true;
             }
             _ => {}
@@ -246,10 +312,14 @@ impl Renderer<'_> {
             TagEnd::Strikethrough => self.style = self.style.remove_modifier(Modifier::CROSSED_OUT),
             TagEnd::Link => {
                 if let Some(url) = self.link.take() {
-                    self.spans.push(TextSpan::styled(
-                        format!(" ({url})"),
-                        self.style.fg(palette::LINK_FG),
-                    ));
+                    // The "(url)" tail is the clickable part of a markdown link.
+                    self.spans.push(Piece {
+                        span: TextSpan::styled(
+                            format!(" ({url})"),
+                            self.style.fg(palette::LINK_FG),
+                        ),
+                        action: Some(MdAction::Open(url)),
+                    });
                 }
             }
             TagEnd::Image => {
@@ -259,14 +329,13 @@ impl Renderer<'_> {
             }
             TagEnd::Paragraph => self.flush_block(),
             TagEnd::Heading(level) => {
-                // No raw `#`: a visual hierarchy by level, like GitHub.
                 let (color, bold) = heading_style(level);
-                for span in &mut self.spans {
+                for piece in &mut self.spans {
                     if bold {
-                        span.style = span.style.add_modifier(Modifier::BOLD);
+                        piece.span.style = piece.span.style.add_modifier(Modifier::BOLD);
                     }
                     if let Some(color) = color {
-                        span.style = span.style.fg(color);
+                        piece.span.style = piece.span.style.fg(color);
                     }
                 }
                 self.flush_block();
@@ -281,7 +350,11 @@ impl Renderer<'_> {
             TagEnd::CodeBlock => self.flush_code(),
             TagEnd::FootnoteDefinition => self.flush_block(),
             TagEnd::TableCell => {
-                let cell = std::mem::take(&mut self.spans);
+                // Tables render without click regions; drop the pieces' actions.
+                let cell = std::mem::take(&mut self.spans)
+                    .into_iter()
+                    .map(|p| p.span)
+                    .collect();
                 if let Some(t) = &mut self.table {
                     t.row.push(cell);
                 }
@@ -305,58 +378,74 @@ impl Renderer<'_> {
         }
     }
 
-    /// Push a run of text, styling any bare `http(s)://` URL as a link (GitHub
-    /// autolinks these). Skipped inside a markdown link label, which is already a
-    /// link. The URL destination is kept on the span for a later click.
+    /// Push a run of text, autolinking bare `http(s)://` URLs (GitHub does).
+    /// Skipped inside a markdown link label, already a link.
     fn push_text(&mut self, text: &str) {
         if self.link.is_some() {
             self.spans
-                .push(TextSpan::styled(text.to_string(), self.style));
+                .push(Piece::plain(TextSpan::styled(text.to_string(), self.style)));
             return;
         }
         let mut rest = text;
         while let Some((pre, url, tail)) = next_url(rest) {
             if !pre.is_empty() {
                 self.spans
-                    .push(TextSpan::styled(pre.to_string(), self.style));
+                    .push(Piece::plain(TextSpan::styled(pre.to_string(), self.style)));
             }
-            self.spans.push(TextSpan::styled(
-                url.to_string(),
-                self.style
-                    .fg(palette::LINK_FG)
-                    .add_modifier(Modifier::UNDERLINED),
-            ));
+            self.spans.push(Piece {
+                span: TextSpan::styled(
+                    url.to_string(),
+                    self.style
+                        .fg(palette::LINK_FG)
+                        .add_modifier(Modifier::UNDERLINED),
+                ),
+                action: Some(MdAction::Open(url.to_string())),
+            });
             rest = tail;
         }
         if !rest.is_empty() {
             self.spans
-                .push(TextSpan::styled(rest.to_string(), self.style));
+                .push(Piece::plain(TextSpan::styled(rest.to_string(), self.style)));
         }
     }
 
-    /// Emit an image as an inline `[Image]` / `[Image: alt]` placeholder (a link,
-    /// so it reads as "there is an image here" and can later open its URL).
-    fn push_image(&mut self, _url: &str, alt: &str) {
+    /// Emit an image as an inline `[Image]` / `[Image: alt]` link placeholder.
+    fn push_image(&mut self, url: &str, alt: &str) {
         let alt = alt.trim();
         let label = if alt.is_empty() {
             "[Image]".to_string()
         } else {
             format!("[Image: {alt}]")
         };
-        self.spans.push(TextSpan::styled(
-            label,
-            self.style
-                .fg(palette::LINK_FG)
-                .add_modifier(Modifier::UNDERLINED),
-        ));
+        self.spans.push(Piece {
+            span: TextSpan::styled(
+                label,
+                self.style
+                    .fg(palette::LINK_FG)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+            action: (!url.is_empty()).then(|| MdAction::Open(url.to_string())),
+        });
     }
 
-    /// Handle a raw-HTML fragment: `<br>` (a break), `<img>` (an image
-    /// placeholder), `<summary>` (a details title header). Anything else is
-    /// dropped — inner text still arrives as separate Text events.
+    /// Handle a raw-HTML fragment: `<br>`, `<img>`, `<details>` open/close, or a
+    /// `<summary>`. Anything else is dropped (inner text kept via Text events).
     fn html(&mut self, html: &str) {
+        let lower = html.trim_start().to_ascii_lowercase();
         if is_br(html) {
-            self.spans.push(break_span());
+            self.spans.push(break_piece());
+        } else if lower.starts_with("<details") {
+            let default_open = details_open_attr(&lower);
+            let index = self.details_count;
+            self.details_count += 1;
+            let open = (self.is_open)(index, default_open);
+            self.details.push(DetailsFrame {
+                index,
+                open,
+                has_summary: false,
+            });
+        } else if lower.starts_with("</details") {
+            self.details.pop();
         } else if let Some((src, alt)) = parse_img(html) {
             if !src.is_empty() {
                 self.push_image(&src, &alt);
@@ -366,41 +455,77 @@ impl Renderer<'_> {
         }
     }
 
-    /// Emit a `<details>` title as a `▾ summary` header line. The body renders as
-    /// normal markdown after it (always shown for now; an interactive fold is a
-    /// follow-up).
+    /// Emit a `<details>` title as a `▸`/`▾ summary` header line and register its
+    /// toggle region. Hidden when an ancestor `<details>` is folded.
     fn emit_summary(&mut self, summary: &str) {
+        let depth = self.details.len();
+        let ancestors_hidden = self.details[..depth.saturating_sub(1)]
+            .iter()
+            .any(|f| !f.open && f.has_summary);
+        if let Some(top) = self.details.last_mut() {
+            top.has_summary = true;
+        }
+        if ancestors_hidden {
+            return; // folded away under a closed ancestor
+        }
         self.flush_block();
-        self.open_block();
+        self.block_gap(false);
+        self.fresh = false;
+
+        let open = self.details.last().map(|f| f.open).unwrap_or(true);
+        let marker = if open { "▾ " } else { "▸ " };
         let summary = summary.trim();
         let label = if summary.is_empty() {
             "Details"
         } else {
             summary
         };
-        let mut spans = Vec::new();
         let prefix = "▏ ".repeat(self.quotes.len());
+        let mut spans = Vec::new();
         if !prefix.is_empty() {
             spans.push(TextSpan::styled(
-                prefix,
+                prefix.clone(),
                 Style::default().fg(self.alert_color().unwrap_or(Color::DarkGray)),
             ));
         }
-        spans.push(TextSpan::styled("▾ ", Style::default().fg(Color::DarkGray)));
+        spans.push(TextSpan::styled(
+            marker,
+            Style::default().fg(Color::DarkGray),
+        ));
         spans.push(TextSpan::styled(
             label.to_string(),
             Style::default().add_modifier(Modifier::BOLD),
         ));
+        let width = span_width(&spans) as u16;
+        let line = self.out.len();
         self.out.push(TextLine::from(spans));
+        if let Some(frame) = self.details.last() {
+            self.regions.push(MdRegion {
+                line,
+                start: 0,
+                end: width,
+                action: MdAction::ToggleDetails(frame.index),
+            });
+        }
         self.mark_emitted();
     }
 
-    /// Place the inter-block separator before the next block, when wrapping. Top
-    /// level gets a blank line; inside a blockquote a bar-prefixed blank; a list's
-    /// items stay tight. No leading gap (nothing emitted yet), and none against a
-    /// container's own opening (the `fresh` guard).
+    /// Whether body content is currently hidden by a folded `<details>` (one that
+    /// has a summary to reopen it).
+    fn body_hidden(&self) -> bool {
+        self.details.iter().any(|f| !f.open && f.has_summary)
+    }
+
+    /// Place the inter-block separator before the next block, when wrapping.
     fn open_block(&mut self) {
-        if self.wrap.is_none() || !self.started {
+        let hidden = self.body_hidden();
+        self.block_gap(hidden);
+    }
+
+    /// The gap logic, with an explicit hide flag (a summary uses ancestor-only
+    /// hiding). Top level gets a blank; a blockquote a bar-blank; lists stay tight.
+    fn block_gap(&mut self, hidden: bool) {
+        if self.wrap.is_none() || !self.started || hidden {
             return;
         }
         if self.fresh {
@@ -408,7 +533,7 @@ impl Renderer<'_> {
             return;
         }
         if !self.list.is_empty() {
-            return; // list items/blocks stay tight
+            return;
         }
         if self.quotes.is_empty() {
             self.out.push(TextLine::from(""));
@@ -422,10 +547,12 @@ impl Renderer<'_> {
         }
     }
 
-    /// Emit a thematic break (`---`) as a dim rule: pane-wide when wrapping, a
-    /// short fixed dash run in tight mode; inside a quote it sits after the bars.
+    /// Emit a thematic break (`---`) as a dim rule.
     fn rule(&mut self) {
         self.flush_block();
+        if self.body_hidden() {
+            return;
+        }
         self.open_block();
         let prefix = "▏ ".repeat(self.quotes.len());
         let color = self.alert_color().unwrap_or(Color::DarkGray);
@@ -442,10 +569,12 @@ impl Renderer<'_> {
         self.mark_emitted();
     }
 
-    /// Emit a GitHub alert's coloured header line (`⚠ Warning`, …) at the top of
-    /// its blockquote, with the quote bars in the same colour.
+    /// Emit a GitHub alert's coloured header line at the top of its blockquote.
     fn alert_header(&mut self, kind: BlockQuoteKind) {
         self.flush_block();
+        if self.body_hidden() {
+            return;
+        }
         let (glyph, label, color) = alert_style(kind);
         let bars = "▏ ".repeat(self.quotes.len());
         self.out.push(TextLine::from(vec![
@@ -483,7 +612,6 @@ impl Renderer<'_> {
         let task = self.task.take();
         match self.list.last_mut() {
             Some(list) => {
-                // A task item shows a checkbox in place of its bullet.
                 let bullet = if let Some(checked) = task {
                     if checked { "☑ " } else { "☐ " }.to_string()
                 } else {
@@ -506,15 +634,27 @@ impl Renderer<'_> {
         }
     }
 
-    /// Emit the accumulated inline spans as one wrapped block, then clear them.
+    /// Emit the accumulated inline pieces as one wrapped block, recording regions.
     fn flush_block(&mut self) {
         if self.spans.is_empty() {
             return;
         }
+        let pieces = std::mem::take(&mut self.spans);
+        if self.body_hidden() {
+            return; // content under a folded <details>: dropped, no regions
+        }
         let color = self.alert_color();
         let (first, cont) = self.prefixes();
-        let spans = std::mem::take(&mut self.spans);
-        let lines = wrap_spans(&spans, self.wrap, &first, &cont, color);
+        let base = self.out.len();
+        let (lines, regions) = wrap_spans(&pieces, self.wrap, &first, &cont, color);
+        for (ln, start, end, action) in regions {
+            self.regions.push(MdRegion {
+                line: base + ln,
+                start,
+                end,
+                action,
+            });
+        }
         self.out.extend(lines);
         self.mark_emitted();
     }
@@ -524,6 +664,9 @@ impl Renderer<'_> {
         let Some((lang, text)) = self.code.take() else {
             return;
         };
+        if self.body_hidden() {
+            return;
+        }
         let bg = palette::CODE_BLOCK_BG;
         let raw: Vec<&str> = text.trim_end_matches('\n').lines().collect();
         for line in self.highlighter.highlight_by_lang(&lang, &raw) {
@@ -546,6 +689,9 @@ impl Renderer<'_> {
         let Some(table) = self.table.take() else {
             return;
         };
+        if self.body_hidden() {
+            return;
+        }
         let prefix = "▏ ".repeat(self.quotes.len());
         let color = self.alert_color();
         let lines = render_table(&table, self.wrap, &prefix, color);
@@ -553,12 +699,15 @@ impl Renderer<'_> {
         self.mark_emitted();
     }
 
-    fn finish(mut self) -> Vec<TextLine<'static>> {
+    fn finish(mut self) -> Rendered {
         self.flush_block();
         if self.out.is_empty() {
             self.out.push(TextLine::from(""));
         }
-        self.out
+        Rendered {
+            lines: self.out,
+            regions: self.regions,
+        }
     }
 }
 
@@ -567,6 +716,18 @@ fn is_br(html: &str) -> bool {
     let t = html.trim().trim_start_matches("</").trim_start_matches('<');
     let t = t.trim_end_matches('>').trim_end_matches('/').trim();
     t.eq_ignore_ascii_case("br")
+}
+
+/// Whether a lowercased `<details …>` opening tag carries the `open` attribute.
+fn details_open_attr(lower_tag: &str) -> bool {
+    lower_tag
+        .strip_prefix("<details")
+        .and_then(|r| r.split('>').next())
+        .is_some_and(|attrs| {
+            attrs
+                .split_whitespace()
+                .any(|a| a == "open" || a == "open=\"\"")
+        })
 }
 
 /// Parse an `<img …>` tag into `(src, alt)`; `None` when it is not an img.
@@ -585,8 +746,7 @@ fn html_attr(html: &str, name: &str) -> Option<String> {
     let key = format!("{name}=");
     let at = lower.find(&key)? + key.len();
     let rest = &html[at..];
-    let mut chars = rest.chars();
-    match chars.next()? {
+    match rest.chars().next()? {
         q @ ('"' | '\'') => {
             let body = &rest[1..];
             let end = body.find(q)?;
@@ -652,7 +812,6 @@ fn next_url(s: &str) -> Option<(&str, &str, &str)> {
         url = &url[..url.len() - 1];
     }
     if url.len() <= "https://".len() {
-        // Nothing past the scheme — not worth linking (avoids a bare "http://").
         return None;
     }
     let real_end = start + url.len();
@@ -680,40 +839,56 @@ fn alert_style(kind: BlockQuoteKind) -> (&'static str, &'static str, Color) {
     }
 }
 
-/// Word-wrap styled spans to `wrap` display columns (when set), prefixing the
-/// first line with `first` and the rest with `cont`. `prefix_color` tints the
-/// prefix (an alert's bar colour, else the default dim). A break sentinel forces
-/// a new line; in no-wrap mode it collapses to a space (tight display).
+/// A local region within a wrapped block: `(line_in_block, start, end, action)`.
+type LocalRegion = (usize, u16, u16, MdAction);
+
+/// Word-wrap styled pieces to `wrap` display columns (when set), prefixing the
+/// first line with `first` and the rest with `cont`. Returns the lines and their
+/// click regions (columns include the prefix). A break sentinel forces a new
+/// line; in no-wrap mode it collapses to a space.
 fn wrap_spans(
-    spans: &[TextSpan<'static>],
+    pieces: &[Piece],
     wrap: Option<usize>,
     first: &str,
     cont: &str,
     prefix_color: Option<Color>,
-) -> Vec<TextLine<'static>> {
+) -> (Vec<TextLine<'static>>, Vec<LocalRegion>) {
     let prefix_style = Style::default().fg(prefix_color.unwrap_or(Color::DarkGray));
 
     let Some(width) = wrap else {
-        // No wrapping: one line, prefixed; breaks become spaces.
-        let mut line = vec![TextSpan::styled(first.to_string(), prefix_style)];
-        for span in spans {
-            if is_break(span) {
-                line.push(TextSpan::styled(" ", span.style));
-            } else {
-                line.push(span.clone());
+        // No wrapping: one line; breaks become spaces.
+        let mut spans = vec![TextSpan::styled(first.to_string(), prefix_style)];
+        let mut regions = Vec::new();
+        let mut col = prefix_width(first) as u16;
+        for piece in pieces {
+            if piece.is_break() {
+                spans.push(TextSpan::styled(" ", piece.span.style));
+                col += 1;
+                continue;
             }
+            let w = UnicodeWidthStr::width(piece.span.content.as_ref()) as u16;
+            if let Some(action) = &piece.action {
+                regions.push((0, col, col + w, action.clone()));
+            }
+            spans.push(piece.span.clone());
+            col += w;
         }
-        return vec![TextLine::from(line)];
+        return (vec![TextLine::from(spans)], regions);
     };
 
-    // `first` and `cont` are built to the same display width, so one budget fits
-    // every line; the first line carries `first`, the rest `cont`.
-    let budget = width.saturating_sub(prefix_width(first)).max(1);
-    let rows = wrap_runs(spans, budget);
-    rows.into_iter()
+    let poff = prefix_width(first) as u16; // first and cont share a width
+    let budget = width.saturating_sub(poff as usize).max(1);
+    let (rows, local) = wrap_pieces(pieces, budget);
+    let lines = rows
+        .into_iter()
         .enumerate()
         .map(|(i, row)| build_line(if i == 0 { first } else { cont }, prefix_style, row))
-        .collect()
+        .collect();
+    let regions = local
+        .into_iter()
+        .map(|(ln, s, e, a)| (ln, s + poff, e + poff, a))
+        .collect();
+    (lines, regions)
 }
 
 fn prefix_width(prefix: &str) -> usize {
@@ -730,71 +905,62 @@ fn build_line(
     TextLine::from(line)
 }
 
-/// Break `spans` into visual lines fitting `width` columns. A break sentinel
-/// starts a new line; words split only at real spaces; a run of non-space text
-/// that crosses style spans stays one unit (no fabricated space at a style
-/// boundary); an over-wide unit hard-breaks. Returns lines of spans (no prefix).
-fn wrap_runs(spans: &[TextSpan<'static>], width: usize) -> Vec<Vec<TextSpan<'static>>> {
+/// Break pieces into lines fitting `width` columns, returning the lines' spans
+/// and content-relative click regions. Words split only at real spaces; a
+/// non-space run crossing styles stays one unit; an over-wide word hard-breaks.
+fn wrap_pieces(pieces: &[Piece], width: usize) -> (Vec<Vec<TextSpan<'static>>>, Vec<LocalRegion>) {
     let width = width.max(1);
     let mut lines: Vec<Vec<TextSpan<'static>>> = Vec::new();
-    for segment in split_breaks(spans) {
+    let mut regions: Vec<LocalRegion> = Vec::new();
+    for segment in split_breaks(pieces) {
         let words = to_words(&segment);
-        wrap_words_into(&words, width, &mut lines);
+        place_words(&words, width, &mut lines, &mut regions);
     }
     if lines.is_empty() {
         lines.push(Vec::new());
     }
-    lines
+    (lines, regions)
 }
 
-/// Split a span list at break sentinels, dropping the sentinels; each returned
-/// segment renders on its own line (or wraps within its own lines).
-fn split_breaks(spans: &[TextSpan<'static>]) -> Vec<Vec<TextSpan<'static>>> {
-    let mut segments: Vec<Vec<TextSpan<'static>>> = vec![Vec::new()];
-    for span in spans {
-        if is_break(span) {
+/// Split a piece list at break sentinels, dropping the sentinels.
+fn split_breaks(pieces: &[Piece]) -> Vec<Vec<Piece>> {
+    let mut segments: Vec<Vec<Piece>> = vec![Vec::new()];
+    for piece in pieces {
+        if piece.is_break() {
             segments.push(Vec::new());
         } else {
-            segments.last_mut().unwrap().push(span.clone());
+            segments.last_mut().unwrap().push(piece.clone());
         }
     }
     segments
 }
 
-/// Group a break-free span list into words: maximal runs of non-space text,
-/// split only where a real space occurs. A word keeps its (possibly several)
-/// style runs, so adjacent styles never get a fabricated space between them.
-fn to_words(spans: &[TextSpan<'static>]) -> Vec<Word> {
+/// Group a break-free piece list into words (runs of non-space text split only
+/// at real spaces), each run keeping its style and action.
+fn to_words(pieces: &[Piece]) -> Vec<Word> {
     let mut words: Vec<Word> = Vec::new();
     let mut cur: Word = Vec::new();
-    let mut run = String::new();
-    let mut run_style = Style::default();
-    let flush_run = |run: &mut String, run_style: Style, cur: &mut Word| {
-        if !run.is_empty() {
-            cur.push((std::mem::take(run), run_style));
-        }
-    };
-    for span in spans {
-        let style = span.style;
-        for ch in span.content.chars() {
+    for piece in pieces {
+        let style = piece.span.style;
+        let action = &piece.action;
+        let mut frag = String::new();
+        for ch in piece.span.content.chars() {
             if ch == ' ' || ch == '\t' {
-                flush_run(&mut run, run_style, &mut cur);
+                if !frag.is_empty() {
+                    cur.push((std::mem::take(&mut frag), style, action.clone()));
+                }
                 if !cur.is_empty() {
                     words.push(std::mem::take(&mut cur));
                 }
             } else {
-                if !run.is_empty() && style != run_style {
-                    flush_run(&mut run, run_style, &mut cur);
-                }
-                if run.is_empty() {
-                    run_style = style;
-                }
-                run.push(ch);
+                frag.push(ch);
             }
         }
-        // A span boundary is not a word boundary — flush the run so the next
-        // span's style starts cleanly, but keep the word open (no space).
-        flush_run(&mut run, run_style, &mut cur);
+        // A piece boundary ends the run (styles/actions may change) but not the
+        // word — adjacent pieces stay flush, no fabricated space.
+        if !frag.is_empty() {
+            cur.push((frag, style, action.clone()));
+        }
     }
     if !cur.is_empty() {
         words.push(cur);
@@ -804,76 +970,93 @@ fn to_words(spans: &[TextSpan<'static>]) -> Vec<Word> {
 
 fn word_width(word: &Word) -> usize {
     word.iter()
-        .map(|(t, _)| UnicodeWidthStr::width(t.as_str()))
+        .map(|(t, _, _)| UnicodeWidthStr::width(t.as_str()))
         .sum()
 }
 
-fn push_word(line: &mut Vec<TextSpan<'static>>, word: &Word) {
-    for (text, style) in word {
+/// Append a word's runs to `line` at column `col`, recording a region per run
+/// that carries an action.
+fn emit_runs(
+    word: &Word,
+    line: &mut Vec<TextSpan<'static>>,
+    col: &mut u16,
+    line_idx: usize,
+    regions: &mut Vec<LocalRegion>,
+) {
+    for (text, style, action) in word {
+        let w = UnicodeWidthStr::width(text.as_str()) as u16;
+        if let Some(action) = action {
+            regions.push((line_idx, *col, *col + w, action.clone()));
+        }
         line.push(TextSpan::styled(text.clone(), *style));
+        *col += w;
     }
 }
 
-/// Greedy word-wrap into `lines`, hard-breaking any word wider than `width`.
-fn wrap_words_into(words: &[Word], width: usize, lines: &mut Vec<Vec<TextSpan<'static>>>) {
+/// Greedy word-wrap, hard-breaking any word wider than `width`.
+fn place_words(
+    words: &[Word],
+    width: usize,
+    lines: &mut Vec<Vec<TextSpan<'static>>>,
+    regions: &mut Vec<LocalRegion>,
+) {
     let mut cur: Vec<TextSpan<'static>> = Vec::new();
-    let mut used = 0usize;
+    let mut col: u16 = 0;
     for word in words {
         let ww = word_width(word);
         if ww > width {
             if !cur.is_empty() {
                 lines.push(std::mem::take(&mut cur));
+                col = 0;
             }
             let mut rest = word.clone();
             while word_width(&rest) > width {
-                let (head, tail) = split_word_at_width(&rest, width);
-                let mut line = Vec::new();
-                push_word(&mut line, &head);
-                lines.push(line);
+                let (head, tail) = split_word(&rest, width);
+                let mut hline = Vec::new();
+                let mut hcol = 0u16;
+                emit_runs(&head, &mut hline, &mut hcol, lines.len(), regions);
+                lines.push(hline);
                 rest = tail;
             }
-            push_word(&mut cur, &rest);
-            used = word_width(&rest);
+            emit_runs(&rest, &mut cur, &mut col, lines.len(), regions);
             continue;
         }
         let sep = usize::from(!cur.is_empty());
-        if !cur.is_empty() && used + sep + ww > width {
+        if !cur.is_empty() && col as usize + sep + ww > width {
             lines.push(std::mem::take(&mut cur));
-            used = 0;
+            col = 0;
         }
         if !cur.is_empty() {
             cur.push(TextSpan::raw(" "));
-            used += 1;
+            col += 1;
         }
-        push_word(&mut cur, word);
-        used += ww;
+        emit_runs(word, &mut cur, &mut col, lines.len(), regions);
     }
     lines.push(cur);
 }
 
-/// Split a word at `width` display columns, preserving style runs; the split
-/// point falls inside whichever run crosses the boundary.
-fn split_word_at_width(word: &Word, width: usize) -> (Word, Word) {
+/// Split a word at `width` display columns, preserving style/action runs.
+fn split_word(word: &Word, width: usize) -> (Word, Word) {
     let mut head: Word = Vec::new();
     let mut tail: Word = Vec::new();
     let mut used = 0usize;
     let mut cutting = false;
-    for (text, style) in word {
+    for (text, style, action) in word {
         if cutting {
-            tail.push((text.clone(), *style));
+            tail.push((text.clone(), *style, action.clone()));
             continue;
         }
         let tw = UnicodeWidthStr::width(text.as_str());
         if used + tw <= width {
-            head.push((text.clone(), *style));
+            head.push((text.clone(), *style, action.clone()));
             used += tw;
         } else {
             let (h, t) = split_at_width(text, (width - used).max(1));
             if !h.is_empty() {
-                head.push((h, *style));
+                head.push((h, *style, action.clone()));
             }
             if !t.is_empty() {
-                tail.push((t, *style));
+                tail.push((t, *style, action.clone()));
             }
             cutting = true;
         }
@@ -884,7 +1067,7 @@ fn split_word_at_width(word: &Word, width: usize) -> (Word, Word) {
 fn span_width(spans: &[TextSpan<'static>]) -> usize {
     spans
         .iter()
-        .filter(|s| !is_break(s))
+        .filter(|s| s.content.as_ref() != BREAK)
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .sum()
 }
@@ -918,8 +1101,7 @@ fn render_table(
         }
     }
 
-    // No wrapping: one line per row, cells joined by the gutter (the caller's
-    // 1-line clip bounds it).
+    // No wrapping: one line per row, cells joined by the gutter.
     let Some(total) = wrap else {
         let mut out = vec![table_flat_row(
             &table.head,
@@ -1012,7 +1194,7 @@ fn table_flat_row(
         }
         if let Some(cell) = row.get(i) {
             for s in cell {
-                if is_break(s) {
+                if s.content.as_ref() == BREAK {
                     spans.push(TextSpan::raw(" "));
                     continue;
                 }
@@ -1075,21 +1257,24 @@ fn table_row(
     lines
 }
 
-/// Word-wrap one cell's styled spans to `width` columns, hard-breaking a word
-/// that is itself too wide. Header cells render bold. Break sentinels split lines.
+/// Word-wrap one cell's styled spans to `width` columns (no click regions). A
+/// break sentinel splits lines; a too-wide word hard-breaks. Header cells bold.
 fn wrap_cell(spans: &[TextSpan<'static>], width: usize, bold: bool) -> Vec<Vec<TextSpan<'static>>> {
     let width = width.max(1);
-    let styled: Vec<TextSpan<'static>> = spans
+    let pieces: Vec<Piece> = spans
         .iter()
         .map(|s| {
-            if is_break(s) || !bold {
-                s.clone()
+            if s.content.as_ref() == BREAK || !bold {
+                Piece::plain(s.clone())
             } else {
-                TextSpan::styled(s.content.to_string(), s.style.add_modifier(Modifier::BOLD))
+                Piece::plain(TextSpan::styled(
+                    s.content.to_string(),
+                    s.style.add_modifier(Modifier::BOLD),
+                ))
             }
         })
         .collect();
-    wrap_runs(&styled, width)
+    wrap_pieces(&pieces, width).0
 }
 
 /// Split `s` at `width` display columns, always taking at least one char (so a
@@ -1112,17 +1297,14 @@ fn split_at_width(s: &str, width: usize) -> (String, String) {
 mod tests {
     use super::*;
 
-    /// The concatenated plain text of a rendered line.
     fn text_of(line: &TextLine) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
-    /// All rendered lines as their plain text.
     fn texts(lines: &[TextLine]) -> Vec<String> {
         lines.iter().map(text_of).collect()
     }
 
-    /// The foreground colour of the first span carrying `needle`.
     fn color_of(lines: &[TextLine], needle: &str) -> Option<Color> {
         lines
             .iter()
@@ -1131,13 +1313,18 @@ mod tests {
             .map(|s| s.style.fg.unwrap_or(Color::Reset))
     }
 
-    /// The style of the first span carrying `needle`.
     fn style_of(lines: &[TextLine], needle: &str) -> Option<Style> {
         lines
             .iter()
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.contains(needle))
             .map(|s| s.style)
+    }
+
+    /// Render with all details expanded, exposing regions.
+    fn rich(src: &str, wrap: Option<usize>) -> Rendered {
+        let hl = Highlighter::new();
+        render_rich(src, wrap, &hl, &|_, default| default)
     }
 
     #[test]
@@ -1174,7 +1361,6 @@ mod tests {
         let joined: String = lines.iter().map(text_of).collect();
         assert!(!joined.contains('#'), "no raw # marks: {joined:?}");
         assert!(joined.contains("Title") && joined.contains("Sub") && joined.contains("Small"));
-        // H1 is bold cyan, H3 bold (default fg), H5 bold dim.
         let h1 = style_of(&lines, "Title").unwrap();
         assert!(h1.add_modifier.contains(Modifier::BOLD) && h1.fg == Some(Color::Cyan));
         let h3 = style_of(&lines, "Sub").unwrap();
@@ -1187,38 +1373,32 @@ mod tests {
     fn top_level_blocks_are_separated_by_one_blank_line() {
         let hl = Highlighter::new();
         let lines = render("para one\n\n# Heading\n\npara two", Some(40), &hl);
-        let t = texts(&lines);
         assert_eq!(
-            t,
+            texts(&lines),
             vec![
                 "para one".to_string(),
                 String::new(),
                 "Heading".to_string(),
                 String::new(),
                 "para two".to_string(),
-            ],
-            "one blank between each top-level block, none leading/trailing"
+            ]
         );
     }
 
     #[test]
     fn no_block_spacing_when_not_wrapping() {
-        // The tight inline path stays dense (no inserted blank lines).
         let hl = Highlighter::new();
         let lines = render("para one\n\npara two", None, &hl);
-        let t = texts(&lines);
-        assert!(!t.iter().any(|l| l.is_empty()), "no blank lines: {t:?}");
+        assert!(!texts(&lines).iter().any(|l| l.is_empty()));
     }
 
     #[test]
     fn soft_and_hard_breaks_become_real_line_breaks() {
         let hl = Highlighter::new();
-        // A single newline (soft break) and a trailing-space hard break both wrap.
         let lines = render("alpha\nbeta", Some(40), &hl);
         assert_eq!(texts(&lines), vec!["alpha".to_string(), "beta".to_string()]);
         let hard = render("alpha  \nbeta", Some(40), &hl);
         assert_eq!(texts(&hard), vec!["alpha".to_string(), "beta".to_string()]);
-        // In no-wrap mode the break collapses to a space (tight display).
         let tight = render("alpha\nbeta", None, &hl);
         assert_eq!(texts(&tight), vec!["alpha beta".to_string()]);
     }
@@ -1226,19 +1406,10 @@ mod tests {
     #[test]
     fn adjacent_styles_keep_no_fabricated_space() {
         let hl = Highlighter::new();
-        // `config.toml` (code) immediately followed by a comma, and a bold word
-        // followed by a period, and a link followed by a paren — all must stay
-        // flush when wrapping.
         let lines = render("see `config.toml`, and **bold**. done", Some(40), &hl);
         let joined: String = texts(&lines).join(" ");
-        assert!(
-            joined.contains("config.toml,"),
-            "code and comma stay flush: {joined:?}"
-        );
-        assert!(
-            joined.contains("bold."),
-            "bold and period stay flush: {joined:?}"
-        );
+        assert!(joined.contains("config.toml,"), "{joined:?}");
+        assert!(joined.contains("bold."), "{joined:?}");
     }
 
     #[test]
@@ -1247,12 +1418,8 @@ mod tests {
         let lines = render("above\n\n---\n\nbelow", Some(20), &hl);
         let t = texts(&lines);
         let rule = t.iter().find(|l| l.contains('─')).expect("a rule line");
-        assert!(
-            UnicodeWidthStr::width(rule.as_str()) <= 20,
-            "the rule fits the pane: {rule:?}"
-        );
-        assert!(rule.chars().all(|c| c == '─'), "a solid rule: {rule:?}");
-        // No-wrap uses a short fixed rule.
+        assert!(UnicodeWidthStr::width(rule.as_str()) <= 20);
+        assert!(rule.chars().all(|c| c == '─'));
         let tight = render("---", None, &hl);
         assert!(texts(&tight).iter().any(|l| l == "───"));
     }
@@ -1278,10 +1445,7 @@ mod tests {
         let lines = render("- outer\n  - inner", None, &hl);
         let t = texts(&lines);
         assert!(t.iter().any(|l| l == "• outer"));
-        assert!(
-            t.iter().any(|l| l.starts_with("  ") && l.contains("inner")),
-            "the nested item is indented: {t:?}"
-        );
+        assert!(t.iter().any(|l| l.starts_with("  ") && l.contains("inner")));
     }
 
     #[test]
@@ -1289,11 +1453,8 @@ mod tests {
         let hl = Highlighter::new();
         let lines = render("text[^1]\n\n[^1]: the note", Some(40), &hl);
         let joined: String = texts(&lines).join("\n");
-        assert!(joined.contains("[1]"), "the reference marker: {joined:?}");
-        assert!(
-            joined.contains("the note"),
-            "the definition body: {joined:?}"
-        );
+        assert!(joined.contains("[1]"));
+        assert!(joined.contains("the note"));
     }
 
     #[test]
@@ -1308,12 +1469,9 @@ mod tests {
         ] {
             let lines = render(src, Some(40), &hl);
             let joined: String = lines.iter().map(text_of).collect();
-            assert!(joined.contains(label), "{label} header shown: {joined:?}");
-            assert!(
-                !joined.contains("[!"),
-                "the raw alert marker is gone: {joined:?}"
-            );
-            assert_eq!(color_of(&lines, label), Some(color), "{label} is coloured");
+            assert!(joined.contains(label), "{label}: {joined:?}");
+            assert!(!joined.contains("[!"), "{joined:?}");
+            assert_eq!(color_of(&lines, label), Some(color));
         }
     }
 
@@ -1324,7 +1482,7 @@ mod tests {
         let joined: String = lines.iter().map(text_of).collect();
         assert!(joined.contains("just a quote"));
         assert!(!joined.contains("Note") && !joined.contains("[!"));
-        assert!(joined.contains('▏'), "the quote bar is kept");
+        assert!(joined.contains('▏'));
     }
 
     #[test]
@@ -1332,12 +1490,7 @@ mod tests {
         let hl = Highlighter::new();
         let lines = render("> one\n>\n> two", Some(40), &hl);
         let t = texts(&lines);
-        // A bar-only line sits between the two quote paragraphs (no empty gap).
-        let bar_blank = t.iter().position(|l| l.trim() == "▏");
-        assert!(
-            bar_blank.is_some(),
-            "a bar-prefixed blank between paras: {t:?}"
-        );
+        assert!(t.iter().any(|l| l.trim() == "▏"));
         assert!(t.iter().any(|l| l.contains("one")) && t.iter().any(|l| l.contains("two")));
     }
 
@@ -1349,6 +1502,153 @@ mod tests {
         assert_eq!(text_of(&lines[1]), "☑ done");
     }
 
+    // --- regions (clickable links / images) ---
+
+    #[test]
+    fn a_bare_url_is_autolinked_and_clickable() {
+        let r = rich("see https://example.com/path, ok", Some(60));
+        let url = r
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.as_ref() == "https://example.com/path")
+            .expect("the url is its own span");
+        assert!(
+            url.style.add_modifier.contains(Modifier::UNDERLINED)
+                && url.style.fg == Some(palette::LINK_FG)
+        );
+        // A region opens exactly that url, and covers the url's columns.
+        let region = r
+            .regions
+            .iter()
+            .find(|reg| reg.action == MdAction::Open("https://example.com/path".to_string()))
+            .expect("a click region for the url");
+        let line = text_of(&r.lines[region.line]);
+        let slice: String = line
+            .chars()
+            .skip(region.start as usize)
+            .take((region.end - region.start) as usize)
+            .collect();
+        assert_eq!(
+            slice, "https://example.com/path",
+            "the region covers the url"
+        );
+    }
+
+    #[test]
+    fn a_markdown_image_renders_a_clickable_placeholder() {
+        let r = rich("see ![a shot](https://ex.com/a.png) here", Some(60));
+        let joined = texts(&r.lines).join(" ");
+        assert!(joined.contains("[Image: a shot]"), "{joined:?}");
+        assert!(
+            !joined.contains("ex.com"),
+            "url not shown inline: {joined:?}"
+        );
+        assert!(
+            r.regions
+                .iter()
+                .any(|reg| reg.action == MdAction::Open("https://ex.com/a.png".to_string())),
+            "the image opens its url"
+        );
+    }
+
+    #[test]
+    fn a_markdown_link_is_clickable() {
+        let r = rich("read [the docs](https://docs.example.com)", Some(60));
+        assert!(
+            r.regions
+                .iter()
+                .any(|reg| reg.action == MdAction::Open("https://docs.example.com".to_string())),
+            "regions: {:?}",
+            r.regions
+        );
+    }
+
+    #[test]
+    fn an_html_img_becomes_a_placeholder_and_other_html_is_stripped() {
+        let hl = Highlighter::new();
+        let lines = render(
+            "<img src=\"https://e.com/x.png\" alt=\"pic\"> tail",
+            Some(60),
+            &hl,
+        );
+        let joined = texts(&lines).join(" ");
+        assert!(joined.contains("[Image: pic]"), "{joined:?}");
+        assert!(joined.contains("tail"));
+        let none = render("<img alt=\"x\"> body", Some(60), &hl);
+        assert!(!texts(&none).join(" ").contains("[Image"));
+    }
+
+    // --- details fold ---
+
+    #[test]
+    fn a_details_defaults_closed_showing_only_its_summary() {
+        // Default closed: the summary (▸) shows with a toggle region; body hidden.
+        let r = rich(
+            "<details>\n<summary>Click me</summary>\n\nHidden body.\n\n</details>",
+            Some(60),
+        );
+        let joined = texts(&r.lines).join("\n");
+        assert!(joined.contains("▸ Click me"), "closed marker: {joined:?}");
+        assert!(!joined.contains("Hidden body"), "body hidden: {joined:?}");
+        assert!(
+            r.regions
+                .iter()
+                .any(|reg| reg.action == MdAction::ToggleDetails(0)),
+            "a toggle region on the summary"
+        );
+    }
+
+    #[test]
+    fn an_open_details_shows_its_body() {
+        // Fold state opens index 0 → ▾ and the body renders.
+        let hl = Highlighter::new();
+        let r = render_rich(
+            "<details>\n<summary>Click me</summary>\n\nHidden body.\n\n</details>",
+            Some(60),
+            &hl,
+            &|_, _| true,
+        );
+        let joined = texts(&r.lines).join("\n");
+        assert!(joined.contains("▾ Click me"), "open marker: {joined:?}");
+        assert!(joined.contains("Hidden body."), "body shows: {joined:?}");
+    }
+
+    #[test]
+    fn details_open_attribute_defaults_open() {
+        let r = rich(
+            "<details open>\n<summary>Shown</summary>\n\nVisible body.\n\n</details>",
+            Some(60),
+        );
+        let joined = texts(&r.lines).join("\n");
+        assert!(joined.contains("▾ Shown"));
+        assert!(joined.contains("Visible body."));
+    }
+
+    #[test]
+    fn a_folded_details_registers_no_inner_regions() {
+        // A link inside a closed details is not hit-testable.
+        let r = rich(
+            "<details>\n<summary>Hidden</summary>\n\nhttps://inside.example.com\n\n</details>",
+            Some(60),
+        );
+        assert!(
+            !r.regions
+                .iter()
+                .any(|reg| matches!(&reg.action, MdAction::Open(u) if u.contains("inside"))),
+            "no region for a link inside a folded details"
+        );
+    }
+
+    #[test]
+    fn a_summaryless_details_shows_its_body() {
+        // Robust degrade: no summary → nothing to reopen with, so show the body.
+        let r = rich("<details>\n\nplain body\n\n</details>", Some(60));
+        assert!(texts(&r.lines).join("\n").contains("plain body"));
+    }
+
+    // --- tables ---
+
     #[test]
     fn a_table_aligns_columns_with_a_header_rule() {
         let hl = Highlighter::new();
@@ -1359,27 +1659,17 @@ mod tests {
 | dd | e | fff |";
         let lines = render(src, Some(40), &hl);
         let texts: Vec<String> = lines.iter().map(text_of).collect();
-        // Header, a dim rule, then two body rows.
         assert!(texts[0].contains("Left") && texts[0].contains("Right"));
-        assert!(
-            texts[1].contains('─'),
-            "a rule under the header: {:?}",
-            texts[1]
-        );
-        assert!(texts.iter().any(|t| t.contains("fff")), "body rendered");
-        // Header cells are bold.
+        assert!(texts[1].contains('─'), "{:?}", texts[1]);
+        assert!(texts.iter().any(|t| t.contains("fff")));
         let left = lines[0]
             .spans
             .iter()
             .find(|s| s.content.contains("Left"))
             .unwrap();
         assert!(left.style.add_modifier.contains(Modifier::BOLD));
-        // Right-aligned column pads on the left: "c" sits at the column's end.
         let right_row = &texts[2];
-        assert!(
-            right_row.trim_end().ends_with('c'),
-            "right column is right-aligned: {right_row:?}"
-        );
+        assert!(right_row.trim_end().ends_with('c'), "{right_row:?}");
     }
 
     #[test]
@@ -1394,101 +1684,15 @@ mod tests {
         for line in &lines {
             assert!(
                 UnicodeWidthStr::width(text_of(line).as_str()) <= width,
-                "no line exceeds the pane: {:?}",
+                "{:?}",
                 text_of(line)
             );
         }
-        // The long cell wrapped to more than the header + rule + one line.
-        assert!(lines.len() > 3, "the cell wrapped across lines");
-    }
-
-    #[test]
-    fn a_markdown_image_renders_a_link_placeholder() {
-        let hl = Highlighter::new();
-        let lines = render("see ![a shot](https://ex.com/a.png) here", Some(60), &hl);
-        let joined = texts(&lines).join(" ");
-        assert!(
-            joined.contains("[Image: a shot]"),
-            "alt in the placeholder: {joined:?}"
-        );
-        assert!(
-            !joined.contains("ex.com"),
-            "the url is not shown inline: {joined:?}"
-        );
-        let img = style_of(&lines, "[Image").unwrap();
-        assert!(
-            img.add_modifier.contains(Modifier::UNDERLINED) && img.fg == Some(palette::LINK_FG),
-            "the placeholder is styled as a link"
-        );
-    }
-
-    #[test]
-    fn an_html_img_becomes_a_placeholder_and_other_html_is_stripped() {
-        let hl = Highlighter::new();
-        let lines = render(
-            "<img src=\"https://e.com/x.png\" alt=\"pic\"> tail",
-            Some(60),
-            &hl,
-        );
-        let joined = texts(&lines).join(" ");
-        assert!(joined.contains("[Image: pic]"), "{joined:?}");
-        assert!(joined.contains("tail"), "trailing text is kept: {joined:?}");
-        // A src-less img is ignored (nothing to point at).
-        let none = render("<img alt=\"x\"> body", Some(60), &hl);
-        assert!(
-            !texts(&none).join(" ").contains("[Image"),
-            "no src → no placeholder"
-        );
-    }
-
-    #[test]
-    fn a_bare_url_is_autolinked() {
-        let hl = Highlighter::new();
-        let lines = render("see https://example.com/path, ok", Some(60), &hl);
-        let url = lines
-            .iter()
-            .flat_map(|l| l.spans.iter())
-            .find(|s| s.content.as_ref() == "https://example.com/path")
-            .expect("the url is its own span");
-        assert!(
-            url.style.add_modifier.contains(Modifier::UNDERLINED)
-                && url.style.fg == Some(palette::LINK_FG),
-            "the url is styled as a link"
-        );
-        let joined = texts(&lines).join("");
-        assert!(
-            joined.contains("https://example.com/path,"),
-            "trailing punctuation stays outside the link: {joined:?}"
-        );
-    }
-
-    #[test]
-    fn details_shows_its_summary_and_body() {
-        let hl = Highlighter::new();
-        let src = "before\n\n<details>\n<summary>Click me</summary>\n\nHidden **body** here.\n\n</details>\n\nafter";
-        let lines = render(src, Some(60), &hl);
-        let joined = texts(&lines).join("\n");
-        assert!(
-            joined.contains("▾ Click me"),
-            "the summary shows as a header: {joined:?}"
-        );
-        assert!(
-            joined.contains("Hidden body here."),
-            "the body renders: {joined:?}"
-        );
-        assert!(
-            !joined.contains("<summary") && !joined.contains("details>"),
-            "the raw detail tags are gone: {joined:?}"
-        );
+        assert!(lines.len() > 3);
     }
 
     #[test]
     fn a_mean_document_renders_every_construct_within_the_pane() {
-        // A regression net: one document exercising heading, autolink, image,
-        // alert, nested quote, table with a cell break, details, footnote, rule,
-        // and CJK. Every rendered line must fit the pane, and each construct must
-        // leave its mark. (Content + width, not an exact line count, so ordinary
-        // spacing tweaks don't false-alarm.)
         let hl = Highlighter::new();
         let src = "\
 # Title
@@ -1504,7 +1708,7 @@ Intro with `code.rs`, https://example.com/x, and ![shot](https://e/i.png).
 | --- | --- |
 | one | two<br>three |
 
-<details>
+<details open>
 <summary>More detail</summary>
 
 Inside the fold.
@@ -1527,26 +1731,24 @@ Text[^1] with a footnote.
                 text_of(line)
             );
         }
-        // Flatten with spaces so a construct that wrapped across lines still reads
-        // contiguously (a wrapped placeholder's break becomes a space here).
         let flat = texts(&lines).join(" ");
         for needle in [
-            "Title",                 // heading, no `#`
-            "https://example.com/x", // bare-url autolink
-            "[Image: shot]",         // image placeholder
-            "Watch out",             // alert body
-            "nested quote",          // nested blockquote
-            "▾ More detail",         // details summary
-            "Inside the fold.",      // details body
-            "[1]",                   // footnote reference
-            "the note",              // footnote definition
-            "日本語",                // CJK
+            "Title",
+            "https://example.com/x",
+            "[Image: shot]",
+            "Watch out",
+            "nested quote",
+            "▾ More detail",
+            "Inside the fold.",
+            "[1]",
+            "the note",
+            "日本語",
         ] {
             assert!(flat.contains(needle), "missing {needle:?} in:\n{flat}");
         }
-        assert!(!flat.contains('#'), "no raw heading marks");
-        assert!(!flat.contains("<summary"), "no raw detail tags");
-        assert!(flat.contains('─'), "the thematic-break rule renders");
+        assert!(!flat.contains('#'));
+        assert!(!flat.contains("<summary"));
+        assert!(flat.contains('─'));
     }
 
     #[test]
@@ -1557,13 +1759,11 @@ Text[^1] with a footnote.
 | --- | --- |
 | `code` | 日本語 |";
         let lines = render(src, Some(40), &hl);
-        // The inline code cell keeps its code background.
         let code = lines
             .iter()
             .flat_map(|l| l.spans.iter())
             .find(|s| s.content.contains("code"));
         assert!(code.is_some_and(|s| s.style.bg == Some(palette::CODE_INLINE_BG)));
-        // No line overruns despite the wide CJK glyphs.
         for line in &lines {
             assert!(UnicodeWidthStr::width(text_of(line).as_str()) <= 40);
         }
