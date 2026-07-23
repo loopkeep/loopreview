@@ -5467,7 +5467,12 @@ impl App {
             sidebar_w: sidebar_cols,
             tabs_row: tabs_area.map(|t| t.y),
             footer_row: footer.y,
-            layout_end: self.layout_label().chars().count() as u16,
+            // The layout indicator (and its click target) is absent for an issue.
+            layout_end: if self.is_issue() {
+                0
+            } else {
+                self.layout_label().chars().count() as u16
+            },
             pr_link_row: self.header_pr_link.get().map(|_| header.y),
             pr_link_x0,
             pr_link_x1,
@@ -6234,7 +6239,6 @@ impl App {
     fn draw_header(&self, f: &mut Frame, area: Rect) {
         let stats = self.diff.stats();
         let bar = Style::default().bg(BAR_BG);
-        let layout_label = if self.sbs() { "split" } else { "unified" };
         let mut spans = vec![TextSpan::styled(
             " loopreview ",
             bar.fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -6274,15 +6278,19 @@ impl App {
                 bar.fg(Color::Gray),
             ));
         }
-        spans.extend([
-            TextSpan::styled(
-                format!("· {} file{} ", stats.files, plural(stats.files)),
-                bar.fg(Color::Gray),
-            ),
-            TextSpan::styled(format!("+{} ", stats.insertions), bar.fg(Color::Green)),
-            TextSpan::styled(format!("-{} ", stats.deletions), bar.fg(Color::Red)),
-            TextSpan::styled(format!("· {layout_label}"), bar.fg(Color::DarkGray)),
-        ]);
+        // The file / +/- counters — only when a diff exists (an issue has none, so
+        // "0 files +0 -0" would be noise). The layout (unified/split) lives in the
+        // footer's clickable indicator, so it is dropped here as redundant.
+        if !self.is_issue() {
+            spans.extend([
+                TextSpan::styled(
+                    format!("· {} file{} ", stats.files, plural(stats.files)),
+                    bar.fg(Color::Gray),
+                ),
+                TextSpan::styled(format!("+{} ", stats.insertions), bar.fg(Color::Green)),
+                TextSpan::styled(format!("-{} ", stats.deletions), bar.fg(Color::Red)),
+            ]);
+        }
         if !self.review.is_empty() {
             spans.push(TextSpan::styled(
                 format!("  💬 {} open", self.review.open_count()),
@@ -6460,30 +6468,34 @@ impl App {
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let bar = Style::default().bg(BAR_BG);
-        let position = if self.view == View::Conversation {
-            format!(
+        // The position index: files in the diff, threads in the conversation, and
+        // nothing in the Overview (a scroll pane has no file/thread position).
+        let position = match self.view {
+            View::Overview => String::new(),
+            View::Conversation => format!(
                 " [{}/{}] ",
                 self.conv_cursor + 1,
                 self.review.threads.len().max(1)
-            )
-        } else {
-            format!(
+            ),
+            View::Files => format!(
                 " [{}/{}]{} ",
                 self.current_file() + 1,
                 self.diff.files.len().max(1),
                 self.cursor_anchor()
-            )
+            ),
         };
-        // A clickable layout indicator leads the footer (click toggles it).
-        let mut spans = vec![
-            TextSpan::styled(
+        // A clickable layout indicator leads the footer (click toggles it) — only
+        // where a diff exists; an issue has no layout to switch.
+        let mut spans = Vec::new();
+        if !self.is_issue() {
+            spans.push(TextSpan::styled(
                 self.layout_label(),
                 bar.fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
-            ),
-            TextSpan::styled(position, bar.fg(Color::Cyan)),
-        ];
+            ));
+        }
+        spans.push(TextSpan::styled(position, bar.fg(Color::Cyan)));
         // Horizontal-scroll indicator (only when scrolled and viewing the diff).
         if self.hscroll > 0 && self.view == View::Files {
             spans.push(TextSpan::styled(
@@ -14330,6 +14342,52 @@ mod tests {
                 .last()
                 .is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty())),
             "the overview ends with a blank line"
+        );
+    }
+
+    #[test]
+    fn pr_header_keeps_files_but_drops_the_layout_label() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut pr = pr_app();
+        pr.label = "PR #1".into();
+        pr.pr_overview = Some(overview(PrStatus::Open));
+        let mut term = Terminal::new(TestBackend::new(120, 6)).unwrap();
+        term.draw(|f| pr.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let header: String = (0..120u16).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            header.contains("file"),
+            "PR header keeps the file counter: {header:?}"
+        );
+        assert!(
+            !header.contains("unified") && !header.contains("split"),
+            "the layout label is dropped from the header: {header:?}"
+        );
+    }
+
+    #[test]
+    fn issue_header_and_footer_drop_diff_only_chrome() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut issue = issue_app();
+        issue.label = "Issue #5".into();
+        issue.set_view(View::Overview);
+        issue.status = None;
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| issue.draw(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(
+            !screen.contains("0 file") && !screen.contains("+0 "),
+            "no file counters for a no-diff issue: {screen:?}"
+        );
+        assert!(
+            !screen.contains("unified") && !screen.contains("split"),
+            "no layout indicator for an issue: {screen:?}"
+        );
+        assert!(
+            !screen.contains("[1/"),
+            "no position index in the Overview: {screen:?}"
         );
     }
 

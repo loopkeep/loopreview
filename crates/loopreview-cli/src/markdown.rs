@@ -580,7 +580,9 @@ impl Renderer<'_> {
         self.out.push(TextLine::from(vec![
             TextSpan::styled(bars, Style::default().fg(color)),
             TextSpan::styled(
-                format!("{glyph} {label}"),
+                // Two spaces: the alert glyphs are ambiguous-width and render
+                // wider than counted, so one space reads as cramped.
+                format!("{glyph}  {label}"),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
         ]));
