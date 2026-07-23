@@ -119,13 +119,28 @@ struct Palette {
     selected: usize,
 }
 
-/// Which top-level view is showing (tabs appear once a review has threads).
+/// Which top-level view is showing (tabs appear for any comment-capable source).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum View {
     /// The diff, with comments inline.
     Files,
     /// The comment threads, chronological with replies.
     Conversation,
+}
+
+impl View {
+    /// The tab order, left to right — the cycle `Tab` / `Shift+Tab` walk. Adding
+    /// a tab here (e.g. PR metadata) makes both directions cycle through it.
+    const ORDER: &'static [View] = &[View::Files, View::Conversation];
+
+    /// The next (`forward`) or previous tab in the cycle, wrapping around.
+    fn cycle(self, forward: bool) -> View {
+        let order = View::ORDER;
+        let n = order.len();
+        let i = order.iter().position(|&v| v == self).unwrap_or(0);
+        let delta = if forward { 1 } else { n - 1 };
+        order[(i + delta) % n]
+    }
 }
 
 /// Everything the review UI needs for one session.
@@ -1761,12 +1776,16 @@ impl App {
                 self.quit = true;
                 return;
             }
+            // Tab cycles the tabs forward; Shift+Tab cycles back — reaching it as
+            // BackTab or as Tab carrying SHIFT, since terminals differ. Same gate
+            // as forward: inert when there are no tabs.
             (KeyCode::Tab, _) if self.shows_tabs() => {
-                let next = match self.view {
-                    View::Files => View::Conversation,
-                    View::Conversation => View::Files,
-                };
-                self.set_view(next);
+                let forward = !mods.contains(KeyModifiers::SHIFT);
+                self.set_view(self.view.cycle(forward));
+                return;
+            }
+            (KeyCode::BackTab, _) if self.shows_tabs() => {
+                self.set_view(self.view.cycle(false));
                 return;
             }
             _ => {}
@@ -11381,6 +11400,42 @@ mod tests {
         assert!(!app.shows_tabs(), "so it stays tab-less");
         app.on_key(KeyCode::Tab, KeyModifiers::NONE);
         assert_eq!(app.view, View::Files, "Tab does nothing without tabs");
+        // Shift+Tab is inert too, in both terminal forms.
+        app.on_key(KeyCode::BackTab, KeyModifiers::NONE);
+        assert_eq!(app.view, View::Files, "BackTab is inert without tabs");
+        app.on_key(KeyCode::Tab, KeyModifiers::SHIFT);
+        assert_eq!(app.view, View::Files, "Tab+SHIFT is inert without tabs");
+    }
+
+    #[test]
+    fn shift_tab_cycles_the_tabs_in_reverse() {
+        let mut app = sample_app(); // a repo source: tabs are shown
+        assert_eq!(app.view, View::Files);
+        // BackTab (one way a terminal reports Shift+Tab) cycles a tab back.
+        app.on_key(KeyCode::BackTab, KeyModifiers::NONE);
+        assert_eq!(
+            app.view,
+            View::Conversation,
+            "Shift+Tab from Files reaches Conversation"
+        );
+        app.on_key(KeyCode::BackTab, KeyModifiers::NONE);
+        assert_eq!(app.view, View::Files);
+        // The other form: Tab carrying SHIFT is reverse as well.
+        app.on_key(KeyCode::Tab, KeyModifiers::SHIFT);
+        assert_eq!(app.view, View::Conversation, "Tab+SHIFT is also reverse");
+        // A plain Tab still cycles forward.
+        app.on_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.view, View::Files);
+    }
+
+    #[test]
+    fn view_cycle_wraps_both_directions() {
+        // The reverse-cycle mechanism a future tab (e.g. PR metadata) extends;
+        // with two tabs each direction wraps to the other.
+        assert_eq!(View::Files.cycle(true), View::Conversation);
+        assert_eq!(View::Conversation.cycle(true), View::Files);
+        assert_eq!(View::Files.cycle(false), View::Conversation);
+        assert_eq!(View::Conversation.cycle(false), View::Files);
     }
 
     #[test]

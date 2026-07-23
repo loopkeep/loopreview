@@ -114,7 +114,7 @@ files from a working-tree review.
 | Key | Action |
 | --- | --- |
 | `q` / `Esc` / `Ctrl-C` | Quit |
-| `Tab` | Switch between the Files and Conversation views (always on a repo diff or PR; a plain patch has no tabs) |
+| `Tab` / `Shift+Tab` | Cycle the views forward / back (Files ⇆ Conversation; always on a repo diff or PR, a plain patch has no tabs) |
 | `?` | Open the command palette — a searchable list of every action with its current key; actions that apply right now are listed first, the rest greyed |
 | `b` | Toggle the file-explorer sidebar |
 | `Ctrl-P` | Open the fuzzy file finder |
