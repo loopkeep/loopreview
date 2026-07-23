@@ -49,7 +49,7 @@ use crate::control::{self, UiRequest};
 use crate::highlight::{Highlighter, LineHighlighter, Span as HlSpan};
 use crate::keys::Action;
 use crate::palette::*;
-use crate::prsync::{PrHandle, PrOverview};
+use crate::prsync::{IssueHandle, PrHandle, SubjectOverview, SubjectStatus};
 use crate::store::Store;
 use crate::textarea::TextArea;
 
@@ -190,7 +190,9 @@ pub struct Loaded {
     pub review: Review,
     /// The PR handle, when this load is a pull request (enables sync/submit).
     pub pr: Option<PrHandle>,
-    /// The store key for this PR's drafts (`owner/repo#number`), if a PR.
+    /// The issue handle, when this load is an issue (no diff; conversation only).
+    pub issue: Option<IssueHandle>,
+    /// The store key for the subject's drafts (`owner/repo#number`), PR or issue.
     pub pr_key: Option<String>,
     /// Stale draft ghosts dropped while merging saved drafts (pre-F2 store
     /// contamination); surfaced in the status when non-zero.
@@ -234,7 +236,7 @@ enum JobOutcome {
     /// overview (`None` when the metadata re-fetch failed — keep the old).
     Refreshed {
         threads: Vec<Thread>,
-        overview: Option<PrOverview>,
+        overview: Option<Box<SubjectOverview>>,
     },
     /// The thread (by id) had its resolution synced. Id, not index: the review
     /// can shift while the network job runs.
@@ -252,6 +254,9 @@ enum JobOutcome {
         thread_id: String,
         comment_id: String,
     },
+    /// Issue conversation drafts were posted; stamp each root's remote id so it
+    /// reads as published. `(thread id, remote id)` per posted draft.
+    IssueSent(Vec<(String, Option<String>)>),
 }
 
 /// A background action worker: reports progress, then yields an outcome.
@@ -822,10 +827,13 @@ struct App {
     job: Option<Job>,
     /// The pull-request handle, when reviewing a PR (enables sync/submit).
     pr: Option<Arc<PrHandle>>,
-    /// The PR overview (status + facts + description) for the header badge and the
-    /// Overview tab — resolved at load, re-fetched on refresh so a transition
-    /// (open → merged) or a description edit follows.
-    pr_overview: Option<PrOverview>,
+    /// The issue handle, when reviewing an issue (no diff; a flat conversation
+    /// with a send-only comment path).
+    issue: Option<Arc<IssueHandle>>,
+    /// The subject overview (PR or issue: status + facts + description) for the
+    /// header badge and the Overview tab — resolved at load, re-fetched on refresh
+    /// so a transition (open → merged / closed) or a description edit follows.
+    pr_overview: Option<SubjectOverview>,
     /// The Overview tab's read-only scroll offset (in rendered lines).
     overview_scroll: usize,
     /// The store key for the current PR's drafts (`owner/repo#number`).
@@ -952,6 +960,7 @@ impl App {
             load_error: None,
             job: None,
             pr: None,
+            issue: None,
             pr_overview: None,
             overview_scroll: 0,
             pr_key: None,
@@ -993,7 +1002,13 @@ impl App {
         self.normalize_resolved_drafts();
         self.normalize_conversation_reply_drafts();
         self.pr = loaded.pr.map(Arc::new);
-        self.pr_overview = self.pr.as_deref().map(PrHandle::overview);
+        self.issue = loaded.issue.map(Arc::new);
+        // The overview comes from whichever handle this load carried.
+        self.pr_overview = self
+            .pr
+            .as_deref()
+            .map(PrHandle::overview)
+            .or_else(|| self.issue.as_deref().map(IssueHandle::overview));
         self.overview_scroll = 0;
         self.pr_key = loaded.pr_key;
         self.apply_layout(loaded.diff);
@@ -1002,6 +1017,11 @@ impl App {
         self.conv_cursor = 0;
         self.conv_scroll = 0;
         self.loading = None;
+        // An issue has no diff — open on its Overview (the description is the
+        // content), not the (empty) Files view.
+        if self.issue.is_some() {
+            self.view = View::Overview;
+        }
         if loaded.stale_cleaned > 0 {
             self.status = Some(format!(
                 "cleaned {} stale draft(s) from an old build",
@@ -1064,8 +1084,8 @@ impl App {
                 self.review.threads = merged;
                 // Follow a lifecycle transition (open → merged) or a description
                 // edit; a failed metadata re-fetch (`None`) leaves the old values.
-                if overview.is_some() {
-                    self.pr_overview = overview;
+                if let Some(overview) = overview {
+                    self.pr_overview = Some(*overview);
                 }
                 let mut notes = Vec::new();
                 if cleaned > 0 {
@@ -1135,6 +1155,23 @@ impl App {
                 self.status = Some("deleted from GitHub".to_string());
                 self.relayout();
             }
+            Ok(JobOutcome::IssueSent(sent)) => {
+                let n = sent.len();
+                for (thread_id, remote_id) in sent {
+                    if let Some(root) = self
+                        .review
+                        .thread_mut(&thread_id)
+                        .and_then(|t| t.comments.first_mut())
+                    {
+                        root.remote_id = remote_id;
+                        root.kind = CommentKind::Published;
+                    }
+                }
+                // The posted roots are no longer drafts — drop them from the store.
+                let _ = self.save_pr_drafts();
+                self.status = Some(format!("sent {n} comment(s) to GitHub"));
+                self.relayout();
+            }
             Err(reason) => self.status = Some(format!("failed: {reason}")),
         }
     }
@@ -1170,19 +1207,64 @@ impl App {
             .min(self.review.threads.len().saturating_sub(1));
     }
 
-    /// Re-pull the PR's threads (keeping local drafts).
+    /// Re-pull the subject's threads (keeping local drafts) — a PR's or an
+    /// issue's conversation, with a best-effort facts re-fetch for the badge.
     fn refresh(&mut self) {
-        let Some(pr) = self.pr.clone() else {
+        if let Some(pr) = self.pr.clone() {
+            self.start_job(
+                "Refreshing",
+                Box::new(move |progress| {
+                    progress("fetching comments…");
+                    let threads = pr.pull()?;
+                    // Best-effort: a metadata re-fetch failure keeps the facts.
+                    let overview = pr.fetch_overview().ok().map(Box::new);
+                    Ok(JobOutcome::Refreshed { threads, overview })
+                }),
+            );
+        } else if let Some(issue) = self.issue.clone() {
+            self.start_job(
+                "Refreshing",
+                Box::new(move |progress| {
+                    progress("fetching comments…");
+                    let threads = issue.pull()?;
+                    let overview = issue.fetch_overview().ok().map(Box::new);
+                    Ok(JobOutcome::Refreshed { threads, overview })
+                }),
+            );
+        }
+    }
+
+    /// Post the issue's draft conversation comments (Ctrl-S on an issue). An issue
+    /// has no review to batch into, so each unpublished draft root posts directly
+    /// as an issue comment; replies stay local (the conversation is flat).
+    fn send_issue_drafts(&mut self) {
+        let Some(issue) = self.issue.clone() else {
             return;
         };
+        let drafts: Vec<(String, String)> = self
+            .review
+            .threads
+            .iter()
+            .filter_map(|t| {
+                let root = t.root()?;
+                (root.disposition() == CommentKind::Draft && root.remote_id.is_none())
+                    .then(|| (t.id.clone(), root.body.clone()))
+            })
+            .collect();
+        if drafts.is_empty() {
+            self.status = Some("no drafts to send".to_string());
+            return;
+        }
         self.start_job(
-            "Refreshing",
+            "Sending",
             Box::new(move |progress| {
-                progress("fetching comments…");
-                let threads = pr.pull()?;
-                // Best-effort: a metadata re-fetch failure keeps the current facts.
-                let overview = pr.fetch_overview().ok();
-                Ok(JobOutcome::Refreshed { threads, overview })
+                let mut sent = Vec::new();
+                for (thread_id, body) in &drafts {
+                    progress("posting comment…");
+                    let comment = issue.create_comment(body)?;
+                    sent.push((thread_id.clone(), comment.remote_id));
+                }
+                Ok(JobOutcome::IssueSent(sent))
             }),
         );
     }
@@ -1193,24 +1275,31 @@ impl App {
     /// under the Conversation cursor, else the PR page itself. A launcher that
     /// won't run falls back to printing the URL for the user to open by hand.
     fn open_github(&mut self) {
-        let Some(pr) = self.pr.clone() else {
+        let url = if let Some(pr) = self.pr.clone() {
+            self.github_link(&pr)
+        } else if let Some(issue) = &self.issue {
+            // An issue's page (a comment deep-link isn't needed per the design).
+            issue.url().to_string()
+        } else {
             self.status = Some("no GitHub context here".to_string());
             return;
         };
-        let url = self.github_link(&pr);
         self.status = Some(match crate::opener::open_url(&url) {
             Ok(()) => format!("opened {url}"),
             Err(_) => format!("open it yourself: {url}"),
         });
     }
 
-    /// Open the pull request's page (its `#N` header link, clicked). Reuses the
-    /// same launcher as `open_github`; a plain review has no page.
+    /// Open the subject's page (its `#N` header link, clicked). Reuses the same
+    /// launcher as `open_github`; a plain review has no page.
     fn open_pr_page(&mut self) {
-        let Some(pr) = self.pr.clone() else {
+        let url = if let Some(pr) = self.pr.clone() {
+            pr.url().to_string()
+        } else if let Some(issue) = &self.issue {
+            issue.url().to_string()
+        } else {
             return;
         };
-        let url = pr.url().to_string();
         self.status = Some(match crate::opener::open_url(&url) {
             Ok(()) => format!("opened {url}"),
             Err(_) => format!("open it yourself: {url}"),
@@ -1692,7 +1781,17 @@ impl App {
     /// pull request. A bare stdin/file patch carries neither, so it stays a
     /// lightweight pager with no comment surface.
     fn comments_enabled(&self) -> bool {
-        self.store.is_some() || self.pr.is_some()
+        self.store.is_some() || self.has_subject()
+    }
+
+    /// Whether this session reviews a GitHub subject — a pull request or an issue.
+    fn has_subject(&self) -> bool {
+        self.pr.is_some() || self.issue.is_some()
+    }
+
+    /// Whether this session reviews an issue (no diff; a flat conversation).
+    fn is_issue(&self) -> bool {
+        self.issue.is_some()
     }
 
     /// Whether the Conversation | Files tab structure is shown. A comment-capable
@@ -1704,11 +1803,13 @@ impl App {
         self.comments_enabled() || self.has_review()
     }
 
-    /// Whether `view` is reachable right now — the Overview only on a pull request.
+    /// Whether `view` is reachable right now: the Overview on a PR or an issue;
+    /// Files on anything with a diff (an issue has none, so it drops the tab).
     fn view_available(&self, view: View) -> bool {
         match view {
-            View::Overview => self.pr.is_some(),
-            View::Files | View::Conversation => true,
+            View::Overview => self.has_subject(),
+            View::Files => !self.is_issue(),
+            View::Conversation => true,
         }
     }
 
@@ -1867,8 +1968,11 @@ impl App {
             Action::ToggleSidebar => return self.toggle_sidebar(),
             Action::FileFinder => return self.open_finder(),
             Action::Palette => return self.open_palette(),
-            Action::Refresh if self.pr.is_some() => return self.refresh(),
+            Action::Refresh if self.has_subject() => return self.refresh(),
+            // A PR opens the submit modal (pick an event); an issue has no review,
+            // so its drafts post directly.
             Action::Submit if self.pr.is_some() => return self.open_submit(),
+            Action::Submit if self.issue.is_some() => return self.send_issue_drafts(),
             Action::OpenGithub => return self.open_github(),
             _ => {}
         }
@@ -1923,8 +2027,11 @@ impl App {
     fn action_available(&self, action: Action) -> bool {
         use Action::*;
         match action {
-            ToggleSidebar | FileFinder | Palette => return true,
-            Refresh | Submit | OpenGithub => return self.pr.is_some(),
+            ToggleSidebar | Palette => return true,
+            // The file finder needs files; an issue (no diff) has none.
+            FileFinder => return !self.diff.files.is_empty(),
+            Refresh | OpenGithub => return self.has_subject(),
+            Submit => return self.has_subject(),
             _ => {}
         }
         let in_sidebar =
@@ -2104,22 +2211,39 @@ impl App {
             // A published comment always names a single comment; delete it on
             // GitHub, then remove it locally by id when the job succeeds.
             Some(endpoint) => {
-                let (Some(comment_id), Some(pr)) = (target.comment_id, self.pr.clone()) else {
+                let Some(comment_id) = target.comment_id else {
                     return;
                 };
                 let thread_id = target.thread_id;
-                self.start_job(
-                    "Deleting on GitHub",
-                    Box::new(move |progress| {
-                        progress("deleting comment…");
-                        pr.delete_published(endpoint)
-                            .map_err(friendly_github_write_error)?;
-                        Ok(JobOutcome::Deleted {
-                            thread_id,
-                            comment_id,
-                        })
-                    }),
-                );
+                // Route to whichever handle owns the published comment.
+                if let Some(pr) = self.pr.clone() {
+                    self.start_job(
+                        "Deleting on GitHub",
+                        Box::new(move |progress| {
+                            progress("deleting comment…");
+                            pr.delete_published(endpoint)
+                                .map_err(friendly_github_write_error)?;
+                            Ok(JobOutcome::Deleted {
+                                thread_id,
+                                comment_id,
+                            })
+                        }),
+                    );
+                } else if let Some(issue) = self.issue.clone() {
+                    self.start_job(
+                        "Deleting on GitHub",
+                        Box::new(move |progress| {
+                            progress("deleting comment…");
+                            issue
+                                .delete_published(endpoint)
+                                .map_err(friendly_github_write_error)?;
+                            Ok(JobOutcome::Deleted {
+                                thread_id,
+                                comment_id,
+                            })
+                        }),
+                    );
+                }
             }
             // Local removal: re-resolve the ids to fresh indices — the review may
             // have changed between arming and confirming (an agent event).
@@ -2205,7 +2329,7 @@ impl App {
                 // Not mine by local author — ownership hinges on the GitHub login;
                 // if that is unknown (gh unreachable at load) say so rather than
                 // flatly "not yours".
-                if self.pr.is_some() && self.pr.as_deref().and_then(|p| p.viewer()).is_none() {
+                if self.has_subject() && self.viewer().is_none() {
                     return Err(
                         "can't confirm your GitHub identity — check `gh auth login`".to_string()
                     );
@@ -2366,7 +2490,16 @@ impl App {
         if comment.author == self.author {
             return true;
         }
-        self.pr.as_deref().and_then(|p| p.viewer()) == Some(comment.author.as_str())
+        self.viewer() == Some(comment.author.as_str())
+    }
+
+    /// The authenticated GitHub login for this session's subject (a PR or an
+    /// issue), when known — for gating edits/deletes to the viewer's own comments.
+    fn viewer(&self) -> Option<&str> {
+        self.pr
+            .as_deref()
+            .and_then(|p| p.viewer())
+            .or_else(|| self.issue.as_deref().and_then(|i| i.viewer()))
     }
 
     /// Open the composer to edit the targeted comment, pre-filled with its body.
@@ -2390,10 +2523,7 @@ impl App {
             // For a published comment, ownership hinges on the GitHub login; if
             // that is unknown (gh unreachable at load) say so rather than implying
             // the comment isn't yours.
-            if published
-                && self.pr.is_some()
-                && self.pr.as_deref().and_then(|p| p.viewer()).is_none()
-            {
+            if published && self.has_subject() && self.viewer().is_none() {
                 self.status =
                     Some("can't confirm your GitHub identity — check `gh auth login`".to_string());
                 return;
@@ -2798,8 +2928,14 @@ impl App {
         let Some(thread) = self.review.threads.get(idx) else {
             return false;
         };
-        if self.pr.is_none() {
+        // A plain local review resolves everything (a local concept).
+        if !self.has_subject() {
             return true;
+        }
+        // An issue's threads are all conversation comments: a local one resolves
+        // locally; a published one has no GitHub resolve (issues can't resolve).
+        if self.is_issue() {
+            return !thread.root().is_some_and(|c| c.remote_id.is_some());
         }
         if matches!(thread.anchor, Anchor::Review) {
             return false;
@@ -3929,9 +4065,10 @@ impl App {
             ComposeKind::Edit { thread, comment } => {
                 match self.published_endpoint(&thread, &comment) {
                     // A published comment: save the edit back to GitHub, then
-                    // apply it locally when the job reports success.
-                    Some(endpoint) => match self.pr.clone() {
-                        Some(pr) => {
+                    // apply it locally when the job reports success — routed to
+                    // whichever handle (PR or issue) owns it.
+                    Some(endpoint) => {
+                        if let Some(pr) = self.pr.clone() {
                             self.start_job(
                                 "Editing on GitHub",
                                 Box::new(move |progress| {
@@ -3946,9 +4083,26 @@ impl App {
                                 }),
                             );
                             None
+                        } else if let Some(issue) = self.issue.clone() {
+                            self.start_job(
+                                "Editing on GitHub",
+                                Box::new(move |progress| {
+                                    progress("updating comment…");
+                                    issue
+                                        .edit_published(endpoint, &body)
+                                        .map_err(friendly_github_write_error)?;
+                                    Ok(JobOutcome::Edited {
+                                        thread_id: thread,
+                                        comment_id: comment,
+                                        body,
+                                    })
+                                }),
+                            );
+                            None
+                        } else {
+                            Some("no GitHub subject to save the edit to".to_string())
                         }
-                        None => Some("no pull request to save the edit to".to_string()),
-                    },
+                    }
                     // An unpublished draft or local note: edit in place.
                     None => {
                         if self.edit_comment(&thread, &comment, &body) {
@@ -4191,20 +4345,20 @@ impl App {
     /// plain diff (no PR) has no subject.
     fn subject_info(&self) -> Option<Box<SubjectInfo>> {
         let ov = self.pr_overview.as_ref()?;
+        let kind = match ov.kind {
+            loopreview_github::SubjectKind::Pr => "pr",
+            loopreview_github::SubjectKind::Issue => "issue",
+        };
         Some(Box::new(SubjectInfo {
-            kind: "pr".to_string(),
+            kind: kind.to_string(),
             number: ov.number,
             title: ov.title.clone(),
-            status: ov.status.label().to_lowercase(),
+            status: ov.status.wire().to_string(),
             author: ov.author.clone(),
-            base: Some(ov.base_ref.clone()),
-            head: Some(ov.head_ref.clone()),
+            base: ov.base_ref.clone(),
+            head: ov.head_ref.clone(),
             body: ov.body.clone(),
-            url: self
-                .pr
-                .as_deref()
-                .map(|p| p.url().to_string())
-                .unwrap_or_default(),
+            url: ov.url.clone(),
         }))
     }
 
@@ -5699,7 +5853,7 @@ impl App {
             TextSpan::styled(
                 ov.status.label(),
                 Style::default()
-                    .fg(pr_status_color(ov.status))
+                    .fg(subject_status_color(ov.status))
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
@@ -5710,18 +5864,27 @@ impl App {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )));
-        // Author · base ← head · opened [· merged].
+        // Author · [base ← head ·] opened [· merged/closed]. An issue has no
+        // branches, so base/head are absent.
         let author = if ov.author.is_empty() {
             "unknown".to_string()
         } else {
             format!("@{}", ov.author)
         };
-        let mut facts = format!("{author}  ·  {} ← {}", ov.base_ref, ov.head_ref);
+        let mut facts = author;
+        if let (Some(base), Some(head)) = (&ov.base_ref, &ov.head_ref) {
+            facts.push_str(&format!("  ·  {base} ← {head}"));
+        }
         if let Some(created) = ov.created_at.as_deref() {
             facts.push_str(&format!("  ·  opened {}", date_only(created)));
         }
-        if let Some(merged) = ov.merged_at.as_deref() {
-            facts.push_str(&format!("  ·  merged {}", date_only(merged)));
+        if let Some(closed) = ov.closed_at.as_deref() {
+            let verb = if matches!(ov.status, SubjectStatus::Pr(PrStatus::Merged)) {
+                "merged"
+            } else {
+                "closed"
+            };
+            facts.push_str(&format!("  ·  {verb} {}", date_only(closed)));
         }
         lines.push(TextLine::from(TextSpan::styled(
             facts,
@@ -5932,7 +6095,7 @@ impl App {
             if let Some(status) = self.pr_overview.as_ref().map(|o| o.status) {
                 spans.push(TextSpan::styled(
                     format!(" {}", status.label()),
-                    bar.fg(pr_status_color(status)),
+                    bar.fg(subject_status_color(status)),
                 ));
             }
             spans.push(TextSpan::styled(" ", bar.fg(Color::Gray)));
@@ -7749,12 +7912,17 @@ fn outdated_flags(review: &Review, placed: &[bool]) -> Vec<bool> {
 /// A human label for where a thread is anchored.
 /// The header-badge color for a PR status, following GitHub's color semantics:
 /// open is green, merged is magenta/purple, closed is red, a draft is dim gray.
-fn pr_status_color(status: PrStatus) -> Color {
+fn subject_status_color(status: SubjectStatus) -> Color {
+    use loopreview_github::IssueStatus;
     match status {
-        PrStatus::Open => Color::Green,
-        PrStatus::Merged => Color::Magenta,
-        PrStatus::Closed => Color::Red,
-        PrStatus::Draft => Color::DarkGray,
+        SubjectStatus::Pr(PrStatus::Open) => Color::Green,
+        SubjectStatus::Pr(PrStatus::Merged) => Color::Magenta,
+        SubjectStatus::Pr(PrStatus::Closed) => Color::Red,
+        SubjectStatus::Pr(PrStatus::Draft) => Color::DarkGray,
+        // An issue: open green, closed (completed) magenta, not planned dim.
+        SubjectStatus::Issue(IssueStatus::Open) => Color::Green,
+        SubjectStatus::Issue(IssueStatus::Closed) => Color::Magenta,
+        SubjectStatus::Issue(IssueStatus::NotPlanned) => Color::DarkGray,
     }
 }
 
@@ -9062,18 +9230,144 @@ mod tests {
     }
 
     /// A PR overview snapshot for header/Overview tests.
-    fn overview(status: PrStatus) -> PrOverview {
-        PrOverview {
+    fn overview(status: PrStatus) -> SubjectOverview {
+        SubjectOverview {
+            kind: loopreview_github::SubjectKind::Pr,
             number: 1,
-            status,
+            status: SubjectStatus::Pr(status),
             title: "Add the thing".into(),
             author: "octocat".into(),
-            base_ref: "main".into(),
-            head_ref: "feature".into(),
+            base_ref: Some("main".into()),
+            head_ref: Some("feature".into()),
             created_at: Some("2026-07-20T10:00:00Z".into()),
-            merged_at: None,
+            closed_at: None,
             body: String::new(),
+            url: "https://github.com/owner/repo/pull/1".into(),
         }
+    }
+
+    /// An issue overview snapshot (no branches).
+    fn issue_overview(status: loopreview_github::IssueStatus) -> SubjectOverview {
+        SubjectOverview {
+            kind: loopreview_github::SubjectKind::Issue,
+            number: 5,
+            status: SubjectStatus::Issue(status),
+            title: "Flaky retry".into(),
+            author: "octocat".into(),
+            base_ref: None,
+            head_ref: None,
+            created_at: Some("2026-07-20T10:00:00Z".into()),
+            closed_at: None,
+            body: "It flakes under load.".into(),
+            url: "https://github.com/owner/repo/issues/5".into(),
+        }
+    }
+
+    /// An app reviewing an issue (no diff, a flat conversation).
+    fn issue_app() -> App {
+        let mut app = sample_app();
+        app.issue = Some(Arc::new(crate::prsync::IssueHandle::for_test(
+            5,
+            "Flaky retry",
+        )));
+        app.pr_key = Some("owner/repo#5".into());
+        app.pr_overview = Some(issue_overview(loopreview_github::IssueStatus::Open));
+        app
+    }
+
+    #[test]
+    fn an_issue_session_shows_overview_and_conversation_only() {
+        let app = issue_app();
+        assert!(app.is_issue());
+        assert!(app.has_subject());
+        assert_eq!(
+            app.visible_views(),
+            vec![View::Overview, View::Conversation],
+            "an issue has no Files tab"
+        );
+        assert!(app.shows_tabs());
+        assert!(!app.view_available(View::Files));
+    }
+
+    #[test]
+    fn installing_an_issue_load_opens_the_overview() {
+        let mut app = sample_app();
+        app.view = View::Files;
+        app.install_loaded(Loaded {
+            label: "issue owner/repo#5".into(),
+            diff: Diff::default(),
+            review: Review::default(),
+            pr: None,
+            issue: Some(crate::prsync::IssueHandle::for_test(5, "t")),
+            pr_key: Some("owner/repo#5".into()),
+            stale_cleaned: 0,
+        });
+        assert_eq!(app.view, View::Overview, "an issue opens on its Overview");
+        assert!(app.is_issue());
+        assert!(app.pr_overview.is_some(), "the issue overview is installed");
+    }
+
+    #[test]
+    fn the_issue_overview_renders_its_facts() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = issue_app();
+        app.set_view(View::Overview);
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("#5"), "the issue number: {screen:?}");
+        assert!(screen.contains("Open"), "the status badge");
+        assert!(screen.contains("Flaky retry"), "the title");
+        assert!(screen.contains("@octocat"), "the author");
+        assert!(!screen.contains('←'), "an issue has no base ← head");
+        assert!(screen.contains("flakes under load"), "the body");
+    }
+
+    #[test]
+    fn an_issue_reports_its_subject_kind() {
+        let app = issue_app();
+        let subject = app.subject_info().expect("an issue carries a subject");
+        assert_eq!(subject.kind, "issue");
+        assert_eq!(subject.number, 5);
+        assert_eq!(subject.status, "open");
+        assert!(
+            subject.base.is_none() && subject.head.is_none(),
+            "an issue has no branches"
+        );
+    }
+
+    #[test]
+    fn an_issue_thread_resolves_locally_but_not_when_published() {
+        let mut app = issue_app();
+        // A local (unpublished) conversation thread resolves locally.
+        app.review.threads.push(Thread {
+            id: "local".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![comment_of("c", "tester", None, CommentKind::Local)],
+        });
+        // A published issue comment has no GitHub resolve.
+        app.review.threads.push(Thread {
+            id: "pub".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![comment_of(
+                "p",
+                "octocat",
+                Some("9"),
+                CommentKind::Published,
+            )],
+        });
+        app.relayout();
+        assert!(
+            app.is_resolvable(0),
+            "a local issue thread resolves locally"
+        );
+        assert!(
+            !app.is_resolvable(1),
+            "a published issue comment can't resolve"
+        );
     }
 
     fn add(app: &mut App, line: u32, draft: bool) {
@@ -12047,12 +12341,15 @@ mod tests {
         app.pr_overview = Some(overview(PrStatus::Open));
         // A fresh overview (open → merged) is applied on refresh.
         let mut merged = overview(PrStatus::Merged);
-        merged.merged_at = Some("2026-07-22T00:00:00Z".into());
+        merged.closed_at = Some("2026-07-22T00:00:00Z".into());
         app.apply_job(Ok(JobOutcome::Refreshed {
             threads: Vec::new(),
-            overview: Some(merged),
+            overview: Some(Box::new(merged)),
         }));
-        assert_eq!(app.pr_overview.as_ref().unwrap().status, PrStatus::Merged);
+        assert_eq!(
+            app.pr_overview.as_ref().unwrap().status,
+            SubjectStatus::Pr(PrStatus::Merged)
+        );
         // A failed re-fetch (None) keeps the current overview.
         app.apply_job(Ok(JobOutcome::Refreshed {
             threads: Vec::new(),
@@ -12060,7 +12357,7 @@ mod tests {
         }));
         assert_eq!(
             app.pr_overview.as_ref().unwrap().status,
-            PrStatus::Merged,
+            SubjectStatus::Pr(PrStatus::Merged),
             "a failed metadata re-fetch keeps the last overview"
         );
     }

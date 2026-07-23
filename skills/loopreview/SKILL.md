@@ -52,15 +52,20 @@ lr session comment list [<id>|--repo .] [--json]
 
 - `list`/`get` report the session id, pid, repo, and **source** — a descriptive
   label such as `working tree`, `git diff main...`, `show HEAD~1 (a1b2c3d)` (one
-  commit's changes), or `pull request`. When a repo has more than one live
-  session (say a worktree review and a `lr show`), match on the source string to
-  pick the id you want.
-- On a **pull-request** session, `get` also carries a `subject` object:
-  `{kind: "pr", number, title, status, author, base, head, body, url}` (`status`
-  is lowercase — `draft`/`open`/`merged`/`closed`; `body` is the PR description in
-  markdown). **Read it before you start reviewing** — the title and description
-  are the change's stated intent, the primary context for judging the diff. A
-  plain diff session has no `subject`.
+  commit's changes), `PR #7`, or `issue owner/repo#5`. When a repo has more than
+  one live session (say a worktree review and a `lr show`), match on the source
+  string to pick the id you want.
+- On a **pull-request or issue** session, `get` also carries a `subject` object:
+  `{kind, number, title, status, author, base, head, body, url}`. `kind` is `pr`
+  or `issue`; `status` is lowercase (a PR: `draft`/`open`/`merged`/`closed`; an
+  issue: `open`/`closed`/`not_planned`); `base`/`head` are present only for a PR;
+  `body` is the description in markdown. **Read it before you start reviewing** —
+  the title and description are the stated intent, the primary context for judging
+  the change. A plain diff session has no `subject`.
+- An **issue** session has no diff: `review --json` returns an empty `files` list
+  (its content is the conversation and the `subject` body), and `navigate --file`
+  has nothing to point at. Read the `subject` and the threads; comment with
+  `comment add --conversation` (a line comment has no meaning without files).
 - `context` reports the human's current view (`files`/`conversation`), the line
   under their cursor, the thread there (if any), and `event_seq` — the latest
   event number, which you pass to `wait --after` to avoid missing events.

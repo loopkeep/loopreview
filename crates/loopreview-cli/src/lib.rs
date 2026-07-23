@@ -188,12 +188,40 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
     let session_dir = Some(dir.clone());
     let draft_common = common;
     let loader: ui::Loader = Box::new(move |progress| {
-        let (handle, label, diff, threads) = prsync::fetch(dir, pr_query, progress)?;
-        let pr_key = handle.pr_key();
+        // Resolve the reference to its true type, then open a PR (with its diff)
+        // or an issue (conversation only, no diff).
+        let (label, diff, threads, pr, issue, key) =
+            match prsync::fetch_subject(dir, pr_query, progress)? {
+                prsync::Opened::Pr {
+                    handle,
+                    label,
+                    diff,
+                    threads,
+                } => {
+                    let key = handle.pr_key();
+                    (label, diff, threads, Some(handle), None, key)
+                }
+                prsync::Opened::Issue {
+                    handle,
+                    label,
+                    threads,
+                } => {
+                    let key = handle.draft_key();
+                    (
+                        label,
+                        loopreview_core::Diff::default(),
+                        threads,
+                        None,
+                        Some(handle),
+                        key,
+                    )
+                }
+            };
+        // Drafts persist under the same `owner/repo#N` key whether PR or issue.
         let (review, stale_cleaned) = match draft_common.as_deref().and_then(store::Store::for_repo)
         {
             Some(store) => {
-                let drafts = store.load_pr_drafts(&pr_key).unwrap_or_default();
+                let drafts = store.load_pr_drafts(&key).unwrap_or_default();
                 // Orphan drops are surfaced on an explicit refresh; at first load
                 // there is no prior view to have shown the note, so only the stale
                 // ghost count feeds the startup notice.
@@ -207,8 +235,9 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
             diff,
             review,
             stale_cleaned,
-            pr: Some(handle),
-            pr_key: Some(pr_key),
+            pr,
+            issue,
+            pr_key: Some(key),
         })
     });
 

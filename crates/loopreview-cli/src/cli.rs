@@ -1,7 +1,8 @@
 //! The command-line surface.
 //!
 //! Bare `lr` is dispatch sugar: a GitHub reference (`lr 123` / `lr owner/repo#N`
-//! / a URL) or `lr --detect` opens a pull request; otherwise a piped patch, else
+//! / a URL) opens a pull request or issue (the type is resolved at load), or
+//! `lr --detect` opens the current branch's PR; otherwise a piped patch, else
 //! the working tree. `lr diff` reviews a VCS diff and never reads stdin; `lr
 //! patch` reviews a unified-diff patch from a file or stdin; `lr show [target]`
 //! reviews one commit's own changes. The hidden `daemon` verb stays reserved for
@@ -53,12 +54,12 @@ pub enum WaitEvent {
 #[command(
     name = "loopreview",
     version,
-    about = "Review a diff, or a GitHub pull request, in an interactive terminal UI",
+    about = "Review a diff, or a GitHub pull request or issue, in an interactive terminal UI",
     long_about = "loopreview (lr) opens a diff for review in an interactive terminal UI.\n\n\
         With no arguments it shows the working tree, or a patch piped in with `git diff | lr`.\n\
-        `lr <ref>` reviews a GitHub pull request — a number (`123`), `#N`, `owner/repo#N`, or a URL \
-        (quote `#N`, since most shells treat a bare `#` as a comment); `lr --detect` opens the \
-        current branch's pull request.\n\
+        `lr <ref>` reviews a GitHub pull request or issue — a number (`123`), `#N`, `owner/repo#N`, \
+        or a URL (quote `#N`, since most shells treat a bare `#` as a comment); the type is resolved \
+        automatically. `lr --detect` opens the current branch's pull request.\n\
         `lr diff <target>` compares git refs; `lr patch <file>` reviews a saved patch; \
         `lr show [commit]` reviews one commit's own changes.",
     disable_help_subcommand = true,
@@ -67,9 +68,10 @@ pub enum WaitEvent {
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
-    /// A GitHub pull request to review: a number (`123`), `#N`, `owner/repo#N`,
-    /// or a URL. Quote `#N` — most shells treat a bare `#` as a comment.
-    #[arg(value_name = "PR")]
+    /// A GitHub pull request or issue to review: a number (`123`), `#N`,
+    /// `owner/repo#N`, or a URL — the type is resolved automatically. Quote `#N`
+    /// — most shells treat a bare `#` as a comment.
+    #[arg(value_name = "REF")]
     target: Option<String>,
     /// Review the pull request for the current branch (no reference needed).
     #[arg(long)]

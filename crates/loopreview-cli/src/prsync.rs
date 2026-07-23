@@ -8,9 +8,10 @@
 
 use std::path::PathBuf;
 
-use loopreview_core::{Anchor, Diff, DiffSource, Review, Thread};
+use loopreview_core::{Anchor, Comment, Diff, DiffSource, Review, Thread};
 use loopreview_github::{
-    CommentEndpoint, GithubClient, PrQuery, PrStatus, ResolvedPr, ReviewEvent,
+    CommentEndpoint, GithubClient, IssueStatus, PrQuery, PrStatus, ResolvedIssue, ResolvedPr,
+    ReviewEvent, Subject, SubjectKind,
 };
 
 /// Build a [`PrQuery`] from the CLI arguments, or an error message.
@@ -26,56 +27,247 @@ pub fn query(text: Option<String>, detect: bool) -> Result<PrQuery, String> {
     })
 }
 
-/// Resolve a PR and fetch its diff and threads, reporting progress. Returns a
-/// handle for later syncs, the header label, the diff, and the pulled threads.
-pub fn fetch(
+/// What opening a GitHub reference yields once its true type is known — a pull
+/// request (with its diff) or an issue (conversation only, no diff).
+pub enum Opened {
+    Pr {
+        handle: PrHandle,
+        label: String,
+        diff: Diff,
+        threads: Vec<Thread>,
+    },
+    Issue {
+        handle: IssueHandle,
+        label: String,
+        threads: Vec<Thread>,
+    },
+}
+
+/// Resolve a reference to its true type and fetch it — a pull request (diff +
+/// threads) or an issue (its flat conversation). The type is decided by the API
+/// ([`GithubClient::resolve_subject`]), never the reference's look.
+pub fn fetch_subject(
     dir: PathBuf,
     query: PrQuery,
     progress: &dyn Fn(&str),
-) -> Result<(PrHandle, String, Diff, Vec<Thread>), String> {
+) -> Result<Opened, String> {
     let client = GithubClient::new(dir);
-    progress("resolving pull request…");
-    let pr = client.resolve_pr(&query).map_err(|e| e.to_string())?;
-    let label = pr.label();
-    progress(&format!("fetching {label} diff…"));
-    let diff = client.pr_source(&pr).load().map_err(|e| e.to_string())?;
-    progress("fetching comments…");
-    let threads = client.pull(&pr).map_err(|e| e.to_string())?;
-    // The viewer's login gates editing/deleting their own published comments.
-    // Best-effort: a failure here just means those affordances stay off.
-    let viewer = client.viewer_login().ok();
-    Ok((PrHandle { client, pr, viewer }, label, diff, threads))
+    progress("resolving…");
+    match client.resolve_subject(&query).map_err(|e| e.to_string())? {
+        Subject::Pr(pr) => {
+            let label = pr.label();
+            progress(&format!("fetching {label} diff…"));
+            let diff = client.pr_source(&pr).load().map_err(|e| e.to_string())?;
+            progress("fetching comments…");
+            let threads = client.pull(&pr).map_err(|e| e.to_string())?;
+            let viewer = client.viewer_login().ok();
+            Ok(Opened::Pr {
+                handle: PrHandle { client, pr, viewer },
+                label,
+                diff,
+                threads,
+            })
+        }
+        Subject::Issue(issue) => {
+            let label = format!("issue {}#{}", issue.slug(), issue.number);
+            progress(&format!("fetching {label} comments…"));
+            let threads = client.pull_issue(&issue).map_err(|e| e.to_string())?;
+            let viewer = client.viewer_login().ok();
+            Ok(Opened::Issue {
+                handle: IssueHandle {
+                    client,
+                    issue,
+                    viewer,
+                },
+                label,
+                threads,
+            })
+        }
+    }
 }
 
-/// The PR facts the Overview tab shows: the lifecycle status, the header line
-/// facts, and the markdown description. A plain snapshot, refreshed on Ctrl-R.
+/// A subject's lifecycle status — a pull request's or an issue's — for the badge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubjectStatus {
+    Pr(PrStatus),
+    Issue(IssueStatus),
+}
+
+impl SubjectStatus {
+    /// The badge text.
+    pub fn label(self) -> &'static str {
+        match self {
+            SubjectStatus::Pr(s) => s.label(),
+            SubjectStatus::Issue(s) => s.label(),
+        }
+    }
+
+    /// The lowercase machine-readable status for the control plane — a PR is
+    /// `draft`/`open`/`merged`/`closed`, an issue adds `not_planned`.
+    pub fn wire(self) -> &'static str {
+        match self {
+            SubjectStatus::Pr(PrStatus::Draft) => "draft",
+            SubjectStatus::Pr(PrStatus::Open) => "open",
+            SubjectStatus::Pr(PrStatus::Merged) => "merged",
+            SubjectStatus::Pr(PrStatus::Closed) => "closed",
+            SubjectStatus::Issue(IssueStatus::Open) => "open",
+            SubjectStatus::Issue(IssueStatus::Closed) => "closed",
+            SubjectStatus::Issue(IssueStatus::NotPlanned) => "not_planned",
+        }
+    }
+}
+
+/// The facts the Overview tab shows for the subject under review — a pull request
+/// or an issue: its status, header facts, and markdown description. A plain
+/// snapshot, refreshed on Ctrl-R.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrOverview {
+pub struct SubjectOverview {
+    /// `pr` or `issue` — drives `subject.kind` and the no-diff layout.
+    pub kind: SubjectKind,
     pub number: u64,
-    pub status: PrStatus,
+    pub status: SubjectStatus,
     pub title: String,
-    /// The PR author's login (may be empty when unknown).
+    /// The author's login (may be empty when unknown).
     pub author: String,
-    pub base_ref: String,
-    pub head_ref: String,
+    /// The base branch — a pull request only (absent for an issue).
+    pub base_ref: Option<String>,
+    /// The head branch — a pull request only.
+    pub head_ref: Option<String>,
     pub created_at: Option<String>,
-    pub merged_at: Option<String>,
-    /// The PR description (markdown).
+    /// The terminal timestamp: a PR's merge time, or an issue's close time.
+    pub closed_at: Option<String>,
+    /// The description (markdown).
     pub body: String,
+    /// The canonical URL.
+    pub url: String,
 }
 
-impl PrOverview {
-    fn from_pr(pr: &ResolvedPr) -> PrOverview {
-        PrOverview {
+impl SubjectOverview {
+    fn from_pr(pr: &ResolvedPr) -> SubjectOverview {
+        SubjectOverview {
+            kind: SubjectKind::Pr,
             number: pr.number,
-            status: pr.status(),
+            status: SubjectStatus::Pr(pr.status()),
             title: pr.title.clone(),
             author: pr.author_login().to_string(),
-            base_ref: pr.base_ref.clone(),
-            head_ref: pr.head_ref.clone(),
+            base_ref: Some(pr.base_ref.clone()),
+            head_ref: Some(pr.head_ref.clone()),
             created_at: pr.created_at.clone(),
-            merged_at: pr.merged_at.clone(),
+            closed_at: pr.merged_at.clone(),
             body: pr.body.clone(),
+            url: pr.url.clone(),
+        }
+    }
+
+    fn from_issue(issue: &ResolvedIssue) -> SubjectOverview {
+        SubjectOverview {
+            kind: SubjectKind::Issue,
+            number: issue.number,
+            status: SubjectStatus::Issue(issue.status()),
+            title: issue.title.clone(),
+            author: issue.author.clone(),
+            base_ref: None,
+            head_ref: None,
+            created_at: issue.created_at.clone(),
+            closed_at: issue.closed_at.clone(),
+            body: issue.body.clone(),
+            url: issue.url.clone(),
+        }
+    }
+}
+
+/// A resolved issue plus a client — the no-diff analogue of [`PrHandle`]. An
+/// issue has no diff and no review threads; its conversation is a flat comment
+/// timeline, and there is no review to submit (a draft posts directly).
+pub struct IssueHandle {
+    client: GithubClient,
+    issue: ResolvedIssue,
+    /// The authenticated GitHub login — gates editing/deleting the viewer's own
+    /// published comments.
+    viewer: Option<String>,
+}
+
+impl IssueHandle {
+    /// The store key for this issue's drafts, `owner/repo#number` — the same
+    /// keyspace as a PR (a number is either a PR or an issue, never both).
+    pub fn draft_key(&self) -> String {
+        format!("{}#{}", self.issue.slug(), self.issue.number)
+    }
+
+    /// The canonical issue URL — the page to open, and a published comment's
+    /// deep-link base.
+    pub fn url(&self) -> &str {
+        &self.issue.url
+    }
+
+    /// The authenticated GitHub login, when known.
+    pub fn viewer(&self) -> Option<&str> {
+        self.viewer.as_deref()
+    }
+
+    /// The issue overview (status + facts + description), for the header badge and
+    /// the Overview tab.
+    pub fn overview(&self) -> SubjectOverview {
+        SubjectOverview::from_issue(&self.issue)
+    }
+
+    /// Re-fetch the issue overview — facts follow a close or a body edit on Ctrl-R.
+    pub fn fetch_overview(&self) -> Result<SubjectOverview, String> {
+        let fresh = self
+            .client
+            .refresh_issue(&self.issue)
+            .map_err(|e| e.to_string())?;
+        Ok(SubjectOverview::from_issue(&fresh))
+    }
+
+    /// Re-pull the issue's conversation.
+    pub fn pull(&self) -> Result<Vec<Thread>, String> {
+        self.client
+            .pull_issue(&self.issue)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Post a new comment to the issue (the send path — an issue has no review to
+    /// batch into, so a draft sends directly).
+    pub fn create_comment(&self, body: &str) -> Result<Comment, String> {
+        self.client
+            .create_issue_comment(&self.issue, body)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Edit a published issue comment on GitHub (the viewer's own only).
+    pub fn edit_published(&self, endpoint: CommentEndpoint, body: &str) -> Result<(), String> {
+        self.client
+            .edit_issue_comment(&self.issue, endpoint, body)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Delete a published issue comment on GitHub (the viewer's own, confirmed).
+    pub fn delete_published(&self, endpoint: CommentEndpoint) -> Result<(), String> {
+        self.client
+            .delete_issue_comment(&self.issue, endpoint)
+            .map_err(|e| e.to_string())
+    }
+
+    /// An offline handle for tests (no network calls are made).
+    #[cfg(test)]
+    pub fn for_test(number: u64, title: &str) -> IssueHandle {
+        IssueHandle {
+            client: GithubClient::new(std::env::temp_dir()),
+            issue: ResolvedIssue {
+                owner: "owner".into(),
+                repo: "repo".into(),
+                number,
+                title: title.into(),
+                state: "OPEN".into(),
+                state_reason: None,
+                author: "author".into(),
+                created_at: None,
+                closed_at: None,
+                body: String::new(),
+                url: format!("https://github.com/owner/repo/issues/{number}"),
+            },
+            viewer: Some("tester".into()),
         }
     }
 }
@@ -152,19 +344,19 @@ impl PrHandle {
 
     /// The PR overview (status + facts + description), for the header badge and
     /// the Overview tab — as resolved at load.
-    pub fn overview(&self) -> PrOverview {
-        PrOverview::from_pr(&self.pr)
+    pub fn overview(&self) -> SubjectOverview {
+        SubjectOverview::from_pr(&self.pr)
     }
 
     /// Re-fetch the PR overview from GitHub — the refresh path, so the badge and
     /// the Overview follow a transition (open → merged) or a description edit on
     /// Ctrl-R.
-    pub fn fetch_overview(&self) -> Result<PrOverview, String> {
+    pub fn fetch_overview(&self) -> Result<SubjectOverview, String> {
         let fresh = self
             .client
             .refresh_pr(&self.pr)
             .map_err(|e| e.to_string())?;
-        Ok(PrOverview::from_pr(&fresh))
+        Ok(SubjectOverview::from_pr(&fresh))
     }
 
     /// Re-pull the PR's threads from GitHub.

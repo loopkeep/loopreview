@@ -98,9 +98,9 @@ lr show               # review the last commit's own changes (like git show)
 lr show HEAD~2        # review a specific commit
 lr patch fix.patch    # review a saved patch...
 git diff | lr         # ...or one piped in
-lr 123                # review GitHub pull request #123 in the TUI
+lr 123                # review GitHub PR or issue #123 (the type is auto-detected)
 lr "#123"             # quote #N — a bare # is a shell comment
-lr owner/repo#123     # a PR in another repo (or paste its URL)
+lr owner/repo#123     # a PR or issue in another repo (or paste its URL)
 lr --detect           # the pull request for the current branch
 ```
 
@@ -257,13 +257,20 @@ history — you can still read and reply to it.
 
 <!-- TODO: screenshot — Conversation view with a resolved and an outdated thread -->
 
-### Pull requests
+### Pull requests & issues
 
 A bare `lr <number | url | owner/repo#n | #n>` (or `lr --detect` for the current
-branch) opens a pull request in the same TUI, fetching the diff and existing
+branch's PR) opens a pull request in the same TUI, fetching the diff and existing
 review threads without touching your working tree. There is no `pr` subcommand —
 a GitHub reference is the entry point (quote `#N`, since most shells treat a bare
-`#` as a comment). Your comments and replies are
+`#` as a comment). The reference's **type is resolved automatically** (GitHub
+redirects `/pull/N` ⇆ `/issues/N`, so the look isn't trusted): a pull request
+opens the diff reader; an **issue** opens a no-diff reader — an **Overview** tab
+(its facts and rendered description) and a **Conversation** tab (its comment
+thread), starting on the Overview since an issue's body is the content. On an
+issue you read and comment (`c` starts a comment; `Ctrl-S` posts it directly —
+there is no review to submit); `e`/`d` edit or delete your own posted comments,
+and `Ctrl-R` re-pulls. The rest of this section describes pull requests. Your comments and replies are
 kept as **drafts** (a `[draft]` badge) — they persist across sessions — until you
 submit. `Ctrl-S` opens the submit modal, which lists what will be sent and by
 whom (flagging any draft not authored by you, since it goes out under your
