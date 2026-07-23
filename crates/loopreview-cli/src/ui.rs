@@ -1790,43 +1790,66 @@ impl App {
         }
     }
 
-    /// The thread the selection points at (Conversation or Files), whatever its
-    /// kind — for the local⇄draft toggle.
-    fn selected_thread_any(&self) -> Option<usize> {
-        if self.view == View::Conversation {
-            self.selected_thread()
-        } else {
-            self.thread_at_cursor()
-        }
-    }
-
-    /// Toggle the selected thread's root between a local note and a draft (a
-    /// human action, e.g. adopting an agent's note to send it). Only on a pull
-    /// request, and only for an unpublished comment.
+    /// Toggle the targeted comment between a local note and a draft (a human
+    /// action, e.g. adopting an agent's note to send it). The target mirrors
+    /// `e`/`d`: in the Conversation view the comment the cursor rests on (root or
+    /// reply), in Files the thread's root. Only on a pull request, and only for an
+    /// unpublished comment.
+    ///
+    /// The kind rules keep a thread coherent:
+    /// - A reply may become a draft only under a draft or published root. Under a
+    ///   local root the promotion is refused — the root must be promoted first, so
+    ///   a queued reply never dangles above a note that is never sent.
+    /// - Demoting a root back to local drags its draft replies down with it, so a
+    ///   local thread never strands a queued draft reply.
+    /// - A published comment is on the remote for good; its kind never changes.
     fn toggle_selected_kind(&mut self) {
         if self.pr.is_none() {
             self.status = Some("local/draft applies only to a pull request".to_string());
             return;
         }
-        let Some(idx) = self.selected_thread_any() else {
+        // Same targeting as edit/delete: the cursor's comment in Conversation, the
+        // thread root in Files.
+        let Some((ti, ci)) = self.edit_target() else {
             self.status = Some("no comment selected".to_string());
             return;
         };
+        let Some(target) = self.review.threads[ti].comments.get(ci) else {
+            return;
+        };
+        if target.disposition() == CommentKind::Published {
+            self.status = Some("a published comment can't change kind".to_string());
+            return;
+        }
+        // Promoting a reply to a draft under a local root would queue a reply whose
+        // root is never sent. Refuse and point at the root.
+        if ci != 0
+            && target.is_local()
+            && self.review.threads[ti]
+                .root()
+                .is_some_and(|c| c.disposition() == CommentKind::Local)
+        {
+            self.status = Some("promote the thread root first (t on the root)".to_string());
+            return;
+        }
         let now_draft = {
-            let Some(root) = self.review.threads[idx].comments.first_mut() else {
-                return;
-            };
-            if root.disposition() == CommentKind::Published {
-                self.status = Some("a published comment can't change kind".to_string());
-                return;
-            }
-            root.kind = if root.kind == CommentKind::Local {
+            let comment = &mut self.review.threads[ti].comments[ci];
+            comment.kind = if comment.kind == CommentKind::Local {
                 CommentKind::Draft
             } else {
                 CommentKind::Local
             };
-            root.kind == CommentKind::Draft
+            comment.kind == CommentKind::Draft
         };
+        // Demoting a root to local pulls its draft replies down too; promoting a
+        // root leaves the replies alone (they may stay local under a draft root).
+        if ci == 0 && !now_draft {
+            for reply in self.review.threads[ti].comments.iter_mut().skip(1) {
+                if reply.disposition() == CommentKind::Draft {
+                    reply.kind = CommentKind::Local;
+                }
+            }
+        }
         let _ = self.persist(if now_draft {
             "queued as draft"
         } else {
@@ -8019,6 +8042,160 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("pull request")
+        );
+    }
+
+    /// Build a PR thread with a root of `root_kind` plus one reply per entry in
+    /// `replies`, laid out and focused in the Conversation view. Returns the app.
+    fn pr_thread(root_kind: CommentKind, replies: &[CommentKind]) -> App {
+        let mut app = pr_app();
+        let (tid, _) = app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "root",
+            root_kind,
+        );
+        if root_kind == CommentKind::Published {
+            app.review.threads[0].comments[0].remote_id = Some("R1".into());
+        }
+        for (i, &k) in replies.iter().enumerate() {
+            app.add_reply(&tid, "tester", &format!("reply {i}"), k);
+        }
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        app
+    }
+
+    #[test]
+    fn t_targets_the_reply_at_the_cursor_in_conversation() {
+        // Rule 2: under a draft root a reply flips local⇄draft on its own, and `t`
+        // now retargets per comment (like e/d) rather than always the root.
+        let mut app = pr_thread(CommentKind::Draft, &[CommentKind::Local]);
+        app.conv_comment = 1; // the reply, not the root
+        app.on_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(
+            app.review.threads[0].comments[1].is_draft(),
+            "the reply promotes under a draft root"
+        );
+        assert!(
+            app.review.threads[0].root().unwrap().is_draft(),
+            "and the root is left where it was"
+        );
+        app.on_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(
+            app.review.threads[0].comments[1].is_local(),
+            "t again demotes just the reply"
+        );
+    }
+
+    #[test]
+    fn t_refuses_a_draft_reply_under_a_local_root() {
+        // Rule 3: a reply under a local root can't become a draft — the root must
+        // be promoted first, so a queued reply never dangles above a note that is
+        // never sent.
+        let mut app = pr_thread(CommentKind::Local, &[CommentKind::Local]);
+        app.conv_comment = 1; // the reply
+        app.on_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(
+            app.review.threads[0].comments[1].is_local(),
+            "the reply stays local under a local root"
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap_or("")
+                .contains("promote the thread root first"),
+            "the status points at the root"
+        );
+    }
+
+    #[test]
+    fn t_toggles_a_reply_under_a_published_root_but_never_the_root() {
+        // Rule 1: replies under a published root flip freely. Rule 5: the published
+        // root itself never changes kind.
+        let mut app = pr_thread(CommentKind::Published, &[CommentKind::Local]);
+        // The reply promotes even though the root is published.
+        app.conv_comment = 1;
+        app.on_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(
+            app.review.threads[0].comments[1].is_draft(),
+            "a reply is free to draft under a published root"
+        );
+        // The published root refuses the toggle and keeps its disposition.
+        app.conv_comment = 0;
+        app.on_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert_eq!(
+            app.review.threads[0].comments[0].disposition(),
+            CommentKind::Published,
+            "a published root can't change kind"
+        );
+        assert!(
+            app.status.as_deref().unwrap_or("").contains("published"),
+            "the status says the comment is published"
+        );
+    }
+
+    #[test]
+    fn demoting_a_root_to_local_drags_its_draft_replies_down() {
+        // Rule 4: a root's draft→local demotion pulls every draft reply to local;
+        // the reverse promotion leaves the replies where they are.
+        let mut app = pr_thread(
+            CommentKind::Draft,
+            &[CommentKind::Draft, CommentKind::Local],
+        );
+        app.conv_comment = 0; // the root
+        app.on_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(
+            app.review.threads[0].comments[0].is_local(),
+            "the root is demoted"
+        );
+        assert!(
+            app.review.threads[0].comments[1].is_local(),
+            "the draft reply is dragged down to local"
+        );
+        assert!(
+            app.review.threads[0].comments[2].is_local(),
+            "the already-local reply stays local"
+        );
+        // Promote the root again: the replies are left untouched (still local).
+        app.on_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(
+            app.review.threads[0].comments[0].is_draft(),
+            "the root is promoted"
+        );
+        assert!(
+            app.review.threads[0].comments[1].is_local()
+                && app.review.threads[0].comments[2].is_local(),
+            "promotion leaves the replies alone"
+        );
+    }
+
+    #[test]
+    fn t_in_the_files_view_still_targets_the_thread_root() {
+        // The diff shows only the root inline, so in Files `t` stays root-scoped —
+        // the cursor's line, not a per-comment target.
+        let mut app = pr_thread(CommentKind::Local, &[CommentKind::Local]);
+        app.view = View::Files;
+        // Park the cursor on the anchored line (a.rs, new line 2).
+        app.cursor = app
+            .clines
+            .iter()
+            .position(|&(file, flat)| {
+                flat != HEADER && {
+                    let (hi, li) = app.flats[file][flat];
+                    app.diff.files[file].hunks[hi].lines[li].new_lineno == Some(2)
+                }
+            })
+            .expect("the anchored line is on screen");
+        app.on_key(KeyCode::Char('t'), KeyModifiers::NONE);
+        assert!(
+            app.review.threads[0].comments[0].is_draft(),
+            "the root is promoted from the Files view"
+        );
+        assert!(
+            app.review.threads[0].comments[1].is_local(),
+            "the reply is untouched from the Files view"
         );
     }
 
