@@ -14537,11 +14537,15 @@ mod tests {
         // When the browser can't be launched, the hint keeps the URL so the user
         // can open it by hand — alongside the reference they clicked.
         let mut app = issue_app();
+        // Success path: a recording opener (never the real one — that panics in a
+        // test build) so the launch is observed, not performed.
+        app.url_opener = Box::new(|_: &str| Ok(()));
         assert_eq!(
             app.open_md_url("https://github.com/owner/repo/issues/42", Some("#42")),
             "opened #42",
             "a reference open reports the reference on success",
         );
+        // Failure path: the launcher errored.
         app.url_opener = Box::new(|_: &str| Err(std::io::Error::other("no browser")));
         assert_eq!(
             app.open_md_url("https://github.com/owner/repo/issues/42", Some("#42")),
