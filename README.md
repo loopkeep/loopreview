@@ -114,7 +114,7 @@ files from a working-tree review.
 | Key | Action |
 | --- | --- |
 | `q` / `Esc` / `Ctrl-C` | Quit |
-| `Tab` | Switch between the Files and Conversation views (once the review has threads) |
+| `Tab` | Switch between the Files and Conversation views (always on a repo diff or PR; a plain patch has no tabs) |
 | `?` | Open the command palette — a searchable list of every action with its current key; actions that apply right now are listed first, the rest greyed |
 | `b` | Toggle the file-explorer sidebar |
 | `Ctrl-P` | Open the fuzzy file finder |
@@ -216,10 +216,16 @@ actions (`r`, `x`, `e`, `d`, …) work from any of those lines, not just the las
 Where two ranges overlap, acting on the shared line offers a small picker (`j` /
 `k` or a digit, `Enter`, `Esc`) so you always choose the intended thread rather
 than one being picked for you. `r` replies to the thread on the cursor's line and
-`x` resolves or reopens it. Once a review has any threads, `Tab` opens a
-Conversation view — every thread as a root comment with its nested replies and
+`x` resolves or reopens it. On a repo diff (`lr`, `lr diff`, `lr show`) or a pull
+request, `Tab` switches between the **Files changed** and **Conversation** views
+from the start — every thread as a root comment with its nested replies and
 relative timestamps, GitHub-style — where `r` and `x` also work and `X` closes
-(deletes) the review. Comments are authored as your `git config user.name`.
+(deletes) the review. The Conversation view is always there because its `c` is
+the only way to start a review-level comment (a note tied to nothing in the
+diff), so it must exist before the first one; an empty conversation greets you
+with a hint. (A piped or file patch has no comment store, so it stays a
+single-pane pager with no tabs.) Comments are authored as your
+`git config user.name`.
 
 **Suggesting a change.** `s` — on a line, or over a `V` / drag range — opens the
 composer already holding a `suggestion` code block filled with those lines'

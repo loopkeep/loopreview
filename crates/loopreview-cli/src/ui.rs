@@ -1655,9 +1655,26 @@ impl App {
         })
     }
 
-    /// Whether the review has any threads (and so the tab bar is shown).
+    /// Whether the review has any threads.
     fn has_review(&self) -> bool {
         !self.review.threads.is_empty()
+    }
+
+    /// Whether this session can take comments at all: a git-backed store (every
+    /// repo-derived source — worktree, `lr diff <target>`, `lr show`) or a live
+    /// pull request. A bare stdin/file patch carries neither, so it stays a
+    /// lightweight pager with no comment surface.
+    fn comments_enabled(&self) -> bool {
+        self.store.is_some() || self.pr.is_some()
+    }
+
+    /// Whether the Conversation | Files tab structure is shown. A comment-capable
+    /// session shows it always, comments or not — the Conversation tab's `c` is
+    /// the only entry for a review-level (non-line) comment, so it must exist
+    /// before the first one (otherwise there is no way to start it). A pure patch
+    /// shows tabs only if it somehow already carries threads.
+    fn shows_tabs(&self) -> bool {
+        self.comments_enabled() || self.has_review()
     }
 
     /// Switch the top-level view, re-syncing the sidebar so its index scroll
@@ -1744,7 +1761,7 @@ impl App {
                 self.quit = true;
                 return;
             }
-            (KeyCode::Tab, _) if self.has_review() => {
+            (KeyCode::Tab, _) if self.shows_tabs() => {
                 let next = match self.view {
                     View::Files => View::Conversation,
                     View::Conversation => View::Files,
@@ -1860,7 +1877,7 @@ impl App {
             View::Conversation => match action {
                 NavIn => true,
                 // `c` starts a new conversation comment (needs somewhere to keep it).
-                Comment => self.store.is_some() || self.pr.is_some(),
+                Comment => self.comments_enabled(),
                 Fold => !self.review.threads.is_empty(),
                 CloseReview => self.has_review(),
                 _ => common(action),
@@ -2372,7 +2389,7 @@ impl App {
 
     /// Begin composing a comment on the cursor's line.
     fn start_compose(&mut self) {
-        if self.store.is_none() && self.pr.is_none() {
+        if !self.comments_enabled() {
             self.status = Some("comments need a git repository or a pull request".to_string());
             return;
         }
@@ -2395,7 +2412,7 @@ impl App {
     /// through the same kind/submit flow as any comment: a draft on a pull
     /// request (sent as a new conversation comment), a local note otherwise.
     fn start_conversation_comment(&mut self) {
-        if self.store.is_none() && self.pr.is_none() {
+        if !self.comments_enabled() {
             self.status = Some("comments need a git repository or a pull request".to_string());
             return;
         }
@@ -2414,7 +2431,7 @@ impl App {
     /// an ordinary comment (same kind and submit flow). Suggestions replace the
     /// *new* side, so a pure-deletion (old-side) range is refused.
     fn start_suggest(&mut self) {
-        if self.store.is_none() && self.pr.is_none() {
+        if !self.comments_enabled() {
             self.status = Some("comments need a git repository or a pull request".to_string());
             return;
         }
@@ -4171,7 +4188,7 @@ impl App {
         &mut self,
         add: protocol::CommentAdd,
     ) -> Result<protocol::CommentResult, String> {
-        if self.store.is_none() && self.pr.is_none() {
+        if !self.comments_enabled() {
             return Err("comments need a git repository or a pull request".to_string());
         }
         // A conversation comment (Anchor::Review) is tied to nothing in the diff —
@@ -4270,7 +4287,7 @@ impl App {
         &mut self,
         reply: protocol::CommentReply,
     ) -> Result<protocol::CommentResult, String> {
-        if self.store.is_none() && self.pr.is_none() {
+        if !self.comments_enabled() {
             return Err("comments need a git repository or a pull request".to_string());
         }
         // An agent's reply is a local note unless it passes --draft (agents don't
@@ -4628,7 +4645,7 @@ impl App {
         match hit_region(column, row, self.hit.get()) {
             Region::LayoutToggle => self.toggle_mode(),
             Region::PrLink => self.open_pr_page(),
-            Region::Tabs if self.has_review() => {
+            Region::Tabs if self.shows_tabs() => {
                 let hit = self.hit.get();
                 if column < hit.tab_files_end {
                     self.set_view(View::Files);
@@ -4943,10 +4960,12 @@ impl App {
             self.draw_load_error(f, error);
             return;
         }
-        // A tab bar appears once the review has threads. A comfortable terminal
-        // gives it breathing room — a blank row above and below; a short one
-        // collapses that so the body keeps every row it can.
-        let tabs = self.has_review();
+        // A tab bar appears for any comment-capable session (a repo diff or a
+        // PR), threads or not, so the Conversation tab is always reachable; a
+        // pure patch shows it only once it carries threads. A comfortable
+        // terminal gives it breathing room — a blank row above and below; a
+        // short one collapses that so the body keeps every row it can.
+        let tabs = self.shows_tabs();
         let spacious = tabs && f.area().height >= TAB_SPACING_MIN_HEIGHT;
         let constraints: Vec<Constraint> = match (tabs, spacious) {
             (true, true) => vec![
@@ -5437,6 +5456,18 @@ impl App {
     }
 
     fn draw_conversation(&self, f: &mut Frame, area: Rect) {
+        // An empty conversation still shows the tab (so the first comment can be
+        // started) — greet it with a hint instead of a blank pane.
+        if self.conv_order.is_empty() {
+            let key = self.keymap.key_for(Action::Comment).unwrap_or("c");
+            let hint = format!("No comments yet — press {key} to start a conversation.");
+            let lines = vec![
+                TextLine::from(""),
+                TextLine::from(TextSpan::styled(hint, Style::default().fg(Color::DarkGray))),
+            ];
+            f.render_widget(Paragraph::new(lines), area);
+            return;
+        }
         let select_bg = CONV_SELECT_BG;
         let width = area.width as usize;
         let mut lines: Vec<TextLine> = Vec::new();
@@ -11262,6 +11293,70 @@ mod tests {
             "files view names the file: {:?}",
             app.pane_title()
         );
+    }
+
+    #[test]
+    fn a_repo_source_shows_tabs_without_comments() {
+        // A store-backed source (worktree / lr diff / lr show) shows the tabs
+        // even before the first comment, so the Conversation tab is reachable.
+        let mut app = sample_app();
+        assert!(!app.has_review(), "no threads yet");
+        assert!(app.comments_enabled(), "but comments are enabled (a store)");
+        assert!(app.shows_tabs(), "so the tab structure is shown");
+        // Tab switches into the Conversation view before any comment exists.
+        app.on_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.view, View::Conversation);
+    }
+
+    #[test]
+    fn a_patch_source_has_no_tabs_until_a_comment_exists() {
+        // multi_file_app carries no store and no PR — the stdin/file patch case:
+        // a lightweight pager with no comment surface and no tabs.
+        let mut app = multi_file_app(&["a.rs"]);
+        assert!(!app.comments_enabled(), "a patch cannot take comments");
+        assert!(!app.shows_tabs(), "so it stays tab-less");
+        app.on_key(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.view, View::Files, "Tab does nothing without tabs");
+    }
+
+    #[test]
+    fn conversation_c_starts_a_review_comment_without_a_pr() {
+        // The chicken-and-egg fix: on a repo diff (no PR), the Conversation `c`
+        // creates a review-level (Anchor::Review) comment from an empty session.
+        let mut app = sample_app();
+        app.mode = Mode::Unified;
+        app.sidebar_override = Some(false);
+        app.set_view(View::Conversation);
+        app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(app.input.is_some(), "c opens the conversation composer");
+        for ch in "hello".chars() {
+            app.on_key(KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+        app.on_key(KeyCode::Char('s'), KeyModifiers::CONTROL); // save
+        assert!(app.input.is_none(), "Ctrl-S saves and closes");
+        let thread = app.review.threads.last().expect("a thread was created");
+        assert_eq!(
+            thread.anchor,
+            Anchor::Review,
+            "it is a review-level comment"
+        );
+        assert_eq!(thread.root().unwrap().body, "hello");
+    }
+
+    #[test]
+    fn an_empty_conversation_shows_a_placeholder() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = sample_app();
+        app.set_view(View::Conversation);
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(
+            screen.contains("No comments yet"),
+            "the empty conversation is greeted with a hint: {screen:?}"
+        );
+        assert!(screen.contains("press c"), "and names the key: {screen:?}");
     }
 
     #[test]
