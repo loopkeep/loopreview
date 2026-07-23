@@ -153,8 +153,18 @@ impl PrSource {
         // by SHA while reachable). Peeling to `^{commit}` then requires it to be
         // present — a bare 40-hex resolves without the object, `^{commit}` does not.
         let _ = git::fetch_many(&self.dir, &[base_oid]);
-        let base_sha =
-            git::rev_parse(&self.dir, &format!("{base_oid}^{{commit}}")).map_err(to_diff_error)?;
+        // A base-flavoured message (like the no-OID case above) so the CLI can tell
+        // a deleted base apart from an unrelated diff failure by the error text.
+        let base_sha = git::rev_parse(&self.dir, &format!("{base_oid}^{{commit}}")).map_err(
+            |_| DiffError::Command {
+                program: "git".to_string(),
+                code: -1,
+                stderr: format!(
+                    "the base branch {} was deleted and its commit is no longer available on GitHub",
+                    self.base_ref
+                ),
+            },
+        )?;
         Ok((base_sha, head_sha))
     }
 }

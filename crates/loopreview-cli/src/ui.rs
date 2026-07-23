@@ -197,9 +197,10 @@ pub struct Loaded {
     /// Stale draft ghosts dropped while merging saved drafts (pre-F2 store
     /// contamination); surfaced in the status when non-zero.
     pub stale_cleaned: usize,
-    /// True when a pull request's diff could not be built (its base branch was
-    /// deleted on GitHub): the session opens in the no-diff reader with a notice.
-    pub diff_unavailable: bool,
+    /// Set when a pull request's diff could not be built (its base branch was
+    /// deleted on GitHub, or another diff failure): the session opens in the
+    /// no-diff reader and this is the status line explaining why. `None` normally.
+    pub diff_notice: Option<String>,
 }
 
 /// A background load job: reports progress via the callback, then yields the
@@ -1100,14 +1101,12 @@ impl App {
             ));
         }
         // A PR whose diff could not be built (its base branch was deleted on
-        // GitHub) opens without a Files tab; say so, and let the notice win over a
-        // stale-draft note — it explains the missing diff the user is looking at.
-        self.diff_unavailable = loaded.diff_unavailable;
-        if loaded.diff_unavailable {
-            self.status = Some(format!(
-                "{}'s base branch was deleted on GitHub — showing without the diff",
-                self.label
-            ));
+        // GitHub, or another diff failure) opens without a Files tab; show the
+        // pre-phrased notice, and let it win over a stale-draft note — it explains
+        // the missing diff the user is looking at.
+        self.diff_unavailable = loaded.diff_notice.is_some();
+        if let Some(notice) = loaded.diff_notice {
+            self.status = Some(notice);
             if self.view == View::Files {
                 self.view = View::Overview;
             }
@@ -9814,7 +9813,7 @@ mod tests {
             issue: Some(crate::prsync::IssueHandle::for_test(5, "t")),
             pr_key: Some("owner/repo#5".into()),
             stale_cleaned: 0,
-            diff_unavailable: false,
+            diff_notice: None,
         });
         assert_eq!(app.view, View::Overview, "an issue opens on its Overview");
         assert!(app.is_issue());
@@ -9835,7 +9834,7 @@ mod tests {
             issue: None,
             pr_key: Some("owner/repo#1".into()),
             stale_cleaned: 0,
-            diff_unavailable: false,
+            diff_notice: None,
         });
         assert_eq!(
             app.view,
@@ -9859,7 +9858,9 @@ mod tests {
             issue: None,
             pr_key: Some("owner/repo#1".into()),
             stale_cleaned: 0,
-            diff_unavailable: true,
+            diff_notice: Some(
+                "PR #1's base branch was deleted on GitHub — showing without the diff".into(),
+            ),
         });
         assert_eq!(
             app.view,

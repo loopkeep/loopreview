@@ -190,25 +190,17 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
     let loader: ui::Loader = Box::new(move |progress| {
         // Resolve the reference to its true type, then open a PR (with its diff)
         // or an issue (conversation only, no diff).
-        let (label, diff, threads, pr, issue, key, diff_unavailable) =
+        let (label, diff, threads, pr, issue, key, diff_notice) =
             match prsync::fetch_subject(dir, pr_query, progress)? {
                 prsync::Opened::Pr {
                     handle,
                     label,
                     diff,
                     threads,
-                    diff_unavailable,
+                    diff_notice,
                 } => {
                     let key = handle.pr_key();
-                    (
-                        label,
-                        diff,
-                        threads,
-                        Some(handle),
-                        None,
-                        key,
-                        diff_unavailable,
-                    )
+                    (label, diff, threads, Some(handle), None, key, diff_notice)
                 }
                 prsync::Opened::Issue {
                     handle,
@@ -223,7 +215,7 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
                         None,
                         Some(handle),
                         key,
-                        false,
+                        None,
                     )
                 }
             };
@@ -248,7 +240,7 @@ fn run_pr(query: Option<String>, detect: bool, mode: LayoutMode) -> Result<()> {
             pr,
             issue,
             pr_key: Some(key),
-            diff_unavailable,
+            diff_notice,
         })
     });
 

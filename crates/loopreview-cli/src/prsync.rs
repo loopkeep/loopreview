@@ -35,10 +35,11 @@ pub enum Opened {
         label: String,
         diff: Diff,
         threads: Vec<Thread>,
-        /// True when the diff could not be built (typically a deleted base branch
-        /// on a closed/merged PR): the comments loaded but there is no diff, so the
-        /// UI opens in its no-diff reader (Overview | Conversation).
-        diff_unavailable: bool,
+        /// Set when the diff could not be built though the comments loaded (so the
+        /// UI opens in its no-diff reader — Overview | Conversation): the status
+        /// line to show, already phrased for the cause (a deleted base branch, the
+        /// common case, versus any other diff failure). `None` on a normal load.
+        diff_notice: Option<String>,
     },
     Issue {
         handle: IssueHandle,
@@ -85,16 +86,16 @@ pub fn fetch_subject(
             // no-diff reader rather than failing the whole open (the user can still
             // read and tidy the conversation, which is usually why they opened it).
             let threads = threads?;
-            let (diff, diff_unavailable) = match diff {
-                Ok(diff) => (diff, false),
-                Err(_) => (Diff::default(), true),
+            let (diff, diff_notice) = match diff {
+                Ok(diff) => (diff, None),
+                Err(err) => (Diff::default(), Some(diff_unavailable_notice(&label, &err))),
             };
             Ok(Opened::Pr {
                 handle: PrHandle { client, pr, viewer },
                 label,
                 diff,
                 threads,
-                diff_unavailable,
+                diff_notice,
             })
         }
         Subject::Issue(issue) => {
@@ -125,6 +126,42 @@ fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, Result<T, String>>) -> Re
     handle
         .join()
         .unwrap_or_else(|_| Err("a background load task panicked".to_string()))
+}
+
+/// The no-diff-reader status line for a PR whose diff (`err`) couldn't be built
+/// while its comments loaded. A deleted base branch — the common, expected case —
+/// gets a specific explanation; anything else gets a generic one carrying a short
+/// reason, so we never mislabel an unrelated failure as a deletion. `label` is the
+/// PR's `PR #N` label.
+fn diff_unavailable_notice(label: &str, err: &str) -> String {
+    if looks_like_missing_base(err) {
+        format!("{label}'s base branch was deleted on GitHub — showing without the diff")
+    } else {
+        match short_reason(err) {
+            Some(reason) => {
+                format!("{label}'s diff couldn't be built ({reason}) — showing without it")
+            }
+            None => format!("{label}'s diff couldn't be built — showing without it"),
+        }
+    }
+}
+
+/// Whether a diff-build error is a missing/deleted base branch. Cheap substring
+/// match on the message (the diff source phrases every base-resolution failure
+/// with "base branch", and raw git says "couldn't find remote ref"), so a deleted
+/// base reads as such without a typed error crossing the crate boundary.
+fn looks_like_missing_base(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("base branch") || e.contains("couldn't find remote ref")
+}
+
+/// A short, single-line reason drawn from an error message for the generic
+/// no-diff notice — the first non-empty line, trimmed and length-capped, or
+/// `None` when there is nothing useful to show.
+fn short_reason(err: &str) -> Option<String> {
+    let line = err.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let reason: String = line.chars().take(80).collect();
+    (!reason.is_empty()).then_some(reason)
 }
 
 /// A subject's lifecycle status — a pull request's or an issue's — for the badge.
@@ -713,6 +750,47 @@ mod tests {
         assert_eq!(query(None, true), Ok(PrQuery::Detect));
         assert!(query(Some("42".into()), false).is_ok());
         assert!(query(Some("nonsense".into()), false).is_err());
+    }
+
+    #[test]
+    fn diff_unavailable_notice_distinguishes_a_deleted_base() {
+        // The diff source's own base-resolution errors mention "base branch"…
+        assert_eq!(
+            diff_unavailable_notice(
+                "PR #7",
+                "`git` exited with status 128 — the base branch main is unavailable and no base commit is recorded",
+            ),
+            "PR #7's base branch was deleted on GitHub — showing without the diff",
+        );
+        // …as does raw git when the base ref is gone.
+        assert!(looks_like_missing_base(
+            "fatal: couldn't find remote ref test/playground-base"
+        ));
+        // An unrelated diff failure is not mislabelled a deletion; it gets the
+        // generic notice carrying a short, single-line reason.
+        let notice = diff_unavailable_notice("PR #7", "patch parse error: bad hunk header\nline 2");
+        assert_eq!(
+            notice,
+            "PR #7's diff couldn't be built (patch parse error: bad hunk header) — showing without it",
+        );
+        assert!(!looks_like_missing_base(
+            "patch parse error: bad hunk header"
+        ));
+        // A reasonless (empty) error still yields a clean, parens-free notice.
+        assert_eq!(
+            diff_unavailable_notice("PR #7", "   \n  "),
+            "PR #7's diff couldn't be built — showing without it",
+        );
+    }
+
+    #[test]
+    fn short_reason_takes_a_capped_first_line() {
+        assert_eq!(
+            short_reason("  first line  \nsecond"),
+            Some("first line".into())
+        );
+        assert_eq!(short_reason("\n\n"), None);
+        assert_eq!(short_reason(&"x".repeat(200)).unwrap().chars().count(), 80);
     }
 
     #[test]
