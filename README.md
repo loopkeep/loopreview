@@ -149,7 +149,7 @@ action (an inapplicable one reports why), `Esc` to close.
 | `t` | Toggle the thread's root between a draft and a local note (pull requests) |
 | `o` | Fold: expand the current file if collapsed, else fold the thread at the cursor, else collapse the current file |
 | Wheel | Scroll the diff (or the sidebar, when the pointer is over it) |
-| Click | Move the cursor; a file header folds/unfolds it; a sidebar row toggles that file (opens it, or collapses an open one); a tab switches views; the footer's layout indicator (`[unified]`/`[split]`) toggles the layout |
+| Click | Move the cursor; a file header folds/unfolds it; a sidebar row toggles that file (opens it, or collapses an open one); a tab switches views; the footer's layout indicator (`[unified]`/`[split]`) toggles the layout; the header's `#N` opens the pull request on github.com |
 | Drag | Select a line range (then `c` to comment) |
 
 **Sidebar** (focused after `b`)

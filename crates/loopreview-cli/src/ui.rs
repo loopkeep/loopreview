@@ -589,6 +589,8 @@ enum Region {
     Content { col: u16, row: usize },
     /// The layout indicator in the footer (click to toggle unified/split).
     LayoutToggle,
+    /// The `#N` link in the header (click to open the PR page).
+    PrLink,
     /// Anything else (header, footer, divider column, outside the body).
     Outside,
 }
@@ -603,6 +605,9 @@ fn hit_region(x: u16, y: u16, hit: HitLayout) -> Region {
     }
     if y == hit.footer_row && x < hit.layout_end {
         return Region::LayoutToggle;
+    }
+    if hit.pr_link_row == Some(y) && x >= hit.pr_link_x0 && x < hit.pr_link_x1 {
+        return Region::PrLink;
     }
     if y < hit.body_top || y >= hit.body_top + hit.body_height {
         return Region::Outside;
@@ -645,6 +650,11 @@ struct HitLayout {
     footer_row: u16,
     /// The layout indicator occupies `[0, layout_end)` on the footer row.
     layout_end: u16,
+    /// The header row carrying the clickable `#N` PR link, when in PR context.
+    pr_link_row: Option<u16>,
+    /// The `#N` link occupies `[pr_link_x0, pr_link_x1)` on `pr_link_row`.
+    pr_link_x0: u16,
+    pr_link_x1: u16,
 }
 
 /// Cached render data for one file, aligned to that file's flat line list.
@@ -772,6 +782,9 @@ struct App {
     drag_anchor: Option<usize>,
     /// Screen geometry from the last draw, for mouse hit-testing.
     hit: Cell<HitLayout>,
+    /// The `#N` PR-link column range `[x0, x1)` in the header, set by
+    /// `draw_header` and read into [`HitLayout`]; `None` off a pull request.
+    header_pr_link: Cell<Option<(u16, u16)>>,
     /// Horizontal scroll offset, in display columns, of the diff content (the
     /// line-number gutter stays fixed). Reset on a layout switch or file jump.
     hscroll: usize,
@@ -912,6 +925,7 @@ impl App {
             selection: None,
             drag_anchor: None,
             hit: Cell::new(HitLayout::default()),
+            header_pr_link: Cell::new(None),
             hscroll: 0,
             keymap: crate::keys::Keymap::defaults(),
             conv_cursor: 0,
@@ -1148,6 +1162,19 @@ impl App {
             return;
         };
         let url = self.github_link(&pr);
+        self.status = Some(match crate::opener::open_url(&url) {
+            Ok(()) => format!("opened {url}"),
+            Err(_) => format!("open it yourself: {url}"),
+        });
+    }
+
+    /// Open the pull request's page (its `#N` header link, clicked). Reuses the
+    /// same launcher as `open_github`; a plain review has no page.
+    fn open_pr_page(&mut self) {
+        let Some(pr) = self.pr.clone() else {
+            return;
+        };
+        let url = pr.url().to_string();
         self.status = Some(match crate::opener::open_url(&url) {
             Ok(()) => format!("opened {url}"),
             Err(_) => format!("open it yourself: {url}"),
@@ -4530,6 +4557,7 @@ impl App {
     fn mouse_down(&mut self, column: u16, row: u16) {
         match hit_region(column, row, self.hit.get()) {
             Region::LayoutToggle => self.toggle_mode(),
+            Region::PrLink => self.open_pr_page(),
             Region::Tabs if self.has_review() => {
                 let hit = self.hit.get();
                 if column < hit.tab_files_end {
@@ -4920,10 +4948,12 @@ impl App {
         self.body_width.set(content.width as usize);
         self.body_height.set(content.height as usize);
 
-        // Record the geometry for mouse hit-testing (inner rects; frames map to
-        // Outside).
+        // Draw the header first so it records the PR-link columns, then capture
+        // the geometry for mouse hit-testing (inner rects; frames map to Outside).
+        self.draw_header(f, header);
         let (files_label, conv_label) = self.tab_labels();
         let files_w = files_label.chars().count() as u16;
+        let (pr_link_x0, pr_link_x1) = self.header_pr_link.get().unwrap_or((0, 0));
         self.hit.set(HitLayout {
             body_top: content.y,
             body_height: content.height,
@@ -4936,9 +4966,11 @@ impl App {
             tab_conv_end: files_w + 1 + conv_label.chars().count() as u16,
             footer_row: footer.y,
             layout_end: self.layout_label().chars().count() as u16,
+            pr_link_row: self.header_pr_link.get().map(|_| header.y),
+            pr_link_x0,
+            pr_link_x1,
         });
 
-        self.draw_header(f, header);
         if let Some(tabs_area) = tabs_area {
             self.draw_tabs(f, tabs_area);
         }
@@ -5473,12 +5505,37 @@ impl App {
         let stats = self.diff.stats();
         let bar = Style::default().bg(BAR_BG);
         let layout_label = if self.sbs() { "split" } else { "unified" };
-        let mut spans = vec![
-            TextSpan::styled(
-                " loopreview ",
-                bar.fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            ),
-            TextSpan::styled(format!("· {} ", self.label), bar.fg(Color::Gray)),
+        let mut spans = vec![TextSpan::styled(
+            " loopreview ",
+            bar.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )];
+        // The source label. On a pull request it is "PR #N": render "PR " plainly
+        // and the "#N" as an underlined link, recording its columns so a click on
+        // just that range opens the PR page. Elsewhere it is plain text.
+        self.header_pr_link.set(None);
+        let hash = self.pr.is_some().then(|| self.label.find('#')).flatten();
+        if let Some(hash) = hash {
+            // "· PR " plainly...
+            spans.push(TextSpan::styled(
+                format!("· {}", &self.label[..hash]),
+                bar.fg(Color::Gray),
+            ));
+            // ...then "#N" as an underlined link; its columns start where we are.
+            let x0 = area.x + span_width(&spans) as u16;
+            let n_len = self.label[hash..].chars().count() as u16;
+            self.header_pr_link.set(Some((x0, x0 + n_len)));
+            spans.push(TextSpan::styled(
+                self.label[hash..].to_string(),
+                bar.fg(PR_ACCENT).add_modifier(Modifier::UNDERLINED),
+            ));
+            spans.push(TextSpan::styled(" ", bar.fg(Color::Gray)));
+        } else {
+            spans.push(TextSpan::styled(
+                format!("· {} ", self.label),
+                bar.fg(Color::Gray),
+            ));
+        }
+        spans.extend([
             TextSpan::styled(
                 format!("· {} file{} ", stats.files, plural(stats.files)),
                 bar.fg(Color::Gray),
@@ -5486,7 +5543,7 @@ impl App {
             TextSpan::styled(format!("+{} ", stats.insertions), bar.fg(Color::Green)),
             TextSpan::styled(format!("-{} ", stats.deletions), bar.fg(Color::Red)),
             TextSpan::styled(format!("· {layout_label}"), bar.fg(Color::DarkGray)),
-        ];
+        ]);
         if !self.review.is_empty() {
             spans.push(TextSpan::styled(
                 format!("  💬 {} open", self.review.open_count()),
@@ -11983,6 +12040,7 @@ mod tests {
             tab_conv_end: 0,
             footer_row: 21,
             layout_end: 0,
+            ..HitLayout::default()
         };
         assert_eq!(hit_region(5, 0, h), Region::Outside); // header
         assert_eq!(hit_region(5, 1, h), Region::Content { col: 5, row: 0 });
@@ -12013,6 +12071,53 @@ mod tests {
         assert_eq!(hit_region(23, 1, h), Region::Outside); // sidebar right border
         assert_eq!(hit_region(24, 1, h), Region::Outside); // gap / body border
         assert_eq!(hit_region(27, 3, h), Region::Content { col: 2, row: 2 });
+    }
+
+    #[test]
+    fn the_header_pr_number_is_a_clickable_link() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = pr_app();
+        app.label = "PR #1".to_string(); // as the real PR load sets it
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let (x0, x1) = app
+            .header_pr_link
+            .get()
+            .expect("a PR-link range was recorded");
+        assert_eq!(
+            (x1 - x0) as usize,
+            "#1".chars().count(),
+            "the link spans '#1'"
+        );
+        // The '#1' columns hit the link; the 'PR ' before and the space after don't.
+        assert_eq!(hit_region(x0, 0, app.hit.get()), Region::PrLink);
+        assert_eq!(hit_region(x1 - 1, 0, app.hit.get()), Region::PrLink);
+        assert_eq!(
+            hit_region(x0 - 1, 0, app.hit.get()),
+            Region::Outside,
+            "the 'PR ' prefix is not the link"
+        );
+        assert_eq!(
+            hit_region(x1, 0, app.hit.get()),
+            Region::Outside,
+            "past the number is not the link"
+        );
+        assert!(screen_text(&term).contains("#1"), "the number renders");
+    }
+
+    #[test]
+    fn a_non_pr_header_has_no_link() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let app = sample_app(); // a working-tree review, no PR
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(
+            app.header_pr_link.get().is_none(),
+            "off a pull request there is no link"
+        );
+        assert_eq!(hit_region(15, 0, app.hit.get()), Region::Outside);
     }
 
     /// Empirical: render, read the buffer to find the screen row of a known
@@ -12168,6 +12273,7 @@ mod tests {
             tab_conv_end: files_end + 1 + 20,
             footer_row: body_top + 20,
             layout_end: 0,
+            ..HitLayout::default()
         }
     }
 
