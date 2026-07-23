@@ -916,6 +916,7 @@ fn wrap_pieces(pieces: &[Piece], width: usize) -> (Vec<Vec<TextSpan<'static>>>, 
         let words = to_words(&segment);
         place_words(&words, width, &mut lines, &mut regions);
     }
+    merge_adjacent_regions(&mut regions);
     if lines.is_empty() {
         lines.push(Vec::new());
     }
@@ -968,7 +969,7 @@ fn to_words(pieces: &[Piece]) -> Vec<Word> {
     words
 }
 
-fn word_width(word: &Word) -> usize {
+fn word_width(word: &[Run]) -> usize {
     word.iter()
         .map(|(t, _, _)| UnicodeWidthStr::width(t.as_str()))
         .sum()
@@ -977,7 +978,7 @@ fn word_width(word: &Word) -> usize {
 /// Append a word's runs to `line` at column `col`, recording a region per run
 /// that carries an action.
 fn emit_runs(
-    word: &Word,
+    word: &[Run],
     line: &mut Vec<TextSpan<'static>>,
     col: &mut u16,
     line_idx: usize,
@@ -993,7 +994,15 @@ fn emit_runs(
     }
 }
 
-/// Greedy word-wrap, hard-breaking any word wider than `width`.
+/// The `(style, action)` of a word's boundary run (first or last).
+fn boundary(run: Option<&Run>) -> Option<(Style, Option<MdAction>)> {
+    run.map(|(_, style, action)| (*style, action.clone()))
+}
+
+/// Greedy word-wrap, hard-breaking any word wider than `width`. The space that
+/// joins two words inherits the boundary run's style and action when both sides
+/// agree — so a multi-word link (or bold run) stays continuously underlined and
+/// its click region spans the space; a style boundary keeps a plain space.
 fn place_words(
     words: &[Word],
     width: usize,
@@ -1002,8 +1011,10 @@ fn place_words(
 ) {
     let mut cur: Vec<TextSpan<'static>> = Vec::new();
     let mut col: u16 = 0;
+    let mut prev_last: Option<(Style, Option<MdAction>)> = None;
     for word in words {
         let ww = word_width(word);
+        let this_first = boundary(word.first());
         if ww > width {
             if !cur.is_empty() {
                 lines.push(std::mem::take(&mut cur));
@@ -1019,24 +1030,49 @@ fn place_words(
                 rest = tail;
             }
             emit_runs(&rest, &mut cur, &mut col, lines.len(), regions);
+            prev_last = boundary(word.last());
             continue;
         }
         let sep = usize::from(!cur.is_empty());
         if !cur.is_empty() && col as usize + sep + ww > width {
-            lines.push(std::mem::take(&mut cur));
+            lines.push(std::mem::take(&mut cur)); // wrap: no separator at the break
             col = 0;
         }
         if !cur.is_empty() {
-            cur.push(TextSpan::raw(" "));
-            col += 1;
+            // The joining space matches both sides' run, else it is a plain space.
+            let (style, action) = match (&prev_last, &this_first) {
+                (Some((ps, pa)), Some((ts, ta))) if ps == ts && pa == ta => (*ts, ta.clone()),
+                _ => (Style::default(), None),
+            };
+            emit_runs(
+                &[(" ".to_string(), style, action)],
+                &mut cur,
+                &mut col,
+                lines.len(),
+                regions,
+            );
         }
         emit_runs(word, &mut cur, &mut col, lines.len(), regions);
+        prev_last = boundary(word.last());
     }
     lines.push(cur);
 }
 
+/// Merge contiguous same-action regions on a line into one, so a multi-word link
+/// is a single click target rather than one region per word.
+fn merge_adjacent_regions(regions: &mut Vec<LocalRegion>) {
+    let mut out: Vec<LocalRegion> = Vec::with_capacity(regions.len());
+    for r in regions.drain(..) {
+        match out.last_mut() {
+            Some(last) if last.0 == r.0 && last.3 == r.3 && last.2 == r.1 => last.2 = r.2,
+            _ => out.push(r),
+        }
+    }
+    *regions = out;
+}
+
 /// Split a word at `width` display columns, preserving style/action runs.
-fn split_word(word: &Word, width: usize) -> (Word, Word) {
+fn split_word(word: &[Run], width: usize) -> (Word, Word) {
     let mut head: Word = Vec::new();
     let mut tail: Word = Vec::new();
     let mut used = 0usize;
@@ -1532,6 +1568,50 @@ mod tests {
         assert_eq!(
             slice, "https://example.com/path",
             "the region covers the url"
+        );
+    }
+
+    #[test]
+    fn a_multi_word_link_stays_underlined_and_is_one_region() {
+        let r = rich("read [Claude Code](https://c.ai) now", Some(60));
+        // The space joining "Claude" and "Code" is underlined link text.
+        let mut checked_space = false;
+        for l in &r.lines {
+            for (i, s) in l.spans.iter().enumerate() {
+                if s.content.as_ref() == "Claude"
+                    && let Some(space) = l.spans.get(i + 1)
+                {
+                    assert_eq!(space.content.as_ref(), " ");
+                    assert!(
+                        space.style.add_modifier.contains(Modifier::UNDERLINED)
+                            && space.style.fg == Some(palette::LINK_FG),
+                        "the joining space is underlined link text"
+                    );
+                    checked_space = true;
+                }
+            }
+        }
+        assert!(checked_space, "found the Claude|space|Code boundary");
+        // One continuous region spans the whole label, space included.
+        let region = r
+            .regions
+            .iter()
+            .find(|reg| reg.action == MdAction::Open("https://c.ai".to_string()))
+            .expect("a link region");
+        let slice: String = text_of(&r.lines[region.line])
+            .chars()
+            .skip(region.start as usize)
+            .take((region.end - region.start) as usize)
+            .collect();
+        assert_eq!(
+            slice, "Claude Code",
+            "one region covers the label incl. the space"
+        );
+        // Plaintext after the link does not inherit the underline.
+        let now = style_of(&r.lines, "now").unwrap();
+        assert!(
+            !now.add_modifier.contains(Modifier::UNDERLINED),
+            "no underline leak"
         );
     }
 
