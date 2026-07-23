@@ -483,9 +483,17 @@ impl Cli {
                         detect: false,
                     }
                 }
+                // Old muscle memory: `lr pr 123` / `lr issue 5`. Point at the new
+                // grammar rather than the generic "not something to review".
+                (false, Some(reference)) if reference == "pr" || reference == "issue" => {
+                    Action::Invalid(format!(
+                        "the `{reference}` verb is gone — a bare reference is the entry point now: \
+                         `lr 123`, `lr owner/repo#5`, or `lr <url>` (it opens a pull request or an issue)"
+                    ))
+                }
                 (false, Some(reference)) => Action::Invalid(format!(
-                    "`{reference}` isn't something to review — pass a pull request (a number, `#N`, \
-                     `owner/repo#N`, or a URL), a git diff (`lr diff {reference}`), or a patch (`lr patch`)"
+                    "`{reference}` isn't something to review — pass a pull request or issue (a number, \
+                     `#N`, `owner/repo#N`, or a URL), a git diff (`lr diff {reference}`), or a patch (`lr patch`)"
                 )),
                 (false, None) => Action::Dispatch,
             },
@@ -670,9 +678,18 @@ mod tests {
 
     #[test]
     fn the_pr_verb_is_gone() {
-        // `pr` is no longer a subcommand — bare `lr pr` is a non-reference
-        // positional (rejected), and `lr pr 123` is a clap parse error.
-        assert!(matches!(action_of(&["lr", "pr"]), Action::Invalid(_)));
+        // `pr` is no longer a subcommand — bare `lr pr` / `lr issue` is a
+        // non-reference positional, guided to the new grammar; `lr pr 123` is a
+        // clap parse error (an extra positional).
+        for verb in ["pr", "issue"] {
+            match action_of(&["lr", verb]) {
+                Action::Invalid(msg) => assert!(
+                    msg.contains("gone"),
+                    "the `{verb}` guidance names the removed verb: {msg}"
+                ),
+                other => panic!("expected an Invalid for `{verb}`, got {other:?}"),
+            }
+        }
         assert!(Cli::try_parse_from(["lr", "pr", "123"]).is_err());
     }
 
