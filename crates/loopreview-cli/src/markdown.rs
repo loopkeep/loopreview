@@ -1483,6 +1483,73 @@ mod tests {
     }
 
     #[test]
+    fn a_mean_document_renders_every_construct_within_the_pane() {
+        // A regression net: one document exercising heading, autolink, image,
+        // alert, nested quote, table with a cell break, details, footnote, rule,
+        // and CJK. Every rendered line must fit the pane, and each construct must
+        // leave its mark. (Content + width, not an exact line count, so ordinary
+        // spacing tweaks don't false-alarm.)
+        let hl = Highlighter::new();
+        let src = "\
+# Title
+
+Intro with `code.rs`, https://example.com/x, and ![shot](https://e/i.png).
+
+> [!WARNING]
+> Watch out.
+>
+> > nested quote
+
+| A | B |
+| --- | --- |
+| one | two<br>three |
+
+<details>
+<summary>More detail</summary>
+
+Inside the fold.
+
+</details>
+
+Text[^1] with a footnote.
+
+[^1]: the note.
+
+---
+
+日本語のテキストも混ぜてみる。";
+        let width = 40;
+        let lines = render(src, Some(width), &hl);
+        for line in &lines {
+            assert!(
+                UnicodeWidthStr::width(text_of(line).as_str()) <= width,
+                "no line overruns the pane: {:?}",
+                text_of(line)
+            );
+        }
+        // Flatten with spaces so a construct that wrapped across lines still reads
+        // contiguously (a wrapped placeholder's break becomes a space here).
+        let flat = texts(&lines).join(" ");
+        for needle in [
+            "Title",                 // heading, no `#`
+            "https://example.com/x", // bare-url autolink
+            "[Image: shot]",         // image placeholder
+            "Watch out",             // alert body
+            "nested quote",          // nested blockquote
+            "▾ More detail",         // details summary
+            "Inside the fold.",      // details body
+            "[1]",                   // footnote reference
+            "the note",              // footnote definition
+            "日本語",                // CJK
+        ] {
+            assert!(flat.contains(needle), "missing {needle:?} in:\n{flat}");
+        }
+        assert!(!flat.contains('#'), "no raw heading marks");
+        assert!(!flat.contains("<summary"), "no raw detail tags");
+        assert!(flat.contains('─'), "the thematic-break rule renders");
+    }
+
+    #[test]
     fn table_cells_keep_inline_styles_and_cjk_width() {
         let hl = Highlighter::new();
         let src = "\
