@@ -2,10 +2,10 @@
 //!
 //! Bare `lr` is dispatch sugar (a piped patch, otherwise the working tree).
 //! `lr diff` reviews a VCS diff and never reads stdin; `lr patch` reviews a
-//! unified-diff patch from a file or stdin. The hidden `show` and `daemon` verbs
-//! are reserved for later milestones so the namespace stays stable (`pr`,
-//! `session`, and `update` are implemented). `--help` / `--version` are handled
-//! by clap before the TTY guard.
+//! unified-diff patch from a file or stdin; `lr show [target]` reviews one
+//! commit's own changes. The hidden `daemon` verb stays reserved for a later
+//! milestone so the namespace stays stable (`pr`, `session`, and `update` are
+//! implemented). `--help` / `--version` are handled by clap before the TTY guard.
 
 use std::path::PathBuf;
 
@@ -102,11 +102,15 @@ enum Command {
         /// Patch file to read; reads standard input when omitted.
         file: Option<PathBuf>,
     },
-    /// Reserved: commit review (planned, not yet available).
-    #[command(hide = true)]
+    /// Review a single commit's own changes, like `git show`.
     Show {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// The commit to show; omit for `HEAD`. Compared against its first parent
+        /// (a merge commit uses its first parent too), or the empty tree for a
+        /// root commit.
+        target: Option<String>,
+        /// Limit the diff to these paths (after `--`).
+        #[arg(last = true, value_name = "PATHSPEC")]
+        pathspec: Vec<String>,
     },
     /// Review a GitHub pull request (by number, URL, owner/repo#N, or #N).
     Pr {
@@ -374,6 +378,11 @@ pub enum Action {
         target: String,
         pathspec: Vec<String>,
     },
+    /// `lr show [target] [-- pathspec]`: one commit's own changes (default HEAD).
+    Show {
+        target: String,
+        pathspec: Vec<String>,
+    },
     /// `lr patch <file>`: a patch from a file.
     PatchFile(PathBuf),
     /// `lr patch`: a patch from standard input.
@@ -453,9 +462,10 @@ impl Cli {
             Some(Command::Patch { file: Some(path) }) => Action::PatchFile(path),
             Some(Command::Patch { file: None }) => Action::PatchStdin,
             Some(Command::Pr { query, detect }) => Action::Pr { query, detect },
-            Some(Command::Show { .. }) => {
-                Action::NotYet("`lr show` (commit review) is planned but not yet available")
-            }
+            Some(Command::Show { target, pathspec }) => Action::Show {
+                target: target.unwrap_or_else(|| "HEAD".to_string()),
+                pathspec,
+            },
             // `session` is peeled off by `dispatch` before this.
             Some(Command::Session(_)) => Action::NotYet("`lr session` is handled by dispatch"),
             Some(Command::Update { .. }) => Action::NotYet("`lr update` is handled by dispatch"),
@@ -507,6 +517,28 @@ mod tests {
             action_of(&["lr", "diff", "main...", "--", "src/"]),
             Action::Ref {
                 target: "main...".to_string(),
+                pathspec: vec!["src/".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn show_defaults_to_head() {
+        assert_eq!(
+            action_of(&["lr", "show"]),
+            Action::Show {
+                target: "HEAD".to_string(),
+                pathspec: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn show_with_target_and_pathspec() {
+        assert_eq!(
+            action_of(&["lr", "show", "HEAD~2", "--", "src/"]),
+            Action::Show {
+                target: "HEAD~2".to_string(),
                 pathspec: vec!["src/".to_string()],
             }
         );

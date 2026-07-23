@@ -48,7 +48,11 @@ lr session review [<id>|--repo .] [--patch] [--json]
 lr session comment list [<id>|--repo .] [--json]
 ```
 
-- `get` reports the session id, pid, repo, and source.
+- `list`/`get` report the session id, pid, repo, and **source** — a descriptive
+  label such as `working tree`, `git diff main...`, `show HEAD~1 (a1b2c3d)` (one
+  commit's changes), or `pull request`. When a repo has more than one live
+  session (say a worktree review and a `lr show`), match on the source string to
+  pick the id you want.
 - `context` reports the human's current view (`files`/`conversation`), the line
   under their cursor, the thread there (if any), and `event_seq` — the latest
   event number, which you pass to `wait --after` to avoid missing events.

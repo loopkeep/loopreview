@@ -181,6 +181,54 @@ impl DiffSource for RefSource {
     }
 }
 
+/// A single commit's own changes — `git show <target>` semantics: the commit
+/// against its first parent (or the empty tree for a root commit). Sugar over the
+/// same ref machinery [`RefSource`] uses, with a session label that names the
+/// commit so it is distinguishable from a worktree review of the same repo.
+pub struct ShowSource {
+    dir: PathBuf,
+    target: String,
+    pathspec: Vec<String>,
+}
+
+impl ShowSource {
+    /// Show `target` (default `HEAD` at the call site) in the repository at `dir`.
+    pub fn new(dir: impl Into<PathBuf>, target: impl Into<String>) -> ShowSource {
+        ShowSource {
+            dir: dir.into(),
+            target: target.into(),
+            pathspec: Vec::new(),
+        }
+    }
+
+    /// Restrict the diff to paths matching `pathspec`.
+    pub fn pathspec(mut self, pathspec: Vec<String>) -> ShowSource {
+        self.pathspec = pathspec;
+        self
+    }
+}
+
+impl DiffSource for ShowSource {
+    fn load(&self) -> Result<Diff, DiffError> {
+        let range = git::show_range(&self.dir, &self.target)?;
+        let text = git::diff_target(&self.dir, &range, &self.pathspec)?;
+        let mut diff = patch::parse(&text)?;
+        // Provenance from the resolved `parent..commit` range: base = the parent
+        // (or empty tree), head = the commit shown — so comment anchors carry the
+        // right commit context.
+        diff.provenance = resolve_ref_provenance(&self.dir, &range);
+        Ok(diff)
+    }
+
+    fn describe(&self) -> String {
+        // "show HEAD~1 (a1b2c3d)" — the target and its resolved short sha.
+        match git::rev_parse(&self.dir, &self.target) {
+            Some(sha) => format!("show {} ({})", self.target, &sha[..sha.len().min(7)]),
+            None => format!("show {}", self.target),
+        }
+    }
+}
+
 /// Resolve the base/head commit SHAs a `git diff <target>` compares, matching
 /// git's range grammar:
 ///

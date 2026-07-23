@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use loopreview_core::{ChangeStatus, DiffError, DiffSource, LineKind, RefSource, WorktreeSource};
+use loopreview_core::{
+    ChangeStatus, DiffError, DiffSource, LineKind, RefSource, ShowSource, WorktreeSource,
+};
 
 /// Run `git` in `dir` with `args`, panicking on failure.
 fn git(dir: &Path, args: &[&str]) {
@@ -239,5 +241,116 @@ fn ref_source_parses_a_commit_range() {
         Some(git_out(&repo, &["rev-parse", "HEAD"]).as_str())
     );
 
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn show_source_shows_a_commits_own_changes() {
+    let repo = init_repo("show");
+    std::fs::write(repo.join("added.txt"), "hello\n").expect("write added file");
+    git(&repo, &["add", "added.txt"]);
+    git(&repo, &["commit", "--quiet", "-m", "add file"]);
+
+    // `show HEAD` = the tip commit against its first parent.
+    let diff = ShowSource::new(&repo, "HEAD")
+        .load()
+        .expect("load show diff");
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].status, ChangeStatus::Added);
+    assert_eq!(diff.files[0].new_path.as_deref(), Some("added.txt"));
+    assert_eq!(
+        diff.provenance.base.as_deref(),
+        Some(git_out(&repo, &["rev-parse", "HEAD^"]).as_str()),
+        "base is the first parent"
+    );
+    assert_eq!(
+        diff.provenance.head.as_deref(),
+        Some(git_out(&repo, &["rev-parse", "HEAD"]).as_str()),
+        "head is the commit shown"
+    );
+
+    // The session label names the commit and its short sha.
+    let label = ShowSource::new(&repo, "HEAD").describe();
+    let short = git_out(&repo, &["rev-parse", "HEAD"])[..7].to_string();
+    assert_eq!(label, format!("show HEAD ({short})"));
+
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn show_source_of_a_root_commit_diffs_the_empty_tree() {
+    let repo = init_repo("show-root"); // the single commit is the root
+    let root = git_out(&repo, &["rev-parse", "HEAD"]);
+    let diff = ShowSource::new(&repo, &root)
+        .load()
+        .expect("load root show");
+    // The initial file is all additions against the empty tree (no parent).
+    assert_eq!(diff.files.len(), 1);
+    assert_eq!(diff.files[0].status, ChangeStatus::Added);
+    assert_eq!(diff.files[0].new_path.as_deref(), Some("file.txt"));
+    assert_eq!(diff.provenance.head.as_deref(), Some(root.as_str()));
+    assert_ne!(
+        diff.provenance.base.as_deref(),
+        Some(root.as_str()),
+        "base is the empty tree, not the (absent) parent"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn show_source_of_a_merge_uses_its_first_parent() {
+    let repo = init_repo("show-merge");
+    let main = git_out(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+    // A feature branch adds its own file.
+    git(&repo, &["checkout", "--quiet", "-b", "feature"]);
+    std::fs::write(repo.join("feature.txt"), "f\n").expect("write");
+    git(&repo, &["add", "feature.txt"]);
+    git(&repo, &["commit", "--quiet", "-m", "feature"]);
+    // Back on the main branch, a different file, then a real merge commit.
+    git(&repo, &["checkout", "--quiet", &main]);
+    std::fs::write(repo.join("main.txt"), "m\n").expect("write");
+    git(&repo, &["add", "main.txt"]);
+    git(&repo, &["commit", "--quiet", "-m", "main change"]);
+    git(
+        &repo,
+        &["merge", "--quiet", "--no-ff", "feature", "-m", "merge"],
+    );
+
+    // `show` on the merge = merge vs its FIRST parent (the main tip), so it shows
+    // only what the branch brought in — not the first parent's own change.
+    let diff = ShowSource::new(&repo, "HEAD")
+        .load()
+        .expect("load merge show");
+    assert_eq!(
+        diff.provenance.base.as_deref(),
+        Some(git_out(&repo, &["rev-parse", "HEAD^1"]).as_str()),
+        "base is the first parent"
+    );
+    let paths: Vec<&str> = diff
+        .files
+        .iter()
+        .filter_map(|f| f.new_path.as_deref())
+        .collect();
+    assert!(
+        paths.contains(&"feature.txt"),
+        "brings in the branch's file: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"main.txt"),
+        "not the first parent's own change: {paths:?}"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn show_source_reports_an_unknown_target() {
+    let repo = init_repo("show-bad");
+    let err = ShowSource::new(&repo, "no-such-ref-xyz")
+        .load()
+        .unwrap_err();
+    assert!(
+        matches!(&err, DiffError::UnknownRevision { target } if target == "no-such-ref-xyz"),
+        "a bad target gets the friendly error: {err:?}"
+    );
     let _ = std::fs::remove_dir_all(&repo);
 }

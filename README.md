@@ -90,11 +90,18 @@ from source or a package manager, update through that channel instead — after 
 lr                    # review the working tree (staged + unstaged vs HEAD)
 lr diff main...       # review this branch's changes off main
 lr diff --staged      # review only the staged changes
+lr show               # review the last commit's own changes (like git show)
+lr show HEAD~2        # review a specific commit
 lr patch fix.patch    # review a saved patch...
 git diff | lr         # ...or one piped in
 lr pr 123             # review GitHub pull request #123 in the TUI
 lr pr "#123"          # quote #N — a bare # is a shell comment
 ```
+
+`lr show [target]` reviews a single commit's own changes (default `HEAD`),
+comparing it to its first parent — like `git show`, so a merge commit shows what
+its branch brought in, and a root commit shows against the empty tree. A limited
+diff takes a pathspec after `--` (`lr show HEAD~2 -- src/`).
 
 Useful global options: `--mode auto|unified|split` picks the layout,
 `--no-watch` turns off auto-refresh, and `--exclude-untracked` drops untracked

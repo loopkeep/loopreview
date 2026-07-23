@@ -27,4 +27,6 @@ pub use model::{
     ChangeStatus, Diff, DiffStats, FileDiff, Hunk, Line, LineAnchor, LineKind, Provenance, Side,
 };
 pub use review::{Anchor, Comment, CommentKind, Review, Thread, ThreadState};
-pub use source::{DiffSource, FilePatchSource, RefSource, StdinPatchSource, WorktreeSource};
+pub use source::{
+    DiffSource, FilePatchSource, RefSource, ShowSource, StdinPatchSource, WorktreeSource,
+};

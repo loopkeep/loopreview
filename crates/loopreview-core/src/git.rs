@@ -159,6 +159,25 @@ pub fn rev_parse(dir: &Path, rev: &str) -> Option<String> {
     (!sha.is_empty()).then_some(sha)
 }
 
+/// The `git diff` range for `git show <target>`: a commit's own changes against
+/// its first parent, or against the empty tree for a root commit (no parent).
+/// Using the first parent (`<target>^`) matches `git show`'s handling of merge
+/// commits. An unresolvable `target` surfaces [`DiffError::UnknownRevision`], the
+/// same friendly error `lr diff` gives.
+pub fn show_range(dir: &Path, target: &str) -> Result<String, DiffError> {
+    if rev_parse(dir, target).is_none() {
+        return Err(DiffError::UnknownRevision {
+            target: target.to_string(),
+        });
+    }
+    let base = rev_parse(dir, &format!("{target}^"))
+        .or_else(|| empty_tree(dir))
+        .ok_or_else(|| DiffError::UnknownRevision {
+            target: target.to_string(),
+        })?;
+    Ok(format!("{base}..{target}"))
+}
+
 /// The best common ancestor commit of `a` and `b`, or `None` when there is none.
 pub fn merge_base(dir: &Path, a: &str, b: &str) -> Option<String> {
     let mut cmd = Command::new("git");

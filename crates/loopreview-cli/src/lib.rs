@@ -28,7 +28,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 
 use loopreview_core::{
-    DiffError, DiffSource, FilePatchSource, RefSource, StdinPatchSource, WorktreeSource, git,
+    DiffError, DiffSource, FilePatchSource, RefSource, ShowSource, StdinPatchSource,
+    WorktreeSource, git,
 };
 
 use cli::{Action, Cli, Dispatch, Invocation, LayoutMode};
@@ -265,6 +266,12 @@ fn build_source(
             reject_piped_stdin_for_diff()?;
             let root = repo_root()?;
             let source = RefSource::new(root.clone(), target).pathspec(pathspec);
+            Ok((Arc::new(source), Some(root)))
+        }
+        Action::Show { target, pathspec } => {
+            reject_piped_stdin_for_diff()?;
+            let root = repo_root()?;
+            let source = ShowSource::new(root.clone(), target).pathspec(pathspec);
             Ok((Arc::new(source), Some(root)))
         }
         Action::PatchFile(path) => Ok((Arc::new(FilePatchSource::new(path)), None)),
