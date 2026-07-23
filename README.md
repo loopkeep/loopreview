@@ -237,7 +237,10 @@ review threads without touching your working tree. Your comments and replies are
 kept as **drafts** (a `[draft]` badge) — they persist across sessions — until you
 submit. `Ctrl-S` opens the submit modal, which lists what will be sent and by
 whom (flagging any draft not authored by you, since it goes out under your
-identity); pick the review event and an optional summary. `Ctrl-R` re-pulls from
+identity). When the batch adds new inline comments you pick a review event
+(comment / approve / request changes) and an optional summary; a reply-only batch
+(replies and conversation comments, no new inline comments) skips that — it posts
+directly, with just a send confirmation. `Ctrl-R` re-pulls from
 GitHub while keeping your drafts. Resolving a published thread syncs to GitHub.
 Multi-line comments round-trip as ranges (GitHub's `start_line` / `startLine`).
 (The pull-request features use the `gh` CLI, which must be installed and

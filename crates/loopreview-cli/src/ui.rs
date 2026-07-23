@@ -484,6 +484,28 @@ const SUBMIT_EVENTS: &[(&str, crate::prsync::SubmitEvent)] = &[
     ),
 ];
 
+/// What a pending submit would post — the counts, authors, and foreign flag the
+/// submit modal is built from.
+struct DraftSummary {
+    /// New inline review comments (line-anchored draft roots).
+    new_inline: usize,
+    /// Inline replies to already-published threads.
+    replies: usize,
+    /// New conversation-comment roots (Review-anchored draft roots).
+    conversation: usize,
+    /// Draft authors and their counts, most first.
+    authors: Vec<(String, usize)>,
+    /// True when a draft is authored by someone other than the submitting human.
+    foreign: bool,
+}
+
+impl DraftSummary {
+    /// Total drafts that will actually post.
+    fn total(&self) -> usize {
+        self.new_inline + self.replies + self.conversation
+    }
+}
+
 /// The review-submission modal for a pull request.
 struct SubmitModal {
     /// Selected index into [`SUBMIT_EVENTS`].
@@ -494,12 +516,22 @@ struct SubmitModal {
     new_count: usize,
     /// Draft replies that will be posted.
     reply_count: usize,
+    /// New conversation comments that will be posted.
+    conversation_count: usize,
     /// Draft authors and their counts, most first — a check before sending under
     /// the human's GitHub identity.
     authors: Vec<(String, usize)>,
     /// True when a draft is authored by someone other than the submitting human
     /// (e.g. an agent) — flagged so it is not sent unnoticed.
     foreign: bool,
+}
+
+impl SubmitModal {
+    /// A reply-only / conversation-only batch — no new inline comments, so no
+    /// review POST and no event to choose (just a send confirmation).
+    fn is_send_only(&self) -> bool {
+        self.new_count == 0
+    }
 }
 
 /// An in-progress comment being composed.
@@ -1123,32 +1155,37 @@ impl App {
         pr.url().to_string()
     }
 
-    /// Count the local drafts that a submit would post: new inline threads and
-    /// replies (comments without a remote id).
-    /// What a submit would send: the new-inline and reply counts, the draft
-    /// authors (most first), and whether any draft is by someone other than the
-    /// submitting human. Only `draft`-kind comments count — local notes are never
-    /// sent — matching what the submit flow actually posts.
-    fn draft_summary(&self) -> (usize, usize, Vec<(String, usize)>, bool) {
+    /// What a submit would actually post, matching the push plan: new inline
+    /// threads, inline replies, and new conversation-comment roots — each a draft
+    /// (local notes are never sent). Returns those three counts, the draft authors
+    /// (most first), and whether any draft is by someone other than the submitting
+    /// human. A conversation *reply* never posts (it stays local), so it is not
+    /// counted.
+    fn draft_summary(&self) -> DraftSummary {
         let mut new_inline = 0;
         let mut replies = 0;
+        let mut conversation = 0;
         let mut authors: Vec<(String, usize)> = Vec::new();
         for thread in &self.review.threads {
+            let review_anchored = thread.anchor == Anchor::Review;
             for (i, comment) in thread.comments.iter().enumerate() {
                 if !comment.is_draft() {
                     continue;
                 }
-                // A root only posts when it is line-anchored (an inline comment);
-                // a reply always posts. Tally the author of what actually sends.
+                // What actually posts: an inline root (a new review comment) or a
+                // conversation root (a new PR comment); an inline reply; never a
+                // conversation reply (it stays local).
                 let sends = if i == 0 {
-                    matches!(thread.anchor, Anchor::Line { .. })
+                    matches!(thread.anchor, Anchor::Line { .. }) || review_anchored
                 } else {
-                    true
+                    !review_anchored
                 };
                 if !sends {
                     continue;
                 }
-                if i == 0 {
+                if i == 0 && review_anchored {
+                    conversation += 1;
+                } else if i == 0 {
                     new_inline += 1;
                 } else {
                     replies += 1;
@@ -1161,7 +1198,13 @@ impl App {
         }
         authors.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let foreign = authors.iter().any(|(name, _)| *name != self.author);
-        (new_inline, replies, authors, foreign)
+        DraftSummary {
+            new_inline,
+            replies,
+            conversation,
+            authors,
+            foreign,
+        }
     }
 
     /// Open the review-submission modal (pull requests only).
@@ -1169,14 +1212,20 @@ impl App {
         if self.pr.is_none() {
             return;
         }
-        let (new_count, reply_count, authors, foreign) = self.draft_summary();
+        let summary = self.draft_summary();
+        // Nothing to send — don't open an empty modal.
+        if summary.total() == 0 {
+            self.status = Some("no drafts to submit".to_string());
+            return;
+        }
         self.submit = Some(SubmitModal {
             selected: 0,
             body: TextArea::default(),
-            new_count,
-            reply_count,
-            authors,
-            foreign,
+            new_count: summary.new_inline,
+            reply_count: summary.replies,
+            conversation_count: summary.conversation,
+            authors: summary.authors,
+            foreign: summary.foreign,
         });
     }
 
@@ -1186,15 +1235,20 @@ impl App {
         let Some(modal) = self.submit.as_mut() else {
             return;
         };
+        // A send-only batch has no event to pick and no summary to type — it is a
+        // plain confirmation, so only Esc and Ctrl-S act.
+        let send_only = modal.is_send_only();
         match code {
             KeyCode::Esc => {
                 self.submit = None;
                 self.status = Some("submit cancelled".to_string());
             }
             KeyCode::Char('s') if ctrl => self.confirm_submit(),
-            KeyCode::Up => modal.selected = modal.selected.saturating_sub(1),
-            KeyCode::Down => modal.selected = (modal.selected + 1).min(SUBMIT_EVENTS.len() - 1),
-            _ if ctrl => {}
+            KeyCode::Up if !send_only => modal.selected = modal.selected.saturating_sub(1),
+            KeyCode::Down if !send_only => {
+                modal.selected = (modal.selected + 1).min(SUBMIT_EVENTS.len() - 1)
+            }
+            _ if ctrl || send_only => {}
             _ => modal.body.on_key(code),
         }
     }
@@ -1207,7 +1261,13 @@ impl App {
         let Some(pr) = self.pr.clone() else {
             return;
         };
-        let event = SUBMIT_EVENTS[modal.selected].1;
+        // A send-only batch posts no review, so the event is moot — use Pending so
+        // no empty review is attempted; otherwise honor the picked event.
+        let event = if modal.is_send_only() {
+            crate::prsync::SubmitEvent::Pending
+        } else {
+            SUBMIT_EVENTS[modal.selected].1
+        };
         let body = modal.body.text().trim().to_string();
         let threads = self.review.threads.clone();
         self.start_job(
@@ -4846,16 +4906,36 @@ impl App {
 
     /// The review-submission modal for a pull request.
     fn draw_submit(&self, f: &mut Frame, modal: &SubmitModal) {
+        let send_only = modal.is_send_only();
         let area = centered_rect(70, 60, f.area());
         f.render_widget(Clear, area);
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Submit review ")
+            .title(if send_only {
+                " Send replies "
+            } else {
+                " Submit review "
+            })
             .border_style(Style::default().fg(Color::Cyan));
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        let total = modal.new_count + modal.reply_count;
+        let total = modal.new_count + modal.reply_count + modal.conversation_count;
+        // A breakdown of what actually posts, omitting zero categories.
+        let mut breakdown = Vec::new();
+        if modal.new_count > 0 {
+            breakdown.push(format!("{} new inline", modal.new_count));
+        }
+        if modal.reply_count > 0 {
+            breakdown.push(format!(
+                "{} repl{}",
+                modal.reply_count,
+                if modal.reply_count == 1 { "y" } else { "ies" }
+            ));
+        }
+        if modal.conversation_count > 0 {
+            breakdown.push(format!("{} conversation", modal.conversation_count));
+        }
         let by = modal
             .authors
             .iter()
@@ -4864,12 +4944,7 @@ impl App {
             .join(" · ");
         let mut lines = vec![
             TextLine::from(TextSpan::styled(
-                format!(
-                    "{total} draft(s) to send ({} new · {} repl{})",
-                    modal.new_count,
-                    modal.reply_count,
-                    if modal.reply_count == 1 { "y" } else { "ies" }
-                ),
+                format!("{total} draft(s) to send ({})", breakdown.join(" · ")),
                 Style::default().fg(Color::Gray),
             )),
             TextLine::from(TextSpan::styled(
@@ -4886,6 +4961,31 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             )));
         }
+
+        // A send-only batch (replies / conversation comments, no new inline
+        // review comments) makes no review POST, so there is no event to choose
+        // and no summary — just a send confirmation.
+        if send_only {
+            lines.push(TextLine::from(""));
+            lines.push(TextLine::from(TextSpan::styled(
+                "posts directly — no review event",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(inner);
+            f.render_widget(Paragraph::new(lines), rows[0]);
+            f.render_widget(
+                Paragraph::new(TextLine::from(TextSpan::styled(
+                    "Ctrl-S send · Esc cancel",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                rows[1],
+            );
+            return;
+        }
+
         lines.push(TextLine::from(""));
         lines.push(TextLine::from(TextSpan::styled(
             "event:",
@@ -8343,12 +8443,16 @@ mod tests {
             "just a note",
             CommentKind::Local,
         );
-        let (new, reply, authors, foreign) = app.draft_summary();
-        assert_eq!((new, reply), (2, 0), "two drafts, the local note excluded");
-        assert!(authors.contains(&("tester".to_string(), 1)));
-        assert!(authors.contains(&("fable".to_string(), 1)));
+        let summary = app.draft_summary();
+        assert_eq!(
+            (summary.new_inline, summary.replies, summary.conversation),
+            (2, 0, 0),
+            "two inline drafts, the local note excluded"
+        );
+        assert!(summary.authors.contains(&("tester".to_string(), 1)));
+        assert!(summary.authors.contains(&("fable".to_string(), 1)));
         assert!(
-            foreign,
+            summary.foreign,
             "a draft by someone other than the human is flagged"
         );
 
@@ -8360,8 +8464,103 @@ mod tests {
             "mine",
             CommentKind::Draft,
         );
-        let (_, _, _, foreign) = solo.draft_summary();
-        assert!(!foreign, "only the human's own drafts — no warning");
+        assert!(
+            !solo.draft_summary().foreign,
+            "only the human's own drafts — no warning"
+        );
+    }
+
+    #[test]
+    fn submit_summary_counts_conversation_roots_not_conversation_replies() {
+        let mut app = pr_app();
+        // A new conversation comment (a draft root) posts.
+        let (conv, _) = app.add_thread(Anchor::Review, "tester", "overall", CommentKind::Draft);
+        // A reply under it stays local — it must not be counted.
+        app.add_reply(&conv, "tester", "reply", CommentKind::Local);
+        // A reply to a published inline thread posts.
+        app.review.threads.push(Thread {
+            id: "inline".into(),
+            anchor: Anchor::line("a.rs", Side::New, 2),
+            state: ThreadState::Open,
+            comments: vec![
+                Comment {
+                    id: "root".into(),
+                    author: "someone".into(),
+                    body: "root".into(),
+                    created_at: 0,
+                    remote_id: Some("500".into()),
+                    kind: CommentKind::Draft,
+                },
+                Comment {
+                    id: "r".into(),
+                    author: "tester".into(),
+                    body: "my reply".into(),
+                    created_at: 0,
+                    remote_id: None,
+                    kind: CommentKind::Draft,
+                },
+            ],
+        });
+        let s = app.draft_summary();
+        assert_eq!(
+            (s.new_inline, s.replies, s.conversation),
+            (0, 1, 1),
+            "one inline reply and one conversation root; the conversation reply is local"
+        );
+    }
+
+    #[test]
+    fn submit_is_send_only_when_there_are_no_new_inline_comments() {
+        // A reply-only batch: a published inline root with a draft reply, no new
+        // inline drafts. The modal opens in send-only mode — no event, no summary.
+        let mut app = pr_app();
+        app.review.threads.push(Thread {
+            id: "inline".into(),
+            anchor: Anchor::line("a.rs", Side::New, 2),
+            state: ThreadState::Open,
+            comments: vec![
+                Comment {
+                    id: "root".into(),
+                    author: "someone".into(),
+                    body: "root".into(),
+                    created_at: 0,
+                    remote_id: Some("500".into()),
+                    kind: CommentKind::Draft,
+                },
+                Comment {
+                    id: "r".into(),
+                    author: "tester".into(),
+                    body: "reply".into(),
+                    created_at: 0,
+                    remote_id: None,
+                    kind: CommentKind::Draft,
+                },
+            ],
+        });
+        app.open_submit();
+        let modal = app.submit.as_ref().expect("the modal opened");
+        assert!(modal.is_send_only(), "a reply-only batch is send-only");
+        // A new inline draft flips it to the full review modal.
+        let mut full = pr_app();
+        full.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "new inline",
+            CommentKind::Draft,
+        );
+        full.open_submit();
+        assert!(
+            !full.submit.as_ref().unwrap().is_send_only(),
+            "a new inline draft needs the full modal"
+        );
+    }
+
+    #[test]
+    fn submit_with_nothing_to_send_reports_instead_of_opening() {
+        let mut app = pr_app(); // no drafts
+        app.open_submit();
+        assert!(app.submit.is_none(), "no empty modal");
+        assert_eq!(app.status.as_deref(), Some("no drafts to submit"));
     }
 
     #[test]
@@ -8439,6 +8638,12 @@ mod tests {
         // Ctrl-S has two roles kept apart by whether a composer is open: it saves
         // inside the composer (above), and opens the submit modal outside it.
         let mut pr = pr_app();
+        pr.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "tester",
+            "a draft to submit",
+            CommentKind::Draft,
+        );
         assert!(pr.input.is_none() && pr.submit.is_none());
         pr.on_key(KeyCode::Char('s'), KeyModifiers::CONTROL);
         assert!(
