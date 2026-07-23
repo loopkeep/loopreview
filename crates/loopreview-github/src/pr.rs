@@ -65,6 +65,12 @@ pub struct ResolvedPr {
     /// `origin/<base_ref>` to compare against.
     #[serde(default, rename = "baseRefName")]
     pub base_ref: String,
+    /// The base ref's commit SHA (`baseRefOid`) at resolution — the fallback base
+    /// endpoint when the base *branch* has been deleted (a closed/merged PR whose
+    /// branch is gone can no longer be fetched by name, but GitHub still serves
+    /// this commit if it remains reachable). Empty when unknown.
+    #[serde(default, rename = "baseRefOid")]
+    pub base_ref_oid: String,
     /// The head (source) branch name.
     #[serde(default, rename = "headRefName")]
     pub head_ref: String,
@@ -125,6 +131,12 @@ impl ResolvedPr {
             .as_ref()
             .map(|m| m.oid.as_str())
             .filter(|oid| !oid.is_empty())
+    }
+
+    /// The base ref's commit SHA, the fallback base endpoint when the base branch
+    /// was deleted. `None` when unknown (an empty `baseRefOid`).
+    pub fn base_ref_oid(&self) -> Option<&str> {
+        Some(self.base_ref_oid.as_str()).filter(|oid| !oid.is_empty())
     }
 
     /// A short label such as `PR #42` for UI headers.
@@ -432,6 +444,7 @@ mod tests {
             number: 1,
             title: "t".into(),
             base_ref: "main".into(),
+            base_ref_oid: String::new(),
             head_ref: "feat".into(),
             state: "OPEN".into(),
             is_draft: true,
@@ -518,6 +531,7 @@ mod tests {
             "number": 7,
             "title": "Add a thing",
             "baseRefName": "main",
+            "baseRefOid": "abc123def456",
             "headRefName": "feature/thing",
             "state": "OPEN",
             "url": "https://github.com/o/r/pull/7"
@@ -527,9 +541,14 @@ mod tests {
         pr.repo = "r".to_string();
         assert_eq!(pr.number, 7);
         assert_eq!(pr.base_ref, "main");
+        assert_eq!(pr.base_ref_oid(), Some("abc123def456"));
         assert_eq!(pr.head_ref, "feature/thing");
         assert_eq!(pr.state, "OPEN");
         assert_eq!(pr.slug(), "o/r");
         assert_eq!(pr.label(), "PR #7");
+
+        // An absent baseRefOid reads as `None`, not `Some("")`.
+        let no_oid: ResolvedPr = serde_json::from_str(r#"{ "number": 1 }"#).unwrap();
+        assert_eq!(no_oid.base_ref_oid(), None);
     }
 }

@@ -129,7 +129,7 @@ fn open_pr_diff_comes_from_one_combined_fetch() {
 
     // A consumer that has neither endpoint locally loads the PR diff.
     let consumer = init_consumer("open", &remote);
-    let diff = PrSource::new(&consumer, "main", 1, None)
+    let diff = PrSource::new(&consumer, "main", 1, None, Some(branch_point.clone()))
         .load()
         .expect("PR diff loads from origin");
 
@@ -187,9 +187,15 @@ fn merged_pr_diff_compares_against_the_merge_parent() {
     // The merged PR carries its merge commit SHA; the base becomes its first
     // parent (a tip-to-tip diff would be empty — the head is already merged).
     let consumer = init_consumer("merged", &remote);
-    let diff = PrSource::new(&consumer, "main", 1, Some(merge_sha))
-        .load()
-        .expect("merged PR diff loads from origin");
+    let diff = PrSource::new(
+        &consumer,
+        "main",
+        1,
+        Some(merge_sha),
+        Some(branch_point.clone()),
+    )
+    .load()
+    .expect("merged PR diff loads from origin");
 
     assert_eq!(
         paths(&diff),
@@ -203,6 +209,95 @@ fn merged_pr_diff_compares_against_the_merge_parent() {
     // Sanity: the first parent really did move past the branch point, so the
     // merge-parent base is doing work a tip comparison could not.
     assert_ne!(merge_first_parent, branch_point);
+
+    let _ = std::fs::remove_dir_all(&remote);
+    let _ = std::fs::remove_dir_all(&seed);
+    let _ = std::fs::remove_dir_all(&consumer);
+}
+
+#[test]
+fn a_deleted_base_branch_falls_back_to_the_base_oid() {
+    let remote = init_bare_remote("deleted-base");
+    let seed = init_seed("deleted-base", &remote);
+    let branch_point = git_out(&seed, &["rev-parse", "HEAD"]);
+
+    // The PR head.
+    git(&seed, &["checkout", "--quiet", "-b", "feature"]);
+    std::fs::write(seed.join("feature.txt"), "hello\n").expect("write feature");
+    git(&seed, &["add", "feature.txt"]);
+    git(&seed, &["commit", "--quiet", "-m", "add feature"]);
+    let head_sha = git_out(&seed, &["rev-parse", "HEAD"]);
+
+    // The base advances (so its recorded tip is past the branch point), then both
+    // endpoints are published — the head under refs/pull/1/head.
+    git(&seed, &["checkout", "--quiet", "main"]);
+    std::fs::write(seed.join("file.txt"), "one\nTWO\nthree\n").expect("edit base file");
+    git(&seed, &["add", "file.txt"]);
+    git(&seed, &["commit", "--quiet", "-m", "base moves on"]);
+    let base_oid = git_out(&seed, &["rev-parse", "HEAD"]);
+    git(&seed, &["push", "--quiet", "origin", "main"]);
+    git(
+        &seed,
+        &["push", "--quiet", "origin", "feature:refs/pull/1/head"],
+    );
+
+    // The base branch is then deleted on the "remote" — as a closed/merged PR's
+    // branch commonly is. Fetching it by name now fails; only the recorded
+    // baseRefOid (still served by SHA while reachable) can anchor the base.
+    git(&remote, &["update-ref", "-d", "refs/heads/main"]);
+    assert!(
+        git_out(&seed, &["ls-remote", "origin", "main"]).is_empty(),
+        "the base branch is gone from origin"
+    );
+
+    let consumer = init_consumer("deleted-base", &remote);
+    let diff = PrSource::new(&consumer, "main", 1, None, Some(base_oid.clone()))
+        .load()
+        .expect("a deleted base branch still loads via the base OID");
+
+    assert_eq!(
+        paths(&diff),
+        ["feature.txt"],
+        "the diff is built from the base OID, not lost to the deleted branch"
+    );
+    assert_eq!(diff.files[0].status, ChangeStatus::Added);
+    // Three-dot base is still the merge base (branch point); the deleted branch's
+    // own later change does not leak in.
+    assert_eq!(diff.provenance.base.as_deref(), Some(branch_point.as_str()));
+    assert_eq!(diff.provenance.head.as_deref(), Some(head_sha.as_str()));
+
+    let _ = std::fs::remove_dir_all(&remote);
+    let _ = std::fs::remove_dir_all(&seed);
+    let _ = std::fs::remove_dir_all(&consumer);
+}
+
+#[test]
+fn a_deleted_base_with_no_recorded_oid_reports_an_error() {
+    // Without a baseRefOid to fall back to, a deleted base branch cannot produce
+    // a diff — the source errors (the CLI turns this into its no-diff reader).
+    let remote = init_bare_remote("no-oid");
+    let seed = init_seed("no-oid", &remote);
+
+    git(&seed, &["checkout", "--quiet", "-b", "feature"]);
+    std::fs::write(seed.join("feature.txt"), "hello\n").expect("write feature");
+    git(&seed, &["add", "feature.txt"]);
+    git(&seed, &["commit", "--quiet", "-m", "add feature"]);
+    git(&seed, &["push", "--quiet", "origin", "main"]);
+    git(
+        &seed,
+        &["push", "--quiet", "origin", "feature:refs/pull/1/head"],
+    );
+    git(&remote, &["update-ref", "-d", "refs/heads/main"]);
+
+    let consumer = init_consumer("no-oid", &remote);
+    let err = PrSource::new(&consumer, "main", 1, None, None)
+        .load()
+        .expect_err("no base branch and no OID cannot build a diff");
+    // The head still fetched (pull/1/head survives) — the failure is about the base.
+    assert!(
+        err.to_string().contains("base branch"),
+        "the error is about the missing base, not a raw ref failure: {err}"
+    );
 
     let _ = std::fs::remove_dir_all(&remote);
     let _ = std::fs::remove_dir_all(&seed);

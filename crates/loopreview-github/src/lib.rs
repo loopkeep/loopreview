@@ -241,6 +241,7 @@ impl GithubClient {
             pr.base_ref.clone(),
             pr.number,
             merged_base,
+            pr.base_ref_oid().map(str::to_string),
         )
     }
 
@@ -751,7 +752,7 @@ impl GithubClient {
 
 /// The `--json` field set requested from `gh pr view`.
 fn pr_view_fields() -> String {
-    "number,title,baseRefName,headRefName,state,isDraft,mergedAt,mergeCommit,createdAt,author,body,url"
+    "number,title,baseRefName,baseRefOid,headRefName,state,isDraft,mergedAt,mergeCommit,createdAt,author,body,url"
         .to_string()
 }
 
@@ -916,7 +917,7 @@ mod tests {
     fn pr_view_fields_are_stable() {
         assert_eq!(
             pr_view_fields(),
-            "number,title,baseRefName,headRefName,state,isDraft,mergedAt,mergeCommit,createdAt,author,body,url"
+            "number,title,baseRefName,baseRefOid,headRefName,state,isDraft,mergedAt,mergeCommit,createdAt,author,body,url"
         );
     }
 }

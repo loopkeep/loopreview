@@ -35,6 +35,10 @@ pub enum Opened {
         label: String,
         diff: Diff,
         threads: Vec<Thread>,
+        /// True when the diff could not be built (typically a deleted base branch
+        /// on a closed/merged PR): the comments loaded but there is no diff, so the
+        /// UI opens in its no-diff reader (Overview | Conversation).
+        diff_unavailable: bool,
     },
     Issue {
         handle: IssueHandle,
@@ -74,13 +78,23 @@ pub fn fetch_subject(
                 let viewer = scope.spawn(|| client.viewer_login().ok());
                 (joined(diff), joined(threads), viewer.join().unwrap_or(None))
             });
-            let diff = diff?;
+            // The comment pull is the reachability signal: its failure means GitHub
+            // is unreachable (or the PR is gone) — surface that as the error. If the
+            // comments loaded but the diff did not, only the diff failed — almost
+            // always a deleted base branch on a closed/merged PR — so degrade to the
+            // no-diff reader rather than failing the whole open (the user can still
+            // read and tidy the conversation, which is usually why they opened it).
             let threads = threads?;
+            let (diff, diff_unavailable) = match diff {
+                Ok(diff) => (diff, false),
+                Err(_) => (Diff::default(), true),
+            };
             Ok(Opened::Pr {
                 handle: PrHandle { client, pr, viewer },
                 label,
                 diff,
                 threads,
+                diff_unavailable,
             })
         }
         Subject::Issue(issue) => {
@@ -352,6 +366,7 @@ impl PrHandle {
                 number,
                 title: title.into(),
                 base_ref: "main".into(),
+                base_ref_oid: String::new(),
                 head_ref: "feature".into(),
                 state: "OPEN".into(),
                 is_draft: false,

@@ -197,6 +197,9 @@ pub struct Loaded {
     /// Stale draft ghosts dropped while merging saved drafts (pre-F2 store
     /// contamination); surfaced in the status when non-zero.
     pub stale_cleaned: usize,
+    /// True when a pull request's diff could not be built (its base branch was
+    /// deleted on GitHub): the session opens in the no-diff reader with a notice.
+    pub diff_unavailable: bool,
 }
 
 /// A background load job: reports progress via the callback, then yields the
@@ -894,6 +897,10 @@ struct App {
     tick: usize,
     /// A transient status message (feedback or error).
     status: Option<String>,
+    /// True when a pull request opened without its diff (its base branch was
+    /// deleted on GitHub): the Files tab is dropped and the session reads like an
+    /// issue (Overview | Conversation).
+    diff_unavailable: bool,
     quit: bool,
 }
 
@@ -1032,6 +1039,7 @@ impl App {
             events: Arc::new(EventLog::new()),
             tick: 0,
             status: None,
+            diff_unavailable: false,
             reloaded_at: None,
             quit: false,
         }
@@ -1090,6 +1098,19 @@ impl App {
                 "cleaned {} stale draft(s) from an old build",
                 loaded.stale_cleaned
             ));
+        }
+        // A PR whose diff could not be built (its base branch was deleted on
+        // GitHub) opens without a Files tab; say so, and let the notice win over a
+        // stale-draft note — it explains the missing diff the user is looking at.
+        self.diff_unavailable = loaded.diff_unavailable;
+        if loaded.diff_unavailable {
+            self.status = Some(format!(
+                "{}'s base branch was deleted on GitHub — showing without the diff",
+                self.label
+            ));
+            if self.view == View::Files {
+                self.view = View::Overview;
+            }
         }
         // A large pull request opens collapsed (fast); this relays out again.
         self.maybe_auto_collapse();
@@ -1904,11 +1925,12 @@ impl App {
     }
 
     /// Whether `view` is reachable right now: the Overview on a PR or an issue;
-    /// Files on anything with a diff (an issue has none, so it drops the tab).
+    /// Files on anything with a diff — an issue has none, and a PR whose base
+    /// branch was deleted (`diff_unavailable`) has none either, so both drop it.
     fn view_available(&self, view: View) -> bool {
         match view {
             View::Overview => self.has_subject(),
-            View::Files => !self.is_issue(),
+            View::Files => !self.is_issue() && !self.diff_unavailable,
             View::Conversation => true,
         }
     }
@@ -9792,6 +9814,7 @@ mod tests {
             issue: Some(crate::prsync::IssueHandle::for_test(5, "t")),
             pr_key: Some("owner/repo#5".into()),
             stale_cleaned: 0,
+            diff_unavailable: false,
         });
         assert_eq!(app.view, View::Overview, "an issue opens on its Overview");
         assert!(app.is_issue());
@@ -9812,12 +9835,54 @@ mod tests {
             issue: None,
             pr_key: Some("owner/repo#1".into()),
             stale_cleaned: 0,
+            diff_unavailable: false,
         });
         assert_eq!(
             app.view,
             View::Overview,
             "a pull request opens on its Overview"
         );
+    }
+
+    #[test]
+    fn a_diff_unavailable_pr_opens_as_a_no_diff_reader() {
+        // A PR whose base branch was deleted loads with no diff: it opens on the
+        // Overview, drops the Files tab, and explains why — but keeps the
+        // Conversation (its comments are what the user came to read/tidy).
+        let mut app = sample_app();
+        app.view = View::Files;
+        app.install_loaded(Loaded {
+            label: "PR #1".into(),
+            diff: Diff::default(),
+            review: Review::default(),
+            pr: Some(crate::prsync::PrHandle::for_test(1, "t")),
+            issue: None,
+            pr_key: Some("owner/repo#1".into()),
+            stale_cleaned: 0,
+            diff_unavailable: true,
+        });
+        assert_eq!(
+            app.view,
+            View::Overview,
+            "it opens on the Overview, not Files"
+        );
+        assert!(
+            !app.view_available(View::Files),
+            "the Files tab is dropped when there is no diff"
+        );
+        assert_eq!(
+            app.visible_views(),
+            vec![View::Overview, View::Conversation],
+            "no-diff PR reads like an issue: Overview | Conversation"
+        );
+        let status = app.status.as_deref().unwrap_or("");
+        assert_eq!(
+            status, "PR #1's base branch was deleted on GitHub — showing without the diff",
+            "the notice explains the missing diff, got {status:?}"
+        );
+        // It is still a PR (not an issue), so PR-only sync stays available.
+        assert!(!app.is_issue());
+        assert!(app.pr.is_some());
     }
 
     #[test]

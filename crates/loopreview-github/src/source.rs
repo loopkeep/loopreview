@@ -44,6 +44,10 @@ pub struct PrSource {
     number: u64,
     /// The merge commit SHA when the PR is merged, else `None`.
     merged_base: Option<String>,
+    /// The base ref's commit SHA, used as the base endpoint when the base
+    /// *branch* has been deleted and can no longer be fetched by name. `None`
+    /// when unknown.
+    base_ref_oid: Option<String>,
 }
 
 impl PrSource {
@@ -51,17 +55,21 @@ impl PrSource {
     /// `dir`, comparing against `base_ref` (the PR's target branch, e.g.
     /// `main`). `merged_base` is the merge commit SHA for a merged PR (its first
     /// parent becomes the base), or `None` for an open/closed-unmerged PR.
+    /// `base_ref_oid` is the base ref's commit SHA — the fallback base when the
+    /// base branch has been deleted (a closed/merged PR whose branch is gone).
     pub fn new(
         dir: impl Into<PathBuf>,
         base_ref: impl Into<String>,
         number: u64,
         merged_base: Option<String>,
+        base_ref_oid: Option<String>,
     ) -> PrSource {
         PrSource {
             dir: dir.into(),
             base_ref: base_ref.into(),
             number,
             merged_base,
+            base_ref_oid,
         }
     }
 
@@ -98,19 +106,64 @@ impl PrSource {
     /// Fetch the PR head and the base branch tip together and read both SHAs from
     /// the combined `FETCH_HEAD`. Used directly for an open/unmerged PR, and as
     /// the merged path's fallback when the merge commit is unfetchable.
+    ///
+    /// When the base branch is gone (deleted on a closed/merged PR), the combined
+    /// fetch fails as a unit — so its failure falls through to the recorded
+    /// `baseRefOid`, which GitHub still serves while the commit stays reachable.
     fn fetch_head_and_base_tip(&self, head_refspec: &str) -> Result<(String, String), DiffError> {
-        git::fetch_many(&self.dir, &[head_refspec, self.base_ref.as_str()])
-            .map_err(to_diff_error)?;
-        let fetch_head = git::read_fetch_head(&self.dir).map_err(to_diff_error)?;
-        base_and_head_shas(&fetch_head, self.number).ok_or_else(|| DiffError::Command {
-            program: "git".to_string(),
-            code: -1,
-            stderr: format!(
-                "could not read the fetched SHAs for {head_refspec} and {} from FETCH_HEAD",
-                self.base_ref
-            ),
-        })
+        // Fast path: base branch present — one fetch brings the head and the tip.
+        if git::fetch_many(&self.dir, &[head_refspec, self.base_ref.as_str()]).is_ok()
+            && let Ok(fetch_head) = git::read_fetch_head(&self.dir)
+            && let Some(pair) = base_and_head_shas(&fetch_head, self.number)
+        {
+            return Ok(pair);
+        }
+        self.fetch_head_with_base_oid(head_refspec)
     }
+
+    /// Fetch the PR head alone and use the recorded `baseRefOid` as the base — the
+    /// path for a PR whose base branch was deleted. GitHub keeps `pull/N/head`
+    /// after a PR closes, so the head still fetches; the base SHA must then
+    /// resolve locally (already in the head's history, or fetchable by SHA while
+    /// still reachable on GitHub). If it cannot, the diff genuinely can't be built
+    /// and the error drives the caller's no-diff fallback.
+    fn fetch_head_with_base_oid(&self, head_refspec: &str) -> Result<(String, String), DiffError> {
+        git::fetch_many(&self.dir, &[head_refspec]).map_err(to_diff_error)?;
+        let fetch_head = git::read_fetch_head(&self.dir).map_err(to_diff_error)?;
+        let head_sha = head_sha_from_fetch_head(&fetch_head, self.number).ok_or_else(|| {
+            DiffError::Command {
+                program: "git".to_string(),
+                code: -1,
+                stderr: format!(
+                    "could not read the fetched SHA for {head_refspec} from FETCH_HEAD"
+                ),
+            }
+        })?;
+        let base_oid =
+            base_oid_fallback(self.base_ref_oid.as_deref()).ok_or_else(|| DiffError::Command {
+                program: "git".to_string(),
+                code: -1,
+                stderr: format!(
+                    "the base branch {} is unavailable and no base commit is recorded",
+                    self.base_ref
+                ),
+            })?;
+        // Best-effort: pull the base commit down if it is not already local (it is
+        // often the head's ancestor and needs no fetch; otherwise GitHub serves it
+        // by SHA while reachable). Peeling to `^{commit}` then requires it to be
+        // present — a bare 40-hex resolves without the object, `^{commit}` does not.
+        let _ = git::fetch_many(&self.dir, &[base_oid]);
+        let base_sha =
+            git::rev_parse(&self.dir, &format!("{base_oid}^{{commit}}")).map_err(to_diff_error)?;
+        Ok((base_sha, head_sha))
+    }
+}
+
+/// The base commit to fall back to when the base branch is gone. An empty
+/// `baseRefOid` (unknown) is treated as no fallback, so the caller degrades to
+/// the no-diff reader rather than fetching a bogus endpoint.
+fn base_oid_fallback(base_ref_oid: Option<&str>) -> Option<&str> {
+    base_ref_oid.filter(|oid| !oid.is_empty())
 }
 
 /// Parse one `FETCH_HEAD` line — `<sha>\t<merge-flag>\t<description>` — into its
@@ -206,8 +259,19 @@ mod tests {
 
     #[test]
     fn describe_names_the_pr() {
-        let source = PrSource::new("/tmp/repo", "main", 42, None);
+        let source = PrSource::new("/tmp/repo", "main", 42, None, None);
         assert_eq!(source.describe(), "PR #42");
+    }
+
+    #[test]
+    fn base_oid_fallback_treats_an_empty_oid_as_absent() {
+        assert_eq!(base_oid_fallback(Some("abc123")), Some("abc123"));
+        assert_eq!(
+            base_oid_fallback(Some("")),
+            None,
+            "an empty oid is no fallback"
+        );
+        assert_eq!(base_oid_fallback(None), None);
     }
 
     /// A realistic two-line FETCH_HEAD for `git fetch origin main pull/7/head`.
