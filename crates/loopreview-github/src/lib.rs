@@ -37,8 +37,8 @@ use loopreview_core::{Comment, CommentKind, Thread};
 pub use error::GithubError;
 pub use issue::{ResolvedIssue, Subject};
 pub use pr::{
-    IssueStatus, PrAuthor, PrQuery, PrRef, PrStatus, ResolvedPr, SubjectKind, parse_pr_query,
-    subject_kind_from_issue_json,
+    IssueStatus, MergeCommit, PrAuthor, PrQuery, PrRef, PrStatus, ResolvedPr, SubjectKind,
+    parse_pr_query, subject_kind_from_issue_json,
 };
 pub use push::{CommentEndpoint, ReviewCommentInput, ReviewEvent};
 pub use source::PrSource;
@@ -229,9 +229,19 @@ impl GithubClient {
             })
     }
 
-    /// A [`PrSource`] for this pull request's diff.
+    /// A [`PrSource`] for this pull request's diff. A merged PR carries its merge
+    /// commit SHA so the diff compares against the base as it was at merge.
     pub fn pr_source(&self, pr: &ResolvedPr) -> PrSource {
-        PrSource::new(self.dir.clone(), pr.base_ref.clone(), pr.number)
+        let merged_base = (pr.status() == PrStatus::Merged)
+            .then(|| pr.merge_commit_sha())
+            .flatten()
+            .map(str::to_string);
+        PrSource::new(
+            self.dir.clone(),
+            pr.base_ref.clone(),
+            pr.number,
+            merged_base,
+        )
     }
 
     /// Re-fetch `pr`'s metadata (state / draft / merged, title, author, body,
@@ -741,7 +751,7 @@ impl GithubClient {
 
 /// The `--json` field set requested from `gh pr view`.
 fn pr_view_fields() -> String {
-    "number,title,baseRefName,headRefName,state,isDraft,mergedAt,createdAt,author,body,url"
+    "number,title,baseRefName,headRefName,state,isDraft,mergedAt,mergeCommit,createdAt,author,body,url"
         .to_string()
 }
 
@@ -906,7 +916,7 @@ mod tests {
     fn pr_view_fields_are_stable() {
         assert_eq!(
             pr_view_fields(),
-            "number,title,baseRefName,headRefName,state,isDraft,mergedAt,createdAt,author,body,url"
+            "number,title,baseRefName,headRefName,state,isDraft,mergedAt,mergeCommit,createdAt,author,body,url"
         );
     }
 }

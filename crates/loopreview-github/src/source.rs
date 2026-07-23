@@ -13,41 +13,77 @@ use loopreview_core::{Diff, DiffError, DiffSource, RefSource};
 
 use crate::git;
 
+/// How a PR's base endpoint is chosen.
+#[derive(Debug, PartialEq, Eq)]
+enum BasePlan {
+    /// A merged PR: compare against the merge commit's first parent (the base as
+    /// it was at merge). The head is an ancestor of the *current* base tip, so a
+    /// tip comparison would be empty.
+    MergeParent(String),
+    /// An open or closed-unmerged PR: compare against the current base tip.
+    BaseTip,
+}
+
+/// Decide the base endpoint plan from the merge commit SHA (present only for a
+/// merged PR). Pure, so the choice is testable without git.
+fn base_plan(merged_base: Option<&str>) -> BasePlan {
+    match merged_base {
+        Some(sha) if !sha.is_empty() => BasePlan::MergeParent(sha.to_string()),
+        _ => BasePlan::BaseTip,
+    }
+}
+
 /// A diff source for a pull request, comparing `origin/<base_ref>` against the
 /// fetched PR head.
 pub struct PrSource {
     dir: PathBuf,
     base_ref: String,
     number: u64,
+    /// The merge commit SHA when the PR is merged, else `None`.
+    merged_base: Option<String>,
 }
 
 impl PrSource {
     /// Create a PR diff source for pull request `number` in the repository at
     /// `dir`, comparing against `base_ref` (the PR's target branch, e.g.
-    /// `main`).
-    pub fn new(dir: impl Into<PathBuf>, base_ref: impl Into<String>, number: u64) -> PrSource {
+    /// `main`). `merged_base` is the merge commit SHA for a merged PR (its first
+    /// parent becomes the base), or `None` for an open/closed-unmerged PR.
+    pub fn new(
+        dir: impl Into<PathBuf>,
+        base_ref: impl Into<String>,
+        number: u64,
+        merged_base: Option<String>,
+    ) -> PrSource {
         PrSource {
             dir: dir.into(),
             base_ref: base_ref.into(),
             number,
+            merged_base,
         }
     }
 
-    /// Fetch the base and head and resolve both to commit SHAs.
-    ///
-    /// The base is fetched first so `FETCH_HEAD` can be read as its tip; then the
-    /// PR head is fetched and its `FETCH_HEAD` captured. Reading each SHA right
-    /// after its fetch keeps the two independent of `FETCH_HEAD` being
-    /// overwritten.
+    /// Fetch the head and base and resolve both to commit SHAs. The head is the
+    /// PR's head commit (it survives the merge); the base follows [`base_plan`].
     fn fetch_endpoints(&self) -> Result<(String, String), DiffError> {
-        git::fetch(&self.dir, &self.base_ref).map_err(to_diff_error)?;
-        let base_sha = git::rev_parse(&self.dir, "FETCH_HEAD").map_err(to_diff_error)?;
-
         let head_refspec = format!("pull/{}/head", self.number);
         git::fetch(&self.dir, &head_refspec).map_err(to_diff_error)?;
         let head_sha = git::rev_parse(&self.dir, "FETCH_HEAD").map_err(to_diff_error)?;
-
+        let base_sha = self.base_endpoint()?;
         Ok((base_sha, head_sha))
+    }
+
+    /// Resolve the base endpoint. For a merged PR, fetch the merge commit and take
+    /// its first parent; if that SHA is missing or unfetchable, fall back to the
+    /// base-branch tip (rather than silently emitting an empty diff).
+    fn base_endpoint(&self) -> Result<String, DiffError> {
+        if let BasePlan::MergeParent(sha) = base_plan(self.merged_base.as_deref())
+            && git::fetch(&self.dir, &sha).is_ok()
+            && let Ok(parent) = git::rev_parse(&self.dir, &format!("{sha}^1"))
+        {
+            return Ok(parent);
+        }
+        git::fetch(&self.dir, &self.base_ref).map_err(to_diff_error)?;
+        git::rev_parse(&self.dir, "FETCH_HEAD").map_err(to_diff_error)
     }
 }
 
@@ -89,7 +125,20 @@ mod tests {
 
     #[test]
     fn describe_names_the_pr() {
-        let source = PrSource::new("/tmp/repo", "main", 42);
+        let source = PrSource::new("/tmp/repo", "main", 42, None);
         assert_eq!(source.describe(), "PR #42");
+    }
+
+    #[test]
+    fn base_plan_uses_the_merge_parent_only_when_merged() {
+        // A merged PR compares against the merge commit's first parent…
+        assert_eq!(
+            base_plan(Some("abc123")),
+            BasePlan::MergeParent("abc123".to_string())
+        );
+        // …an open/closed-unmerged PR (no merge SHA) uses the base tip…
+        assert_eq!(base_plan(None), BasePlan::BaseTip);
+        // …and an empty SHA falls back to the tip rather than a bad `^1`.
+        assert_eq!(base_plan(Some("")), BasePlan::BaseTip);
     }
 }

@@ -77,6 +77,10 @@ pub struct ResolvedPr {
     /// The merge timestamp (`mergedAt`), present only once the PR is merged.
     #[serde(default, rename = "mergedAt")]
     pub merged_at: Option<String>,
+    /// The merge commit (`mergeCommit`), present only once the PR is merged — its
+    /// first parent is the base the diff should compare against.
+    #[serde(default, rename = "mergeCommit")]
+    pub merge_commit: Option<MergeCommit>,
     /// The creation timestamp (`createdAt`).
     #[serde(default, rename = "createdAt")]
     pub created_at: Option<String>,
@@ -100,10 +104,27 @@ pub struct PrAuthor {
     pub login: String,
 }
 
+/// The `mergeCommit` object `gh pr view` returns — only its `oid` is used.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+pub struct MergeCommit {
+    /// The merge commit SHA.
+    #[serde(default)]
+    pub oid: String,
+}
+
 impl ResolvedPr {
     /// The `owner/repo` slug for this pull request.
     pub fn slug(&self) -> String {
         format!("{}/{}", self.owner, self.repo)
+    }
+
+    /// The merge commit SHA, once the PR is merged (its first parent is the diff
+    /// base). `None` for an open or closed-unmerged PR.
+    pub fn merge_commit_sha(&self) -> Option<&str> {
+        self.merge_commit
+            .as_ref()
+            .map(|m| m.oid.as_str())
+            .filter(|oid| !oid.is_empty())
     }
 
     /// A short label such as `PR #42` for UI headers.
@@ -415,6 +436,7 @@ mod tests {
             state: "OPEN".into(),
             is_draft: true,
             merged_at: None,
+            merge_commit: None,
             created_at: None,
             author: None,
             body: String::new(),

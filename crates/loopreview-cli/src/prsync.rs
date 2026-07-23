@@ -329,6 +329,7 @@ impl PrHandle {
                 state: "OPEN".into(),
                 is_draft: false,
                 merged_at: None,
+                merge_commit: None,
                 created_at: None,
                 author: None,
                 body: String::new(),
