@@ -66,7 +66,11 @@ lr session comment list [<id>|--repo .] [--json]
 - An **issue** session has no diff: `review --json` returns an empty `files` list
   (its content is the conversation and the `subject` body), and `navigate --file`
   has nothing to point at. Read the `subject` and the threads; comment with
-  `comment add --conversation` (a line comment has no meaning without files).
+  `comment add --conversation` (a line comment has no meaning without files). A
+  **pull request whose base branch was deleted** on GitHub degrades to this same
+  no-diff state — empty `files`, conversation only — even though `subject.kind`
+  is `pr`; treat it the same (read the `subject` and threads, comment on the
+  conversation).
 - `context` reports the human's current view (`overview`/`files`/`conversation`;
   an issue has no `files`), the line under their cursor, the thread there (if any),
   and `event_seq` — the latest

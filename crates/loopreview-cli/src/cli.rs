@@ -269,8 +269,9 @@ pub enum CommentAction {
         /// or role name); omitted, it defaults to `agent`.
         #[arg(long)]
         author: Option<String>,
-        /// Queue as a draft to submit (pull requests only). Without it an agent
-        /// comment is a local note that is never sent to GitHub.
+        /// Queue as a draft to submit (on a pull request, or an issue's
+        /// conversation with --conversation). Without it an agent comment is a
+        /// local note that is never sent to GitHub.
         #[arg(long)]
         draft: bool,
         /// Emit JSON.

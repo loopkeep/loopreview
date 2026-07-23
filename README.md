@@ -141,16 +141,18 @@ action (an inapplicable one reports why), `Esc` to close.
 **Overview view** (pull requests and issues)
 
 The leftmost tab: the subject's facts and rendered description, read-only. It has
-no sidebar. Keys scroll it; the mouse is interactive — click a link or an
-`[Image]` placeholder to open it on github.com, and click a `<details>` summary
-(`▸` / `▾`) to fold or unfold that section (folds are per-session).
+no sidebar. Keys scroll it; the mouse is interactive — click a link, an `[Image]`
+placeholder, or a `#N` reference to open it on github.com, and click a
+`<details>` summary (`▸` / `▾`) to fold or unfold that section (folds are
+per-session).
 
 | Key | Action |
 | --- | --- |
 | `j` / `k` (or `↓` / `↑`) | Scroll a line |
-| `Ctrl-D` / `Ctrl-U` (or `Space` / `PageUp`) | Scroll a half / full page |
+| `Ctrl-D` / `Ctrl-U` | Half-page down / up |
+| `Space` / `PageDown`, `PageUp` | Page down / up |
 | `g` / `G` (or `Home` / `End`) | Top / bottom |
-| Click | Open a link/image, or fold/unfold a `<details>` |
+| Click | Open a link/image/`#N` reference, or fold/unfold a `<details>` |
 
 **Files (diff) view**
 
@@ -177,7 +179,7 @@ no sidebar. Keys scroll it; the mouse is interactive — click a link or an
 | `t` | Toggle the thread's root between a draft and a local note (pull requests) |
 | `o` | Fold: expand the current file if collapsed, else fold the thread at the cursor, else collapse the current file |
 | Wheel | Scroll the diff (or the sidebar, when the pointer is over it) |
-| Click | In the diff: moves the cursor and focuses the diff; a file header folds/unfolds that file, and a comment thread's header folds/unfolds that thread. A sidebar row jumps to that file (expanding it if collapsed, focus following to the diff — never folding). A tab switches views; the footer's layout indicator (`[unified]`/`[split]`) toggles the layout; the header's `#N` opens the pull request on github.com |
+| Click | In the diff: moves the cursor and focuses the diff; a file header folds/unfolds that file, and a comment thread's header folds/unfolds that thread. A sidebar row jumps to that file (expanding it if collapsed, focus following to the diff — never folding). A tab switches views; the footer's layout indicator (`[unified]`/`[split]`) toggles the layout; the header's `#N` opens the pull request (or issue) on github.com |
 | Drag | Select a line range (then `c` to comment) |
 
 **Sidebar** (focused after `b`)

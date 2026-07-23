@@ -2112,7 +2112,9 @@ impl App {
     }
 
     /// Route an action in the Overview tab — a read-only scroll pane, so only the
-    /// movement keys do anything (comment actions are absent by design).
+    /// movement keys do anything (comment actions are absent by design). Page keys
+    /// match the Files view: `Ctrl-D`/`Ctrl-U` scroll half a page, `PageDown` (and
+    /// `Space`)/`PageUp` scroll a full page.
     fn overview_action(&mut self, action: Action) {
         let page = self.body_height.get().max(1);
         let max = self.overview_max_scroll();
@@ -2121,12 +2123,14 @@ impl App {
             Action::MoveUp => self.overview_scroll = self.overview_scroll.saturating_sub(1),
             Action::Top => self.overview_scroll = 0,
             Action::Bottom => self.overview_scroll = max,
-            Action::HalfPageDown | Action::PageDown => {
+            Action::HalfPageDown => {
                 self.overview_scroll = (self.overview_scroll + page / 2).min(max)
             }
-            Action::HalfPageUp | Action::PageUp => {
+            Action::HalfPageUp => {
                 self.overview_scroll = self.overview_scroll.saturating_sub(page / 2)
             }
+            Action::PageDown => self.overview_scroll = (self.overview_scroll + (page - 1)).min(max),
+            Action::PageUp => self.overview_scroll = self.overview_scroll.saturating_sub(page - 1),
             _ => {}
         }
     }
@@ -13116,6 +13120,19 @@ mod tests {
         assert_eq!(app.overview_scroll, 0, "g returns to the top");
         app.on_key(KeyCode::Char('G'), KeyModifiers::NONE);
         assert_eq!(app.overview_scroll, bottom, "G stops at the last line");
+
+        // Page keys mirror the Files view: Ctrl-D/U half a page (height 5 → 2),
+        // PageDown/PageUp a full page (page - 1 → 4). They must differ.
+        app.overview_scroll = 0;
+        app.overview_action(Action::HalfPageDown);
+        assert_eq!(app.overview_scroll, 2, "Ctrl-D scrolls half a page");
+        app.overview_scroll = 0;
+        app.overview_action(Action::PageDown);
+        assert_eq!(app.overview_scroll, 4, "PageDown scrolls a full page");
+        app.overview_action(Action::HalfPageUp);
+        assert_eq!(app.overview_scroll, 2, "Ctrl-U scrolls half a page back");
+        app.overview_action(Action::PageUp);
+        assert_eq!(app.overview_scroll, 0, "PageUp scrolls a full page back");
     }
 
     #[test]
