@@ -35,7 +35,7 @@ use loopreview_core::{Comment, CommentKind, Thread};
 
 pub use error::GithubError;
 pub use pr::{PrQuery, PrRef, ResolvedPr, parse_pr_query};
-pub use push::{ReviewCommentInput, ReviewEvent};
+pub use push::{CommentEndpoint, ReviewCommentInput, ReviewEvent};
 pub use source::PrSource;
 
 /// The outcome of submitting a review: the drafts that were published, each with
@@ -457,22 +457,21 @@ impl GithubClient {
         Ok(out.trim().to_string())
     }
 
-    /// Edit a published comment's body. `comment_id` is the numeric REST id a
-    /// pulled comment carries in `remote_id`; `review` selects the inline
-    /// review-comment endpoint over the PR conversation (issue) one.
+    /// Edit a published comment's body. The [`CommentEndpoint`] carries the
+    /// numeric id and picks the right REST route — an inline review comment, a PR
+    /// conversation (issue) comment, or a submitted review's summary body.
     pub fn edit_comment(
         &self,
         pr: &ResolvedPr,
-        comment_id: u64,
-        review: bool,
+        endpoint: CommentEndpoint,
         body: &str,
     ) -> Result<(), GithubError> {
-        let path = push::comment_endpoint(&pr.owner, &pr.repo, comment_id, review);
+        let (method, path) = endpoint.edit_request(&pr.owner, &pr.repo, pr.number);
         let payload = serde_json::to_string(&push::BodyPayload { body })
             .map_err(|e| GithubError::parse("edit payload", e))?;
         cmd::run_ok(
             "gh",
-            &["api", "-X", "PATCH", &path, "--input", "-"],
+            &["api", "-X", method, &path, "--input", "-"],
             &self.dir,
             Some(&payload),
         )?;
@@ -480,14 +479,21 @@ impl GithubClient {
     }
 
     /// Delete a published comment. Irreversible on GitHub — the caller confirms
-    /// with the human first. `comment_id`/`review` are as in [`Self::edit_comment`].
+    /// with the human first. Refuses a review summary (GitHub has no delete for a
+    /// submitted review); the UI should not offer it in the first place.
     pub fn delete_comment(
         &self,
         pr: &ResolvedPr,
-        comment_id: u64,
-        review: bool,
+        endpoint: CommentEndpoint,
     ) -> Result<(), GithubError> {
-        let path = push::comment_endpoint(&pr.owner, &pr.repo, comment_id, review);
+        let path =
+            endpoint
+                .delete_path(&pr.owner, &pr.repo)
+                .ok_or_else(|| GithubError::Command {
+                    program: "gh".into(),
+                    code: 1,
+                    stderr: "a submitted review's summary cannot be deleted on GitHub".into(),
+                })?;
         cmd::run_ok("gh", &["api", "-X", "DELETE", &path], &self.dir, None)?;
         Ok(())
     }

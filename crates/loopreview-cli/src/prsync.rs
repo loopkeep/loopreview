@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use loopreview_core::{Anchor, Diff, DiffSource, Review, Thread};
-use loopreview_github::{GithubClient, PrQuery, ResolvedPr, ReviewEvent};
+use loopreview_github::{CommentEndpoint, GithubClient, PrQuery, ResolvedPr, ReviewEvent};
 
 /// Build a [`PrQuery`] from the CLI arguments, or an error message.
 pub fn query(text: Option<String>, detect: bool) -> Result<PrQuery, String> {
@@ -111,18 +111,18 @@ impl PrHandle {
         result.map_err(|e| e.to_string())
     }
 
-    /// Edit a published comment's body on GitHub. `review` selects the inline
-    /// review-comment endpoint over the PR conversation one.
-    pub fn edit_published(&self, remote_id: u64, review: bool, body: &str) -> Result<(), String> {
+    /// Edit a published comment's body on GitHub. The endpoint carries the id and
+    /// the route (inline review comment / issue comment / review summary).
+    pub fn edit_published(&self, endpoint: CommentEndpoint, body: &str) -> Result<(), String> {
         self.client
-            .edit_comment(&self.pr, remote_id, review, body)
+            .edit_comment(&self.pr, endpoint, body)
             .map_err(|e| e.to_string())
     }
 
     /// Delete a published comment on GitHub (irreversible — confirm first).
-    pub fn delete_published(&self, remote_id: u64, review: bool) -> Result<(), String> {
+    pub fn delete_published(&self, endpoint: CommentEndpoint) -> Result<(), String> {
         self.client
-            .delete_comment(&self.pr, remote_id, review)
+            .delete_comment(&self.pr, endpoint)
             .map_err(|e| e.to_string())
     }
 

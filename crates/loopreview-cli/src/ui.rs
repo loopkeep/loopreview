@@ -43,6 +43,8 @@ use loopreview_core::{
     ThreadState, word_diff,
 };
 
+use loopreview_github::CommentEndpoint;
+
 use crate::control::{self, UiRequest};
 use crate::highlight::{Highlighter, LineHighlighter, Span as HlSpan};
 use crate::keys::Action;
@@ -442,9 +444,9 @@ struct DeleteTarget {
     /// The comment id to remove, or `None` to remove the whole draft thread
     /// (a draft root takes its thread with it).
     comment_id: Option<String>,
-    /// For a published comment, its `(remote id, is-review-comment)` — the
-    /// removal goes to GitHub first. `None` for a purely-local removal.
-    published: Option<(u64, bool)>,
+    /// For a published comment, its GitHub endpoint — the removal goes to GitHub
+    /// first. `None` for a purely-local removal.
+    published: Option<CommentEndpoint>,
 }
 
 /// The review events offered in the submit modal.
@@ -1593,7 +1595,7 @@ impl App {
         match target.published {
             // A published comment always names a single comment; delete it on
             // GitHub, then remove it locally by id when the job succeeds.
-            Some((remote_id, review)) => {
+            Some(endpoint) => {
                 let (Some(comment_id), Some(pr)) = (target.comment_id, self.pr.clone()) else {
                     return;
                 };
@@ -1602,7 +1604,7 @@ impl App {
                     "Deleting on GitHub",
                     Box::new(move |progress| {
                         progress("deleting comment…");
-                        pr.delete_published(remote_id, review)
+                        pr.delete_published(endpoint)
                             .map_err(friendly_github_write_error)?;
                         Ok(JobOutcome::Deleted {
                             thread_id,
@@ -1669,12 +1671,16 @@ impl App {
             if !self.comment_is_mine(comment) {
                 return None;
             }
-            let (remote_id, review) = self.published_comment_ref(&thread_id, &comment_id)?;
+            let endpoint = self.published_endpoint(&thread_id, &comment_id)?;
+            // A submitted review's summary has no GitHub delete — don't offer it.
+            if !endpoint.is_deletable() {
+                return None;
+            }
             // A published delete removes just that one comment.
             Some(DeleteTarget {
                 thread_id,
                 comment_id: Some(comment_id),
-                published: Some((remote_id, review)),
+                published: Some(endpoint),
             })
         } else {
             Some(DeleteTarget {
@@ -1774,9 +1780,23 @@ impl App {
         let Some(comment) = self.review.threads[ti].comments.get(ci) else {
             return;
         };
-        if !self.comment_is_mine(comment) {
+        let published = comment.is_published();
+        let mine = self.comment_is_mine(comment);
+        let body = comment.body.clone();
+        let thread_id = self.review.threads[ti].id.clone();
+        let comment_id = comment.id.clone();
+
+        // A published comment's owner is the GitHub viewer login; on a PR where
+        // that is unknown (gh unreachable at load) say so rather than implying the
+        // comment isn't yours.
+        if published && self.pr.is_some() && self.pr.as_deref().and_then(|p| p.viewer()).is_none() {
+            self.status =
+                Some("can't confirm your GitHub identity — check `gh auth login`".to_string());
+            return;
+        }
+        if !mine {
             self.status = Some(
-                if comment.is_published() {
+                if published {
                     "you can only edit your own published comment"
                 } else {
                     "only your own comments can be edited"
@@ -1785,16 +1805,21 @@ impl App {
             );
             return;
         }
-        let compose = Compose {
-            area: TextArea::from_text(&comment.body),
+        // A published comment needs an addressable id on GitHub to edit (a pulled
+        // comment can report a null databaseId).
+        if published && self.published_endpoint(&thread_id, &comment_id).is_none() {
+            self.status = Some("this comment has no editable id on GitHub".to_string());
+            return;
+        }
+        self.input = Some(Compose {
+            area: TextArea::from_text(&body),
             kind: ComposeKind::Edit {
-                thread: self.review.threads[ti].id.clone(),
-                comment: comment.id.clone(),
+                thread: thread_id,
+                comment: comment_id,
             },
             target: "edit comment".to_string(),
             confirming_discard: false,
-        };
-        self.input = Some(compose);
+        });
     }
 
     /// Route a key while the comment composer is open.
@@ -2878,16 +2903,16 @@ impl App {
                 }
             }
             ComposeKind::Edit { thread, comment } => {
-                match self.published_comment_ref(&thread, &comment) {
+                match self.published_endpoint(&thread, &comment) {
                     // A published comment: save the edit back to GitHub, then
                     // apply it locally when the job reports success.
-                    Some((remote_id, review)) => match self.pr.clone() {
+                    Some(endpoint) => match self.pr.clone() {
                         Some(pr) => {
                             self.start_job(
                                 "Editing on GitHub",
                                 Box::new(move |progress| {
                                     progress("updating comment…");
-                                    pr.edit_published(remote_id, review, &body)
+                                    pr.edit_published(endpoint, &body)
                                         .map_err(friendly_github_write_error)?;
                                     Ok(JobOutcome::Edited {
                                         thread_id: thread,
@@ -2915,15 +2940,22 @@ impl App {
     }
 
     /// If `(thread_id, comment_id)` names a published comment with a numeric
-    /// remote id, returns `(remote id, is-review-comment)` — the inputs for a
-    /// GitHub edit or delete. A review comment is a line-anchored thread; a PR
-    /// conversation comment lives under a non-line anchor.
-    fn published_comment_ref(&self, thread_id: &str, comment_id: &str) -> Option<(u64, bool)> {
+    /// remote id, the GitHub endpoint to edit/delete it through. The three routes
+    /// are told apart by the pulled thread id: `review:` is a submitted review's
+    /// summary, `issuecomment:` a PR conversation comment, and anything else an
+    /// inline review comment (line- or file-anchored). Routing a review summary
+    /// through the issue-comment endpoint is a 404.
+    fn published_endpoint(&self, thread_id: &str, comment_id: &str) -> Option<CommentEndpoint> {
         let thread = self.review.thread(thread_id)?;
-        let review = matches!(thread.anchor, Anchor::Line { .. });
         let comment = thread.comments.iter().find(|c| c.id == comment_id)?;
         let remote_id = comment.remote_id.as_deref()?.parse::<u64>().ok()?;
-        Some((remote_id, review))
+        Some(if thread_id.starts_with("review:") {
+            CommentEndpoint::ReviewSummary(remote_id)
+        } else if thread_id.starts_with("issuecomment:") {
+            CommentEndpoint::IssueComment(remote_id)
+        } else {
+            CommentEndpoint::ReviewComment(remote_id)
+        })
     }
 
     /// Replace the body of an existing comment, re-checking it is still the
@@ -7488,6 +7520,72 @@ mod tests {
         );
     }
 
+    fn published_thread(id: &str, anchor: Anchor) -> Thread {
+        Thread {
+            id: id.into(),
+            anchor,
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: "5".into(),
+                author: "tester".into(),
+                body: "text".into(),
+                created_at: 0,
+                remote_id: Some("5".into()),
+                kind: loopreview_core::CommentKind::Published,
+            }],
+        }
+    }
+
+    #[test]
+    fn published_endpoint_routes_by_thread_id() {
+        // The pulled thread id tells the three published kinds apart: a review
+        // summary and an issue comment share Anchor::Review, so routing must use
+        // the id prefix (a review summary through issues/comments 404s).
+        let mut app = pr_app();
+        app.review.threads.push(published_thread(
+            "PRRT_node",
+            Anchor::line("a.rs", Side::New, 1),
+        ));
+        app.review
+            .threads
+            .push(published_thread("issuecomment:5", Anchor::Review));
+        app.review
+            .threads
+            .push(published_thread("review:5", Anchor::Review));
+        assert_eq!(
+            app.published_endpoint("PRRT_node", "5"),
+            Some(CommentEndpoint::ReviewComment(5))
+        );
+        assert_eq!(
+            app.published_endpoint("issuecomment:5", "5"),
+            Some(CommentEndpoint::IssueComment(5))
+        );
+        assert_eq!(
+            app.published_endpoint("review:5", "5"),
+            Some(CommentEndpoint::ReviewSummary(5))
+        );
+    }
+
+    #[test]
+    fn a_review_summary_is_editable_but_not_deletable() {
+        let mut app = pr_app(); // viewer "tester"
+        app.review
+            .threads
+            .push(published_thread("review:99", Anchor::Review));
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        // `e` opens the composer — a review summary edits via PUT /pulls/reviews.
+        app.on_key(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert!(app.input.is_some(), "a review summary is editable");
+        app.input = None;
+        // But GitHub has no delete for a submitted review — no delete offered.
+        assert!(
+            app.selected_delete_target().is_none(),
+            "a review summary can't be deleted"
+        );
+    }
+
     fn published_comment(id: &str, author: &str, remote: &str) -> Thread {
         Thread {
             id: "t".into(),
@@ -7526,7 +7624,7 @@ mod tests {
         // thread is a review comment.
         let target = app.selected_delete_target().expect("a deletable target");
         assert_eq!(target.comment_id.as_deref(), Some("c"));
-        assert_eq!(target.published, Some((555, true)));
+        assert_eq!(target.published, Some(CommentEndpoint::ReviewComment(555)));
     }
 
     #[test]

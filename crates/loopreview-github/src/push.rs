@@ -106,12 +106,61 @@ pub(crate) struct BodyPayload<'a> {
     pub body: &'a str,
 }
 
-/// The REST endpoint path for editing or deleting one published comment by its
-/// numeric id. An inline review comment and a PR conversation (issue) comment
-/// live under different collections, so `review` picks between them.
-pub(crate) fn comment_endpoint(owner: &str, repo: &str, id: u64, review: bool) -> String {
-    let kind = if review { "pulls" } else { "issues" };
-    format!("repos/{owner}/{repo}/{kind}/comments/{id}")
+/// Which GitHub object a published comment is, for edit/delete routing. The three
+/// live at different REST endpoints — a common bug is editing a review summary
+/// through the issue-comment path (a 404, since the ids are different spaces).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentEndpoint {
+    /// An inline review comment: `/pulls/comments/{id}`.
+    ReviewComment(u64),
+    /// A PR conversation (issue) comment: `/issues/comments/{id}`.
+    IssueComment(u64),
+    /// A submitted review's summary body: `/pulls/{n}/reviews/{id}`. Editable
+    /// (PUT), but GitHub has no delete for a submitted review.
+    ReviewSummary(u64),
+}
+
+impl CommentEndpoint {
+    /// The HTTP method and REST path to edit this comment's body.
+    pub(crate) fn edit_request(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> (&'static str, String) {
+        match self {
+            CommentEndpoint::ReviewComment(id) => {
+                ("PATCH", format!("repos/{owner}/{repo}/pulls/comments/{id}"))
+            }
+            CommentEndpoint::IssueComment(id) => (
+                "PATCH",
+                format!("repos/{owner}/{repo}/issues/comments/{id}"),
+            ),
+            CommentEndpoint::ReviewSummary(id) => (
+                "PUT",
+                format!("repos/{owner}/{repo}/pulls/{number}/reviews/{id}"),
+            ),
+        }
+    }
+
+    /// The REST path to delete this comment, or `None` when GitHub offers no
+    /// delete (a submitted review's summary — the UI must not offer it).
+    pub(crate) fn delete_path(&self, owner: &str, repo: &str) -> Option<String> {
+        match self {
+            CommentEndpoint::ReviewComment(id) => {
+                Some(format!("repos/{owner}/{repo}/pulls/comments/{id}"))
+            }
+            CommentEndpoint::IssueComment(id) => {
+                Some(format!("repos/{owner}/{repo}/issues/comments/{id}"))
+            }
+            CommentEndpoint::ReviewSummary(_) => None,
+        }
+    }
+
+    /// Whether this comment can be deleted on GitHub at all.
+    pub fn is_deletable(&self) -> bool {
+        !matches!(self, CommentEndpoint::ReviewSummary(_))
+    }
 }
 
 /// Decide which draft threads become inline review comments.
@@ -397,16 +446,35 @@ mod tests {
     }
 
     #[test]
-    fn comment_endpoint_picks_the_collection() {
-        // An inline review comment vs a PR conversation (issue) comment.
+    fn comment_endpoint_routes_edit_and_delete() {
+        use CommentEndpoint::*;
+        // Edit: an inline review comment and an issue comment PATCH their
+        // collections; a review summary PUTs the review (a different id space —
+        // routing it through issues/comments was the 404 bug).
         assert_eq!(
-            comment_endpoint("o", "r", 42, true),
-            "repos/o/r/pulls/comments/42"
+            ReviewComment(42).edit_request("o", "r", 7),
+            ("PATCH", "repos/o/r/pulls/comments/42".to_string())
         );
         assert_eq!(
-            comment_endpoint("o", "r", 42, false),
-            "repos/o/r/issues/comments/42"
+            IssueComment(42).edit_request("o", "r", 7),
+            ("PATCH", "repos/o/r/issues/comments/42".to_string())
         );
+        assert_eq!(
+            ReviewSummary(42).edit_request("o", "r", 7),
+            ("PUT", "repos/o/r/pulls/7/reviews/42".to_string())
+        );
+        // Delete: only the two comment kinds; a review summary has no delete.
+        assert_eq!(
+            ReviewComment(42).delete_path("o", "r"),
+            Some("repos/o/r/pulls/comments/42".to_string())
+        );
+        assert_eq!(
+            IssueComment(42).delete_path("o", "r"),
+            Some("repos/o/r/issues/comments/42".to_string())
+        );
+        assert_eq!(ReviewSummary(42).delete_path("o", "r"), None);
+        assert!(!ReviewSummary(42).is_deletable());
+        assert!(ReviewComment(42).is_deletable());
     }
 
     #[test]
