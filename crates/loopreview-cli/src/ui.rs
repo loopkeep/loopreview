@@ -3385,24 +3385,29 @@ impl App {
         None
     }
 
-    /// The thread whose inline comment header sits at Files body `row` (the first
-    /// line of its comment block), for a fold-toggle click.
+    /// The thread whose inline comment header (or the blank pad above it) sits at
+    /// Files body `row`, for a fold-toggle click. An expanded block starts with a
+    /// padding line, so its header is block-line 1; a collapsed block is just its
+    /// header at line 0. A click on either the header or that top pad folds.
     fn comment_header_at(&self, body_row: usize) -> Option<usize> {
         if body_row >= self.body_height.get() {
             return None;
         }
         let i = self.scroll + body_row;
-        if self.sbs() {
+        let (t, k) = if self.sbs() {
             match self.srows.get(i) {
-                Some(SRow::Comment(t, 0)) => Some(*t),
-                _ => None,
+                Some(SRow::Comment(t, k)) => (*t, *k),
+                _ => return None,
             }
         } else {
             match self.urows.get(i) {
-                Some(URow::Comment(t, 0)) => Some(*t),
-                _ => None,
+                Some(URow::Comment(t, k)) => (*t, *k),
+                _ => return None,
             }
-        }
+        };
+        let collapsed = self.collapsed.contains(&self.review.threads[t].id);
+        let header_k = if collapsed { 0 } else { 1 };
+        (k <= header_k).then_some(t)
     }
 
     fn conv_max_scroll(&self) -> usize {
@@ -6793,7 +6798,15 @@ fn build_comment_blocks(
                     Style::default().fg(Color::DarkGray),
                 ));
             }
-            let mut lines = vec![TextLine::from(header)];
+            // An expanded block gets a blank bar line above and below its content,
+            // so the comment reads as a roomy card rather than crowding the diff
+            // lines it sits between. A collapsed block stays a single header line.
+            let pad = || TextLine::from(vec![TextSpan::styled("  ▏ ", bar)]);
+            let mut lines = Vec::new();
+            if !is_collapsed {
+                lines.push(pad());
+            }
+            lines.push(TextLine::from(header));
             if !is_collapsed && let Some(root) = thread.root() {
                 for body in
                     crate::markdown::render(&root.body, Some(INLINE_COMMENT_WRAP), highlighter)
@@ -6802,6 +6815,7 @@ fn build_comment_blocks(
                     spans.extend(body.spans);
                     lines.push(TextLine::from(spans));
                 }
+                lines.push(pad());
             }
             lines
         })
@@ -10547,6 +10561,50 @@ mod tests {
             app.collapsed.contains(&id),
             "clicking the inline comment header folds the thread"
         );
+    }
+
+    #[test]
+    fn an_expanded_inline_comment_block_is_padded_top_and_bottom() {
+        let mut app = sample_app();
+        app.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "alice",
+            "looks wrong",
+            CommentKind::Local,
+        );
+        app.relayout();
+        let text = |line: &TextLine<'static>| {
+            line.spans
+                .iter()
+                .map(|s| s.content.clone())
+                .collect::<String>()
+        };
+        let block = &app.comment_blocks[0];
+        assert!(
+            block.len() >= 4,
+            "pad + header + body + pad: {}",
+            block.len()
+        );
+        // The first line is a blank bar (padding), the header (with the author)
+        // is the second, and the last line is padding again.
+        assert_eq!(text(&block[0]).trim(), "▏", "a top padding line");
+        assert!(text(&block[1]).contains("alice"), "the header follows it");
+        assert_eq!(
+            text(block.last().unwrap()).trim(),
+            "▏",
+            "a bottom padding line"
+        );
+        assert!(
+            block.iter().any(|l| text(l).contains("looks wrong")),
+            "the body is still there"
+        );
+
+        // A collapsed block stays a single header line — no padding.
+        let id = app.review.threads[0].id.clone();
+        app.toggle_collapse(id);
+        let block = &app.comment_blocks[0];
+        assert_eq!(block.len(), 1, "collapsed is just the header");
+        assert!(text(&block[0]).contains("alice"));
     }
 
     /// A one-file diff with five context lines `line1`..`line5` (new 1..5).
