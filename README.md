@@ -202,8 +202,12 @@ which then becomes the newline (with `Alt+Enter` as a fallback).
 Press `c` on any line to open a markdown composer; the comment shows inline under
 its line and starts a thread. To comment on several lines, select a range first —
 `V` then `j` / `k`, or drag over the lines — and the composer's title shows the
-`file:start-end` range. `r` replies to the thread on the cursor's line and `x`
-resolves or reopens it. Once a review has any threads, `Tab` opens a
+`file:start-end` range. A gutter bar marks every line a comment covers, and its
+actions (`r`, `x`, `e`, `d`, …) work from any of those lines, not just the last.
+Where two ranges overlap, acting on the shared line offers a small picker (`j` /
+`k` or a digit, `Enter`, `Esc`) so you always choose the intended thread rather
+than one being picked for you. `r` replies to the thread on the cursor's line and
+`x` resolves or reopens it. Once a review has any threads, `Tab` opens a
 Conversation view — every thread as a root comment with its nested replies and
 relative timestamps, GitHub-style — where `r` and `x` also work and `X` closes
 (deletes) the review. Comments are authored as your `git config user.name`.

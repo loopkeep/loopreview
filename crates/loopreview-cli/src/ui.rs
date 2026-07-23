@@ -517,6 +517,18 @@ struct Compose {
     suggestion: bool,
 }
 
+/// A disambiguation picker: when several threads cover the cursor's line
+/// (overlapping range comments), a thread action opens this instead of silently
+/// choosing one, so the reviewer picks the intended target.
+struct ThreadPicker {
+    /// Candidate thread indices, in display order (end line ascending, then start).
+    candidates: Vec<usize>,
+    /// The highlighted candidate.
+    selected: usize,
+    /// The action to run against the chosen thread once confirmed.
+    action: Action,
+}
+
 /// A relocatable cursor position: a file path and a line number on one side.
 /// Used to keep the cursor on the same line across a watch reload.
 struct CursorAnchor {
@@ -708,6 +720,12 @@ struct App {
     finder: Option<Finder>,
     /// The `?` command-palette overlay, when open.
     palette: Option<Palette>,
+    /// The disambiguation picker shown when several threads cover the cursor line
+    /// and a thread action is invoked, holding the action to run on the choice.
+    thread_picker: Option<ThreadPicker>,
+    /// A thread index that overrides the cursor→thread mapping while a picked
+    /// action runs (set by the picker, cleared right after). `None` normally.
+    forced_thread: Option<usize>,
     /// The cursor line where a line-range selection began (`V` or a drag).
     selection: Option<usize>,
     /// The cursor line a mouse-drag started on (to distinguish a click).
@@ -849,6 +867,8 @@ impl App {
             sidebar_scroll: 0,
             finder: None,
             palette: None,
+            thread_picker: None,
+            forced_thread: None,
             selection: None,
             drag_anchor: None,
             hit: Cell::new(HitLayout::default()),
@@ -1544,6 +1564,10 @@ impl App {
             self.on_key_finder(code, mods);
             return;
         }
+        if self.thread_picker.is_some() {
+            self.on_key_thread_picker(code, mods);
+            return;
+        }
         if self.palette.is_some() {
             self.on_key_palette(code, mods);
             return;
@@ -1727,6 +1751,27 @@ impl App {
     }
 
     fn files_action(&mut self, action: Action) {
+        // When several threads cover the cursor line (overlapping range comments)
+        // and the action targets a thread, disambiguate with a picker rather than
+        // silently choosing — picking the wrong reply/delete target is too costly.
+        // The `forced_thread` guard lets the picked action run straight through.
+        if self.forced_thread.is_none()
+            && matches!(
+                action,
+                Action::Reply
+                    | Action::Resolve
+                    | Action::Edit
+                    | Action::Delete
+                    | Action::ToggleKind
+                    | Action::Fold
+            )
+        {
+            let hits = self.threads_at_cursor();
+            if hits.len() > 1 {
+                self.open_thread_picker(hits, action);
+                return;
+            }
+        }
         let page = self.body_height.get().max(1) as isize;
         match action {
             Action::MoveDown => self.move_cursor(1),
@@ -3270,22 +3315,119 @@ impl App {
     }
 
     /// The index of the thread anchored at the cursor's line, if any.
-    fn thread_at_cursor(&self) -> Option<usize> {
-        let (file, flat) = self.cursor_content()?;
+    /// Every thread whose line-range anchor *covers* the cursor's line — so a
+    /// range comment (`start..=end`) is reachable from any line inside it, not
+    /// only its last. Ordered end-line ascending then start ascending, which
+    /// matches the on-screen stack (each inline block renders just below its end
+    /// line); storage order breaks ties.
+    fn threads_at_cursor(&self) -> Vec<usize> {
+        let Some((file, flat)) = self.cursor_content() else {
+            return Vec::new();
+        };
         let (hi, li) = self.flats[file][flat];
         let line = &self.diff.files[file].hunks[hi].lines[li];
         let path = self.diff.files[file].display_path();
-        for (side, number) in [(Side::New, line.new_lineno), (Side::Old, line.old_lineno)] {
-            if let Some(n) = number
-                && let Some(idx) = self.review.threads.iter().position(|t| {
-                    matches!(&t.anchor, Anchor::Line { file, side: s, end, .. }
-                        if file == path && *s == side && *end == n)
-                })
-            {
-                return Some(idx);
-            }
+        let mut hits: Vec<usize> = (0..self.review.threads.len())
+            .filter(|&ti| self.thread_covers_line(ti, path, line))
+            .collect();
+        hits.sort_by_key(|&ti| match &self.review.threads[ti].anchor {
+            Anchor::Line { start, end, .. } => (*end, *start),
+            _ => (u32::MAX, u32::MAX),
+        });
+        hits
+    }
+
+    /// Whether thread `ti`'s line anchor covers `line` within `path` — its range
+    /// contains the line's number on the anchored side.
+    fn thread_covers_line(&self, ti: usize, path: &str, line: &Line) -> bool {
+        matches!(&self.review.threads[ti].anchor,
+        Anchor::Line { file, side, start, end, .. } if file == path && {
+            let n = if *side == Side::New { line.new_lineno } else { line.old_lineno };
+            n.is_some_and(|n| *start <= n && n <= *end)
+        })
+    }
+
+    /// Whether any thread's range covers the diff line `(file, flat)` — used to
+    /// mark every row of a multi-line comment in the gutter, not only its anchor
+    /// line, so a range comment is visible on the lines it applies to.
+    fn line_has_comment(&self, file: usize, flat: usize) -> bool {
+        if flat == HEADER {
+            return false;
         }
-        None
+        let (hi, li) = self.flats[file][flat];
+        let line = &self.diff.files[file].hunks[hi].lines[li];
+        let path = self.diff.files[file].display_path();
+        (0..self.review.threads.len()).any(|ti| self.thread_covers_line(ti, path, line))
+    }
+
+    /// The single thread a per-line action targets: the forced pick while a
+    /// picked action runs, else the top thread covering the cursor (the display
+    /// representative). Callers that must disambiguate several use
+    /// [`Self::threads_at_cursor`] and open a picker.
+    fn thread_at_cursor(&self) -> Option<usize> {
+        if let Some(ti) = self.forced_thread {
+            return Some(ti);
+        }
+        self.threads_at_cursor().first().copied()
+    }
+
+    /// Open the disambiguation picker for `candidates`, to run `action` on the one
+    /// the reviewer chooses.
+    fn open_thread_picker(&mut self, candidates: Vec<usize>, action: Action) {
+        let n = candidates.len();
+        self.thread_picker = Some(ThreadPicker {
+            candidates,
+            selected: 0,
+            action,
+        });
+        self.status = Some(format!("{n} comments here — pick one (Esc to cancel)"));
+    }
+
+    /// Run the picker's action against candidate `choice`, then clear the picker
+    /// and the forced-target override.
+    fn run_thread_pick(&mut self, choice: usize) {
+        let Some(picker) = self.thread_picker.take() else {
+            return;
+        };
+        let Some(&ti) = picker.candidates.get(choice) else {
+            return;
+        };
+        self.forced_thread = Some(ti);
+        self.run_action(picker.action);
+        self.forced_thread = None;
+    }
+
+    /// Route a key while the thread-disambiguation picker is open: `j`/`k` (or
+    /// arrows) move, a digit picks that candidate directly, Enter confirms the
+    /// highlighted one, Esc cancels.
+    fn on_key_thread_picker(&mut self, code: KeyCode, _mods: KeyModifiers) {
+        let Some(picker) = self.thread_picker.as_mut() else {
+            return;
+        };
+        let n = picker.candidates.len();
+        match code {
+            KeyCode::Esc => {
+                self.thread_picker = None;
+                self.status = Some("cancelled".to_string());
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                picker.selected = (picker.selected + 1).min(n - 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let idx = c as usize - '1' as usize;
+                if idx < n {
+                    self.run_thread_pick(idx);
+                }
+            }
+            KeyCode::Enter => {
+                let choice = picker.selected;
+                self.run_thread_pick(choice);
+            }
+            _ => {}
+        }
     }
 
     /// Finish composing: create the thread or append the reply, then save.
@@ -4594,6 +4736,9 @@ impl App {
         if let Some(palette) = &self.palette {
             self.draw_palette(f, palette);
         }
+        if let Some(picker) = &self.thread_picker {
+            self.draw_thread_picker(f, picker);
+        }
         if self.confirming_close {
             self.draw_close_confirm(f);
         }
@@ -5139,13 +5284,26 @@ impl App {
                 (Fold, "fold"),
             ]
         };
+        // Several threads on the cursor line make thread actions ambiguous; the
+        // footer flags the count on `reply` (`r reply (2)`) so it is clear a pick
+        // is coming — matching the Files-view picker.
+        let overlap = if !in_sidebar && self.view == View::Files {
+            self.threads_at_cursor().len()
+        } else {
+            0
+        };
         let mut parts = Vec::new();
         for (action, label) in candidates {
             if parts.len() >= 6 {
                 break;
             }
             if self.action_available(*action) {
-                parts.push(format!("{} {label}", key(*action)));
+                let shown = if *action == Reply && overlap > 1 {
+                    format!("{label} ({overlap})")
+                } else {
+                    (*label).to_string()
+                };
+                parts.push(format!("{} {shown}", key(*action)));
             }
         }
         parts.join(" · ")
@@ -5309,8 +5467,23 @@ impl App {
             tint
         };
         let base = bg.map_or_else(Style::default, |c| Style::default().bg(c));
-        let marker = if is_cursor { "▎" } else { " " };
-        let marker_fg = if dim { Color::DarkGray } else { Color::Cyan };
+        // Gutter marker: the cursor bar wins; else a thin comment bar on any line
+        // a thread's range covers (so a multi-line comment shows on every line).
+        let commented = !is_cursor && self.line_has_comment(file, flat);
+        let marker = if is_cursor {
+            "▎"
+        } else if commented {
+            "▏"
+        } else {
+            " "
+        };
+        let marker_fg = if commented {
+            COMMENT_BAR
+        } else if dim {
+            Color::DarkGray
+        } else {
+            Color::Cyan
+        };
         let number = if new_side {
             line.new_lineno
         } else {
@@ -5771,6 +5944,75 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
+    /// Draw the thread-disambiguation picker: one row per candidate covering the
+    /// cursor line — its range, author, kind/state badge, and a body excerpt —
+    /// numbered for a direct pick.
+    fn draw_thread_picker(&self, f: &mut Frame, picker: &ThreadPicker) {
+        let screen = f.area();
+        let rows = picker.candidates.len() as u16 + 2; // items + borders
+        let width = 72.min(screen.width.saturating_sub(4));
+        let height = rows.min(screen.height);
+        let area = Rect {
+            x: (screen.width.saturating_sub(width)) / 2,
+            y: (screen.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        };
+        f.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" pick a comment (j/k or 1-9 · Enter · Esc) ")
+            .style(Style::default().bg(FINDER_BG));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let mut lines = Vec::new();
+        for (row, &ti) in picker.candidates.iter().enumerate() {
+            let thread = &self.review.threads[ti];
+            let range = match &thread.anchor {
+                Anchor::Line { start, end, .. } if start == end => format!("L{start}"),
+                Anchor::Line { start, end, .. } => format!("L{start}-{end}"),
+                _ => "—".to_string(),
+            };
+            let root = thread.root();
+            let author = root.map(|c| c.author.as_str()).unwrap_or("?");
+            let excerpt = {
+                let first = root.and_then(|c| c.body.lines().next()).unwrap_or("");
+                if first.chars().count() > 40 {
+                    first.chars().take(39).collect::<String>() + "…"
+                } else {
+                    first.to_string()
+                }
+            };
+            let selected = row == picker.selected;
+            let base = if selected {
+                Style::default().bg(SEL_BG)
+            } else {
+                Style::default().bg(FINDER_BG)
+            };
+            let mut spans = vec![
+                TextSpan::styled(
+                    format!(" {} ", row + 1),
+                    base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                TextSpan::styled(format!("{range:<9} "), base.fg(Color::Gray)),
+                TextSpan::styled(
+                    format!("{author} "),
+                    base.fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if let Some((badge, color)) = root.and_then(kind_badge) {
+                spans.push(TextSpan::styled(format!("{badge} "), base.fg(color)));
+            }
+            if thread.is_resolved() {
+                spans.push(TextSpan::styled("[resolved] ", base.fg(Color::DarkGray)));
+            }
+            spans.push(TextSpan::styled(excerpt, base.fg(Color::Gray)));
+            lines.push(TextLine::from(spans));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn hunk_header_line(&self, fi: usize, hi: usize) -> TextLine<'static> {
         let hunk = &self.diff.files[fi].hunks[hi];
         let mut spans = vec![TextSpan::styled(
@@ -5804,8 +6046,22 @@ impl App {
             tint
         };
         let base = bg.map_or_else(Style::default, |c| Style::default().bg(c));
-        let marker = if is_cursor { "▎" } else { " " };
-        let marker_fg = if dim { Color::DarkGray } else { Color::Cyan };
+        // Gutter marker: cursor bar wins, else a thin comment bar on covered lines.
+        let commented = !is_cursor && self.line_has_comment(file, flat);
+        let marker = if is_cursor {
+            "▎"
+        } else if commented {
+            "▏"
+        } else {
+            " "
+        };
+        let marker_fg = if commented {
+            COMMENT_BAR
+        } else if dim {
+            Color::DarkGray
+        } else {
+            Color::Cyan
+        };
         let old = optional_number(line.old_lineno, self.num_width);
         let new = optional_number(line.new_lineno, self.num_width);
         // A fixed gutter (marker + old/new numbers + sign), then the content
@@ -7489,6 +7745,67 @@ mod tests {
             Highlighter::new(),
             None,
         )
+    }
+
+    /// An app whose file is five added lines (new 1..=5). clines row `i`
+    /// (1..=5) is new line `i`, so a cursor row maps straight to a line number —
+    /// handy for exercising multi-line range anchors.
+    fn multi_line_app() -> App {
+        let lines: Vec<Line> = (1..=5)
+            .map(|n| Line {
+                kind: LineKind::Addition,
+                content: format!("line {n}"),
+                old_lineno: None,
+                new_lineno: Some(n),
+            })
+            .collect();
+        let file = FileDiff {
+            old_path: None,
+            new_path: Some("a.rs".into()),
+            status: ChangeStatus::Added,
+            binary: false,
+            hunks: vec![Hunk {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 5,
+                section: None,
+                lines,
+            }],
+        };
+        let diff = Diff {
+            files: vec![file],
+            provenance: Provenance {
+                base: Some("base".into()),
+                head: None,
+            },
+        };
+        let path = std::env::temp_dir().join(format!(
+            "lr-ui-{}-{}/review.json",
+            std::process::id(),
+            app_counter()
+        ));
+        App::new(
+            "working tree".into(),
+            diff,
+            Review::default(),
+            Some(Store::at(path, "test-repo")),
+            "tester".into(),
+            Highlighter::new(),
+            None,
+        )
+    }
+
+    /// A new-side range anchor on `a.rs` spanning `start..=end`.
+    fn range_anchor(start: u32, end: u32) -> Anchor {
+        Anchor::Line {
+            file: "a.rs".into(),
+            side: Side::New,
+            start,
+            end,
+            commit: None,
+            context: Vec::new(),
+        }
     }
 
     #[test]
@@ -10564,6 +10881,34 @@ mod tests {
     }
 
     #[test]
+    fn drawing_the_thread_picker_does_not_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = multi_line_app();
+        app.mode = Mode::Unified;
+        app.view = View::Files;
+        app.add_thread(
+            range_anchor(2, 4),
+            "tester",
+            "a long body that should be truncated to keep the picker row tidy indeed",
+            CommentKind::Local,
+        );
+        app.add_thread(range_anchor(2, 3), "tester", "C", CommentKind::Local);
+        app.relayout();
+        app.cursor = 2;
+        let hits = app.threads_at_cursor();
+        app.open_thread_picker(hits, Action::Reply);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(
+            screen.contains("pick a comment"),
+            "the picker title rendered:\n{screen}"
+        );
+        assert!(screen.contains("L2-4"), "a candidate's range rendered");
+    }
+
+    #[test]
     fn jump_to_file_expands_a_collapsed_file() {
         let mut app = multi_file_app(&["a.rs", "b.rs"]);
         app.collapsed_files.insert("b.rs".to_string());
@@ -11135,6 +11480,108 @@ mod tests {
             Anchor::Line { file, .. } => assert_eq!(file, "a.rs"),
             other => panic!("unexpected anchor {other:?}"),
         }
+    }
+
+    // -- range-comment targeting and overlap picker -------------------------
+
+    #[test]
+    fn a_range_comment_is_reachable_from_any_line_it_covers() {
+        let mut app = multi_line_app(); // clines row i (1..=5) == new line i
+        app.mode = Mode::Unified;
+        app.view = View::Files;
+        app.add_thread(
+            range_anchor(2, 4),
+            "tester",
+            "spans 2-4",
+            CommentKind::Local,
+        );
+        app.relayout();
+        // The end line (4) always worked; the fix is the start and middle lines.
+        for row in [2usize, 3, 4] {
+            app.cursor = row;
+            assert_eq!(app.threads_at_cursor(), vec![0], "reachable at row {row}");
+            let (f, flat) = app.clines[row];
+            assert!(app.line_has_comment(f, flat), "the gutter marks row {row}");
+        }
+        // Lines outside the range are untouched.
+        for row in [1usize, 5] {
+            app.cursor = row;
+            assert!(app.threads_at_cursor().is_empty(), "row {row} is outside");
+            let (f, flat) = app.clines[row];
+            assert!(!app.line_has_comment(f, flat), "no marker on row {row}");
+        }
+    }
+
+    #[test]
+    fn overlapping_ranges_open_a_picker_ordered_by_end_line() {
+        let mut app = multi_line_app();
+        app.mode = Mode::Unified;
+        app.view = View::Files;
+        // E's example: A=2-4, B=3-5, C=2-3 — all cover line 3.
+        let (a, _) = app.add_thread(range_anchor(2, 4), "tester", "A", CommentKind::Local);
+        let (_b, _) = app.add_thread(range_anchor(3, 5), "tester", "B", CommentKind::Local);
+        let (_c, _) = app.add_thread(range_anchor(2, 3), "tester", "C", CommentKind::Local);
+        app.relayout();
+        app.cursor = 3;
+        // Ordered end ascending, then start ascending: C(3), A(4), B(5).
+        let order: Vec<String> = app
+            .threads_at_cursor()
+            .iter()
+            .map(|&ti| app.review.threads[ti].root().unwrap().body.clone())
+            .collect();
+        assert_eq!(order, vec!["C", "A", "B"], "end asc, then start asc");
+        // The footer flags the multiplicity on reply.
+        assert!(
+            app.footer_ops().contains("reply (3)"),
+            "footer shows the count: {}",
+            app.footer_ops()
+        );
+        // Pressing `r` opens the picker rather than choosing silently.
+        app.on_key(KeyCode::Char('r'), KeyModifiers::NONE);
+        assert!(app.input.is_none(), "no composer opened yet");
+        let picker = app.thread_picker.as_ref().expect("the picker opened");
+        assert_eq!(picker.candidates.len(), 3);
+        // Pick #2 (A, the middle of C/A/B) — the reply targets thread A.
+        app.on_key(KeyCode::Char('2'), KeyModifiers::NONE);
+        assert!(app.thread_picker.is_none(), "the picker closed");
+        match &app.input.as_ref().expect("a reply composer opened").kind {
+            ComposeKind::Reply(id) => assert_eq!(id, &a, "reply went to the picked thread A"),
+            _ => panic!("expected a reply composer for the picked thread"),
+        }
+    }
+
+    #[test]
+    fn the_thread_picker_cancels_on_esc_without_acting() {
+        let mut app = multi_line_app();
+        app.mode = Mode::Unified;
+        app.view = View::Files;
+        app.add_thread(range_anchor(2, 4), "tester", "A", CommentKind::Local);
+        app.add_thread(range_anchor(2, 3), "tester", "C", CommentKind::Local);
+        app.relayout();
+        app.cursor = 2; // both A and C cover line 2
+        app.on_key(KeyCode::Char('x'), KeyModifiers::NONE); // resolve → picker
+        assert!(app.thread_picker.is_some(), "two threads here → a picker");
+        app.on_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.thread_picker.is_none(), "esc closes the picker");
+        assert!(
+            !app.review.threads[0].is_resolved() && !app.review.threads[1].is_resolved(),
+            "cancelling resolves nothing"
+        );
+    }
+
+    #[test]
+    fn a_single_line_anchor_still_targets_only_its_line() {
+        let mut app = multi_line_app();
+        app.mode = Mode::Unified;
+        app.view = View::Files;
+        app.add_thread(range_anchor(3, 3), "tester", "one", CommentKind::Local);
+        app.relayout();
+        app.cursor = 3;
+        assert_eq!(app.threads_at_cursor(), vec![0], "on its own line");
+        app.cursor = 2;
+        assert!(app.threads_at_cursor().is_empty(), "not the line above");
+        app.cursor = 4;
+        assert!(app.threads_at_cursor().is_empty(), "not the line below");
     }
 
     #[test]
