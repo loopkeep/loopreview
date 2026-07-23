@@ -51,18 +51,6 @@ pub fn run() -> ExitCode {
 }
 
 fn try_run() -> Result<()> {
-    // The `pr` / `issue` verbs are gone, but `args_conflicts_with_subcommands`
-    // makes `lr pr 123` an opaque clap conflict error before any app code runs.
-    // Intercept that muscle memory in raw argv, ahead of clap, and point at the
-    // new grammar. (`args_os` → lossy keeps a non-UTF-8 arg from panicking; clap
-    // reports it in its own terms just after.)
-    let argv: Vec<String> = std::env::args_os()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    if let Some(message) = cli::removed_verb_hint(&argv) {
-        bail!("{message}");
-    }
-
     // clap handles `--help` / `--version` (printing and exiting) before this.
     // The control-plane verbs run headless (an agent has no terminal); only the
     // review UI needs a TTY, so split them off before the TTY guard.

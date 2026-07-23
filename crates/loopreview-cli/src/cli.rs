@@ -485,14 +485,6 @@ impl Cli {
                         detect: false,
                     }
                 }
-                // Old muscle memory: bare `lr pr` / `lr issue`. Point at the new
-                // grammar rather than the generic "not something to review". (The
-                // `lr pr 123` form never reaches here — clap rejects the extra
-                // token first — so the same guidance is issued pre-parse by
-                // [`removed_verb_hint`]; both share [`removed_verb_message`].)
-                (false, Some(reference)) if reference == "pr" || reference == "issue" => {
-                    Action::Invalid(removed_verb_message(&reference))
-                }
                 (false, Some(reference)) => Action::Invalid(format!(
                     "`{reference}` isn't something to review — pass a pull request or issue (a number, \
                      `#N`, `owner/repo#N`, or a URL), a git diff (`lr diff {reference}`), or a patch (`lr patch`)"
@@ -525,70 +517,12 @@ impl Cli {
     }
 }
 
-/// The guidance shown when someone reaches for the removed `pr` / `issue` verb:
-/// a bare reference is the entry point now. One source of truth for both the
-/// pre-parse scan ([`removed_verb_hint`]) and the post-parse [`Action::Invalid`]
-/// branch.
-fn removed_verb_message(verb: &str) -> String {
-    format!(
-        "the `{verb}` verb is gone — a bare reference is the entry point now: \
-         `lr 123`, `lr owner/repo#5`, or `lr <url>` (it opens a pull request or an issue)"
-    )
-}
-
-/// Catch the removed `pr` / `issue` verbs in raw argv *before* clap parses.
-///
-/// Bare `lr` takes a single optional reference and no other positional, and the
-/// parser sets `args_conflicts_with_subcommands`, so `lr pr 123` reads as "the
-/// positional `pr` plus an extra token `123`" — clap aborts with an opaque
-/// conflict error before [`Cli::action`] (and its [`Action::Invalid`] guidance)
-/// ever runs. Scanning here, ahead of clap, is the only place that guidance can
-/// reach the `lr pr <ref>` / `lr issue <ref>` forms. Intercepting the first
-/// positional token is safe precisely because bare `lr` accepts no second
-/// positional. Returns the migration hint when that token is `pr` or `issue`.
-///
-/// `argv` is the whole command line including `argv[0]` (the program name), as
-/// [`std::env::args`] yields it.
-pub fn removed_verb_hint(argv: &[String]) -> Option<String> {
-    let mut past_flags = false;
-    let mut skip_value = false;
-    for arg in argv.iter().skip(1) {
-        if skip_value {
-            skip_value = false;
-            continue;
-        }
-        if !past_flags {
-            if arg == "--" {
-                past_flags = true;
-                continue;
-            }
-            if arg == "--mode" {
-                skip_value = true; // `--mode <layout>` carries its value in the next token
-                continue;
-            }
-            if arg.starts_with('-') && arg != "-" {
-                continue; // any other flag (booleans, or a `--flag=value` bundle)
-            }
-        }
-        // The first positional token decides.
-        return match arg.as_str() {
-            "pr" | "issue" => Some(removed_verb_message(arg)),
-            _ => None,
-        };
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn action_of(args: &[&str]) -> Action {
         Cli::parse_from(args).action()
-    }
-
-    fn owned(args: &[&str]) -> Vec<String> {
-        args.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
@@ -737,65 +671,19 @@ mod tests {
     }
 
     #[test]
-    fn the_pr_verb_is_gone() {
-        // `pr` is no longer a subcommand — bare `lr pr` / `lr issue` is a
-        // non-reference positional, guided to the new grammar via Action::Invalid.
+    fn pr_and_issue_are_not_verbs() {
+        // There is no `pr` / `issue` subcommand. Bare `lr pr` / `lr issue` is just
+        // a non-reference positional, guided by the general "isn't something to
+        // review" message; `lr pr 123` is a plain clap parse error (the positional
+        // plus an extra token). No special migration hint — pre-release, there is
+        // no old muscle memory to court.
         for verb in ["pr", "issue"] {
-            match action_of(&["lr", verb]) {
-                Action::Invalid(msg) => assert!(
-                    msg.contains("gone"),
-                    "the `{verb}` guidance names the removed verb: {msg}"
-                ),
-                other => panic!("expected an Invalid for `{verb}`, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn removed_verb_hint_fires_through_real_argv() {
-        // Regression: `lr pr 123` is a clap parse error (the `pr` positional plus
-        // an extra token), so Action::Invalid never runs — a test that only drives
-        // action() would miss it. The pre-clap scan is what delivers the migration
-        // hint here; drive it with the full argv (argv[0] + args), the exact slice
-        // `try_run` feeds it, so a green test means a working binary.
-        for argv in [
-            &["lr", "pr"][..],
-            &["lr", "pr", "1"][..],
-            &["lr", "issue", "5"][..],
-            &["lr", "pr", "#1"][..],
-        ] {
-            let hint = removed_verb_hint(&owned(argv))
-                .unwrap_or_else(|| panic!("expected a migration hint for {argv:?}"));
             assert!(
-                hint.contains("gone") && hint.contains("bare reference"),
-                "the hint for {argv:?} points at the new grammar: {hint}"
+                matches!(action_of(&["lr", verb]), Action::Invalid(_)),
+                "`{verb}` is not something to review",
             );
         }
-        // clap alone cannot rescue `lr pr 123` — the extra token is a hard parse
-        // error. That opaque failure is exactly why the scan runs ahead of clap.
         assert!(Cli::try_parse_from(["lr", "pr", "123"]).is_err());
-    }
-
-    #[test]
-    fn removed_verb_hint_leaves_real_invocations_alone() {
-        // A genuine reference, the working-tree default, flag-led forms, and the
-        // real subcommands must all pass the scan untouched (None → hand to clap).
-        for argv in [
-            &["lr"][..],
-            &["lr", "123"][..],
-            &["lr", "octo/hello#5"][..],
-            &["lr", "--detect"][..],
-            &["lr", "--mode", "unified"][..],
-            &["lr", "diff"][..],
-            &["lr", "patch"][..],
-            &["lr", "session", "list"][..],
-        ] {
-            assert_eq!(
-                removed_verb_hint(&owned(argv)),
-                None,
-                "{argv:?} is a real invocation, not a removed verb"
-            );
-        }
     }
 
     #[test]
