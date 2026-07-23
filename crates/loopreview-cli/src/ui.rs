@@ -910,6 +910,7 @@ impl App {
             &collapsed,
             &HashMap::new(),
             &RefCell::new(HashMap::new()),
+            None,
         );
         let block_lens: Vec<usize> = comment_blocks.iter().map(Vec::len).collect();
         let layout = Layouts::build(&diff, &review, &block_lens, &HashSet::new());
@@ -925,6 +926,7 @@ impl App {
             repo_dir.as_deref(),
             &HashMap::new(),
             &RefCell::new(HashMap::new()),
+            None,
         );
         let num_width = digits(layout.max_lineno).max(3);
         let file_count = diff.files.len();
@@ -1067,9 +1069,10 @@ impl App {
         self.conv_cursor = 0;
         self.conv_scroll = 0;
         self.loading = None;
-        // An issue has no diff — open on its Overview (the description is the
-        // content), not the (empty) Files view.
-        if self.issue.is_some() {
+        // A GitHub subject (pull request or issue) opens on its Overview — read
+        // the intent (title/description) first, Files is one Tab away. A plain
+        // diff (worktree/ref/show/patch) has no subject and stays on the diff.
+        if self.has_subject() {
             self.view = View::Overview;
         }
         if loaded.stale_cleaned > 0 {
@@ -1706,12 +1709,14 @@ impl App {
 
     fn apply_layout(&mut self, diff: Diff) {
         self.apply_default_folds();
+        let slug = self.subject_slug();
         (self.comment_blocks, self.comment_block_regions) = build_comment_blocks(
             &self.review,
             &self.highlighter,
             &self.collapsed,
             &self.conv_folds,
             &self.conv_effective,
+            slug.as_deref(),
         );
         let block_lens: Vec<usize> = self.comment_blocks.iter().map(Vec::len).collect();
         let layout = Layouts::build(&diff, &self.review, &block_lens, &self.collapsed_files);
@@ -1731,6 +1736,7 @@ impl App {
             self.repo_dir.as_deref(),
             &self.conv_folds,
             &self.conv_effective,
+            slug.as_deref(),
         );
         self.conv_order = conv_display_order(&self.review);
         self.conv_cursor = self
@@ -1852,6 +1858,15 @@ impl App {
     /// Whether this session reviews an issue (no diff; a flat conversation).
     fn is_issue(&self) -> bool {
         self.issue.is_some()
+    }
+
+    /// The subject's `owner/repo` slug, for `#N` autolinks in markdown; `None` off
+    /// a GitHub subject. Derived from the `owner/repo#N` draft key.
+    fn subject_slug(&self) -> Option<String> {
+        self.pr_key
+            .as_deref()
+            .and_then(|key| key.split_once('#'))
+            .map(|(slug, _)| slug.to_string())
     }
 
     /// Whether the Conversation | Files tab structure is shown. A comment-capable
@@ -6082,8 +6097,14 @@ impl App {
             effective.borrow_mut().insert(index, open);
             open
         };
-        let mut body =
-            crate::markdown::render_rich(&ov.body, Some(width.max(1)), &self.highlighter, &is_open);
+        let slug = self.subject_slug();
+        let mut body = crate::markdown::render_rich(
+            &ov.body,
+            Some(width.max(1)),
+            &self.highlighter,
+            &is_open,
+            slug.as_deref(),
+        );
         let preamble = lines.len();
         for region in &mut body.regions {
             region.line += preamble;
@@ -7857,12 +7878,14 @@ type CommentBlocksBuild = (
     Vec<Vec<crate::markdown::MdRegion>>,
 );
 
+#[allow(clippy::too_many_arguments)]
 fn build_comment_blocks(
     review: &Review,
     highlighter: &Highlighter,
     collapsed: &HashSet<String>,
     folds: &HashMap<(String, usize), bool>,
     effective: &RefCell<HashMap<(String, usize), bool>>,
+    slug: Option<&str>,
 ) -> CommentBlocksBuild {
     // The inline body prefix "  ▏ " is 4 display columns; a click region's column
     // is offset past it.
@@ -7926,6 +7949,7 @@ fn build_comment_blocks(
                     Some(INLINE_COMMENT_WRAP),
                     highlighter,
                     &is_open,
+                    slug,
                 );
                 for r in &rendered.regions {
                     regions.push(crate::markdown::MdRegion {
@@ -7975,6 +7999,7 @@ fn build_conversation(
     repo_dir: Option<&Path>,
     folds: &HashMap<(String, usize), bool>,
     effective: &RefCell<HashMap<(String, usize), bool>>,
+    slug: Option<&str>,
 ) -> ConversationBuild {
     let now = now();
     effective.borrow_mut().clear();
@@ -8101,6 +8126,7 @@ fn build_conversation(
                     Some(width),
                     highlighter,
                     &is_open_body,
+                    slug,
                 );
                 collect_regions(&rendered.regions, base, 0, dbase, &mut regions);
                 details_base += seen.get();
@@ -8121,6 +8147,7 @@ fn build_conversation(
                     Some(width.saturating_sub(2)),
                     highlighter,
                     &is_open_body,
+                    slug,
                 );
                 collect_regions(&rendered.regions, base, 2, dbase, &mut regions);
                 details_base += seen.get();
@@ -9741,6 +9768,28 @@ mod tests {
         assert_eq!(app.view, View::Overview, "an issue opens on its Overview");
         assert!(app.is_issue());
         assert!(app.pr_overview.is_some(), "the issue overview is installed");
+    }
+
+    #[test]
+    fn installing_a_pull_request_opens_the_overview() {
+        // A PR now opens on its Overview too (read the intent first; Files is a
+        // Tab away). A plain diff has no subject and stays on Files.
+        let mut app = sample_app();
+        app.view = View::Files;
+        app.install_loaded(Loaded {
+            label: "PR #1".into(),
+            diff: Diff::default(),
+            review: Review::default(),
+            pr: Some(crate::prsync::PrHandle::for_test(1, "t")),
+            issue: None,
+            pr_key: Some("owner/repo#1".into()),
+            stale_cleaned: 0,
+        });
+        assert_eq!(
+            app.view,
+            View::Overview,
+            "a pull request opens on its Overview"
+        );
     }
 
     #[test]

@@ -94,17 +94,21 @@ struct DetailsFrame {
 
 /// Render markdown with interactivity. `is_open(index, default_open)` decides
 /// whether the nth `<details>` is expanded — `default_open` is its `open`
-/// attribute, which the caller may override with session fold state.
+/// attribute, which the caller may override with session fold state. `slug` is
+/// the current subject's `owner/repo`, when known — it enables `#N` /
+/// `owner/repo#N` autolinks to GitHub; `None` leaves those as plain text.
 pub fn render_rich(
     text: &str,
     wrap: Option<usize>,
     highlighter: &Highlighter,
     is_open: &dyn Fn(usize, bool) -> bool,
+    slug: Option<&str>,
 ) -> Rendered {
     let mut renderer = Renderer {
         wrap,
         highlighter,
         is_open,
+        slug,
         out: Vec::new(),
         regions: Vec::new(),
         spans: Vec::new(),
@@ -150,6 +154,8 @@ struct Renderer<'a> {
     wrap: Option<usize>,
     highlighter: &'a Highlighter,
     is_open: &'a dyn Fn(usize, bool) -> bool,
+    /// The current subject's `owner/repo`, for `#N` autolinks (`None` disables).
+    slug: Option<&'a str>,
     out: Vec<TextLine<'static>>,
     regions: Vec<MdRegion>,
     /// Inline pieces accumulating for the current block (or table cell).
@@ -207,8 +213,10 @@ impl Renderer<'_> {
             Event::SoftBreak | Event::HardBreak => self.spans.push(break_piece()),
             // Raw HTML: `<br>` (a break), `<img>` (an image placeholder),
             // `<details>`/`<summary>` (a fold); everything else is dropped — its
-            // inner text still arrives as Text events, so content is kept.
-            Event::Html(html) | Event::InlineHtml(html) => self.html(&html),
+            // inner text still arrives as Text events, so content is kept. A block
+            // `<img>` (its own HTML block) is a block; an inline one stays inline.
+            Event::Html(html) => self.html(&html, true),
+            Event::InlineHtml(html) => self.html(&html, false),
             Event::Rule => self.rule(),
             Event::FootnoteReference(label) => {
                 let style = self.style.fg(palette::LINK_FG);
@@ -362,7 +370,8 @@ impl Renderer<'_> {
 
     /// Push a run of text. Inside a markdown link label it becomes underlined
     /// link text carrying the destination (clickable, no separate `(url)`);
-    /// elsewhere bare `http(s)://` URLs autolink (GitHub does).
+    /// elsewhere bare `http(s)://` URLs autolink, and `#N` / `owner/repo#N`
+    /// autolink to GitHub when a subject slug is known (like GitHub).
     fn push_text(&mut self, text: &str) {
         if let Some(url) = self.link.clone() {
             self.spans.push(Piece {
@@ -376,22 +385,23 @@ impl Renderer<'_> {
             });
             return;
         }
+        let link_style = self
+            .style
+            .fg(palette::LINK_FG)
+            .add_modifier(Modifier::UNDERLINED);
         let mut rest = text;
-        while let Some((pre, url, tail)) = next_url(rest) {
-            if !pre.is_empty() {
-                self.spans
-                    .push(Piece::plain(TextSpan::styled(pre.to_string(), self.style)));
+        while let Some((start, end, url)) = find_autolink(rest, self.slug) {
+            if start > 0 {
+                self.spans.push(Piece::plain(TextSpan::styled(
+                    rest[..start].to_string(),
+                    self.style,
+                )));
             }
             self.spans.push(Piece {
-                span: TextSpan::styled(
-                    url.to_string(),
-                    self.style
-                        .fg(palette::LINK_FG)
-                        .add_modifier(Modifier::UNDERLINED),
-                ),
-                action: Some(MdAction::Open(url.to_string())),
+                span: TextSpan::styled(rest[start..end].to_string(), link_style),
+                action: Some(MdAction::Open(url)),
             });
-            rest = tail;
+            rest = &rest[end..];
         }
         if !rest.is_empty() {
             self.spans
@@ -420,7 +430,9 @@ impl Renderer<'_> {
 
     /// Handle a raw-HTML fragment: `<br>`, `<img>`, `<details>` open/close, or a
     /// `<summary>`. Anything else is dropped (inner text kept via Text events).
-    fn html(&mut self, html: &str) {
+    /// `block` is true for a standalone HTML block, false for inline HTML — a
+    /// block `<img>` becomes its own paragraph-level block.
+    fn html(&mut self, html: &str, block: bool) {
         let lower = html.trim_start().to_ascii_lowercase();
         if is_br(html) {
             self.spans.push(break_piece());
@@ -438,7 +450,16 @@ impl Renderer<'_> {
             self.details.pop();
         } else if let Some((src, alt)) = parse_img(html) {
             if !src.is_empty() {
-                self.push_image(&src, &alt);
+                if block {
+                    // A standalone <img> is its own block, spaced from its
+                    // neighbours (so "[Image]" never runs into the next paragraph).
+                    self.flush_block();
+                    self.open_block();
+                    self.push_image(&src, &alt);
+                    self.flush_block();
+                } else {
+                    self.push_image(&src, &alt);
+                }
             }
         } else if let Some(summary) = parse_summary(html) {
             self.emit_summary(&summary);
@@ -808,6 +829,88 @@ fn next_url(s: &str) -> Option<(&str, &str, &str)> {
     }
     let real_end = start + url.len();
     Some((&s[..start], &s[start..real_end], &s[real_end..]))
+}
+
+/// The earliest autolink in `s` — a bare URL, or (when `slug` is known) a `#N` /
+/// `owner/repo#N` reference — as `(start, end, url)` byte offsets and target.
+fn find_autolink(s: &str, slug: Option<&str>) -> Option<(usize, usize, String)> {
+    let mut best: Option<(usize, usize, String)> = None;
+    if let Some((pre, url, _)) = next_url(s) {
+        best = Some((pre.len(), pre.len() + url.len(), url.to_string()));
+    }
+    if let Some(slug) = slug
+        && let Some(candidate) = next_issue_ref(s, slug)
+        && best.as_ref().is_none_or(|b| candidate.0 < b.0)
+    {
+        best = Some(candidate);
+    }
+    best
+}
+
+/// Whether `c` is a slug word character (`owner`/`repo` may hold these).
+fn slug_word(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_')
+}
+
+/// The first `#N` / `owner/repo#N` reference in `s` at a word boundary, as
+/// `(start, end, url)`. `#N` targets `slug`'s repo; `owner/repo#N` its own. The
+/// `/issues/N` path is correct even for a PR — GitHub redirects it.
+fn next_issue_ref(s: &str, slug: &str) -> Option<(usize, usize, String)> {
+    let b = s.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = s[from..].find('#') {
+        let hash = from + rel;
+        let num_start = hash + 1;
+        let mut end = num_start;
+        while end < s.len() && b[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == num_start {
+            from = hash + 1;
+            continue; // `#` not followed by a number
+        }
+        let num = &s[num_start..end];
+        if let Some(start) = repo_slug_start(s, hash) {
+            let owner_repo = &s[start..hash];
+            return Some((
+                start,
+                end,
+                format!("https://github.com/{owner_repo}/issues/{num}"),
+            ));
+        }
+        // A bare `#N`: only at a boundary (not mid-word, not after a slash path).
+        let boundary = hash == 0 || !(slug_word(b[hash - 1]) || b[hash - 1] == b'/');
+        if boundary {
+            return Some((hash, end, format!("https://github.com/{slug}/issues/{num}")));
+        }
+        from = hash + 1;
+    }
+    None
+}
+
+/// If `owner/repo` (each `[\w.-]+`) sits immediately before `hash`, its start.
+fn repo_slug_start(s: &str, hash: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut repo = hash;
+    while repo > 0 && slug_word(b[repo - 1]) {
+        repo -= 1;
+    }
+    if repo == hash || repo == 0 || b[repo - 1] != b'/' {
+        return None; // no repo run, or no `/` before it
+    }
+    let slash = repo - 1;
+    let mut owner = slash;
+    while owner > 0 && slug_word(b[owner - 1]) {
+        owner -= 1;
+    }
+    if owner == slash {
+        return None; // no owner run
+    }
+    // A boundary before the owner (not part of a longer path/word).
+    if owner > 0 && (slug_word(b[owner - 1]) || b[owner - 1] == b'/') {
+        return None;
+    }
+    Some(owner)
 }
 
 /// A heading's `(colour, bold)` by level: H1/H2 accent (cyan), H3/H4 plain bold,
@@ -1349,15 +1452,21 @@ mod tests {
             .map(|s| s.style)
     }
 
-    /// Render with all details expanded, exposing regions.
+    /// Render with all details expanded, exposing regions (no autolink slug).
     fn rich(src: &str, wrap: Option<usize>) -> Rendered {
         let hl = Highlighter::new();
-        render_rich(src, wrap, &hl, &|_, default| default)
+        render_rich(src, wrap, &hl, &|_, default| default, None)
+    }
+
+    /// Render with a subject slug, so `#N` autolinks resolve.
+    fn rich_slug(src: &str, wrap: Option<usize>, slug: &str) -> Rendered {
+        let hl = Highlighter::new();
+        render_rich(src, wrap, &hl, &|_, default| default, Some(slug))
     }
 
     /// Lines-only render (details always expanded) — the common test shape.
     fn render(text: &str, wrap: Option<usize>, hl: &Highlighter) -> Vec<TextLine<'static>> {
-        render_rich(text, wrap, hl, &|_, _| true).lines
+        render_rich(text, wrap, hl, &|_, _| true, None).lines
     }
 
     #[test]
@@ -1613,6 +1722,69 @@ mod tests {
     }
 
     #[test]
+    fn a_block_img_is_its_own_block_but_inline_img_stays_inline() {
+        let hl = Highlighter::new();
+        // A standalone <img> block, then a paragraph — separated, not merged.
+        let block = render(
+            "<img src=\"https://e/i.png\" alt=\"shot\"/>\n\nCloses the thing",
+            Some(40),
+            &hl,
+        );
+        let t = texts(&block);
+        assert!(t.iter().any(|l| l.contains("[Image: shot]")), "{t:?}");
+        assert!(
+            !t.iter()
+                .any(|l| l.contains("[Image: shot]") && l.contains("Closes")),
+            "the image does not run into the next paragraph: {t:?}"
+        );
+        // An inline <img> (surrounded by text) stays on the line.
+        let inline = render(
+            "see <img src=\"https://e/i.png\" alt=\"x\"> now",
+            Some(60),
+            &hl,
+        );
+        let joined = texts(&inline).join(" ");
+        assert!(
+            joined.contains("see") && joined.contains("[Image: x]") && joined.contains("now"),
+            "inline image keeps its neighbours on the line: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn issue_refs_autolink_only_with_a_slug() {
+        // `#N` targets the subject's repo; `owner/repo#N` targets that repo.
+        let r = rich_slug(
+            "Closes #1256 and octo/other#7 today",
+            Some(90),
+            "acme/widget",
+        );
+        assert!(
+            r.regions.iter().any(|reg| reg.action
+                == MdAction::Open("https://github.com/acme/widget/issues/1256".to_string())),
+            "#N links to the subject repo: {:?}",
+            r.regions
+        );
+        assert!(
+            r.regions.iter().any(|reg| reg.action
+                == MdAction::Open("https://github.com/octo/other/issues/7".to_string())),
+            "owner/repo#N links to that repo: {:?}",
+            r.regions
+        );
+        // Without a slug, `#N` stays plain text.
+        assert!(
+            rich("Closes #1256", Some(80)).regions.is_empty(),
+            "no autolink without a subject slug"
+        );
+        // Inside inline code, `#N` is not linked (code is a separate event).
+        assert!(
+            rich_slug("use `#1256` here", Some(80), "acme/widget")
+                .regions
+                .is_empty(),
+            "no autolink inside inline code"
+        );
+    }
+
+    #[test]
     fn a_markdown_image_renders_a_clickable_placeholder() {
         let r = rich("see ![a shot](https://ex.com/a.png) here", Some(60));
         let joined = texts(&r.lines).join(" ");
@@ -1697,6 +1869,7 @@ mod tests {
             Some(60),
             &hl,
             &|_, _| true,
+            None,
         );
         let joined = texts(&r.lines).join("\n");
         assert!(joined.contains("▾ Click me"), "open marker: {joined:?}");

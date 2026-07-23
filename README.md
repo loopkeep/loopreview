@@ -120,7 +120,7 @@ files from a working-tree review.
 | Key | Action |
 | --- | --- |
 | `q` / `Esc` / `Ctrl-C` | Quit |
-| `Tab` / `Shift+Tab` | Cycle the views forward / back (a repo diff has Files ⇆ Conversation; a pull request adds an **Overview** tab on the left, so Files → Shift+Tab reaches Overview and Tab reaches Conversation; an issue has Overview ⇆ Conversation with no Files and opens on Overview; a plain patch has no tabs) |
+| `Tab` / `Shift+Tab` | Cycle the views forward / back (a repo diff has Files ⇆ Conversation; a pull request has Overview \| Files \| Conversation and opens on Overview, so `Tab` reaches Files; an issue has Overview ⇆ Conversation with no Files and opens on Overview; a plain patch has no tabs) |
 | `?` | Open the command palette — a searchable list of every action with its current key; actions that apply right now are listed first, the rest greyed |
 | `b` | Toggle the file-explorer sidebar |
 | `Ctrl-P` | Open the fuzzy file finder |
@@ -234,11 +234,12 @@ which then becomes the newline (with `Alt+Enter` as a fallback).
 Comment bodies and a pull request's or issue's description render as markdown — headings, emphasis,
 inline and fenced (syntax-highlighted) code, lists, block quotes, GitHub alerts
 (`> [!NOTE]` / `[!WARNING]` …), task lists (`- [ ]` / `- [x]`), tables, thematic
-breaks, footnotes, links and bare URLs, `[Image]` placeholders, and `<details>`
-folds. Everywhere markdown renders — the Overview, the Conversation, and inline
-comments in the diff — a link or `[Image]` placeholder opens on github.com when
-clicked, and a `<details>` folds or unfolds on a click of its summary (folds are
-per-session).
+breaks, footnotes, links and bare URLs, `[Image]` placeholders, `<details>`
+folds, and `#N` / `owner/repo#N` issue references (on a pull request or issue).
+Everywhere markdown renders — the Overview, the Conversation, and inline comments
+in the diff — a link, `[Image]` placeholder, or `#N` reference opens on
+github.com when clicked, and a `<details>` folds or unfolds on a click of its
+summary (folds are per-session).
 
 ## Reviewing
 
@@ -284,10 +285,11 @@ branch's PR) opens a pull request in the same TUI, fetching the diff and existin
 review threads without touching your working tree. There is no `pr` subcommand —
 a GitHub reference is the entry point (quote `#N`, since most shells treat a bare
 `#` as a comment). The reference's **type is resolved automatically** (GitHub
-redirects `/pull/N` ⇆ `/issues/N`, so the look isn't trusted): a pull request
-opens the diff reader; an **issue** opens a no-diff reader — an **Overview** tab
-(its facts and rendered description) and a **Conversation** tab (its comment
-thread), starting on the Overview since an issue's body is the content. On an
+redirects `/pull/N` ⇆ `/issues/N`, so the look isn't trusted). A pull request and
+an **issue** both **open on the Overview** tab — its facts and rendered
+description, the change's stated intent — with the diff (a PR's **Files**) or the
+**Conversation** one `Tab` away. An issue is a no-diff reader (Overview and
+Conversation only). On an
 issue you read and comment (`c` starts a comment; `Ctrl-S` posts it directly —
 there is no review to submit); `e`/`d` edit or delete your own posted comments,
 and `Ctrl-R` re-pulls. The rest of this section describes pull requests. Your comments and replies are
