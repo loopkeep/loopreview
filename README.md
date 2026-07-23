@@ -138,7 +138,8 @@ action (an inapplicable one reports why), `Esc` to close.
 | --- | --- |
 | `j` / `k` (or `↓` / `↑`) | Move the cursor (over file headers and lines) |
 | `l` (or `→`) | Go in: expand a folded file, or move from a header to its first line |
-| `h` (or `←`) | Go out: line → its file header, expanded header → fold, folded header → sidebar (`b` jumps straight to the sidebar) |
+| `h` (or `←`) | Go out (pure movement, never folds): line → its file header, header → sidebar (`b` jumps straight to the sidebar) |
+| `Enter` | On a file header, toggle its fold (open a collapsed file / collapse an open one); on a line it does nothing |
 | `Ctrl-D` / `Ctrl-U` | Half-page down / up |
 | `Space` / `PageDown`, `PageUp` | Page down / up |
 | `g` / `G` (or `Home` / `End`) | First / last line |

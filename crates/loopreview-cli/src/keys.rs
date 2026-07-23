@@ -129,7 +129,7 @@ impl Action {
             Action::NextHunk => "Next hunk",
             Action::PrevHunk => "Previous hunk",
             Action::NavIn => "Go in: expand, or move into",
-            Action::NavOut => "Go out: fold, or move to the header",
+            Action::NavOut => "Go out: to the header, then the sidebar",
             Action::ScrollLeft => "Scroll the diff left",
             Action::ScrollRight => "Scroll the diff right",
             Action::ToggleLayout => "Toggle unified / side-by-side",
@@ -137,7 +137,7 @@ impl Action {
             Action::Suggest => "Suggest a change to the line or selection",
             Action::Reply => "Reply to the thread",
             Action::Resolve => "Resolve or reopen the thread",
-            Action::Fold => "Fold / unfold",
+            Action::Fold => "Fold / unfold (Enter also toggles a file header)",
             Action::Select => "Start / cancel a line selection",
             Action::CloseReview => "Close (delete) the review",
             Action::Delete => "Withdraw a draft/local comment, or delete your published one",
@@ -199,7 +199,6 @@ const FIXED: &[(&str, Action)] = &[
     ("home", Action::Top),
     ("end", Action::Bottom),
     ("right", Action::NavIn),
-    ("enter", Action::NavIn),
     ("left", Action::NavOut),
     ("}", Action::NextHunk),
     ("{", Action::PrevHunk),
@@ -209,8 +208,9 @@ const FIXED: &[(&str, Action)] = &[
 /// / `Ctrl-C`), the view switch (`Tab`), and the confirm-modal `y`. They cannot
 /// be reassigned to an action (a remap onto one is silently shadowed), so no
 /// remappable action's default may sit on one — the `defaults_avoid_structural`
-/// test enforces it. (`Enter` is reserved too, but as a fixed `NavIn` alternate,
-/// covered by `FIXED`; the finder and composer reserve their own modal keys.)
+/// test enforces it. (`Enter` is handled directly by the UI too: contextual —
+/// it toggles the fold on a file header and otherwise means `NavIn` — so it is
+/// not in the map; the finder and composer reserve their own modal keys.)
 #[cfg(test)]
 const STRUCTURAL: &[&str] = &["q", "esc", "ctrl+c", "tab", "y"];
 
@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn fixed_alternates_never_shadow_a_different_action() {
-        // A fixed alternate may intentionally duplicate a default (`enter` and
+        // A fixed alternate may intentionally duplicate a default (`right` and
         // `l` both mean NavIn), but must never bind a key that a default already
         // gives to a *different* action.
         let defaults: HashMap<(KeyCode, KeyModifiers), Action> = DEFAULTS

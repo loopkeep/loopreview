@@ -1756,6 +1756,20 @@ impl App {
         }
         self.status = None;
 
+        // Enter is handled directly, not through the keymap: on a Files-view file
+        // header it toggles that file's fold (the tree-UI convention — `h`/`l` are
+        // pure movement now), and everywhere else it keeps its `NavIn` meaning
+        // (expand/enter a thread, activate a sidebar row). Comment- and diff-line
+        // Enter is unchanged: `NavIn` is a no-op on a diff line.
+        if code == KeyCode::Enter {
+            if !in_sidebar && self.view == View::Files && self.cursor_is_header() {
+                self.set_file_collapsed(self.current_file(), None);
+            } else {
+                self.run_action(Action::NavIn);
+            }
+            return;
+        }
+
         // Resolve the remappable action and run it in the active context.
         let Some(action) = self.keymap.action(code, mods) else {
             return;
@@ -2817,10 +2831,11 @@ impl App {
         }
     }
 
-    /// `h` in the body: go one level out, in a hierarchy (nvim-tree style). On a
-    /// line, jump to the file's own header; an expanded header collapses; a
-    /// collapsed header moves focus to the sidebar (when it is showing). `b` is
-    /// the direct jump to the sidebar for when the cascade is more than you want.
+    /// `h` in the body: step one level out, in a hierarchy (nvim-tree style) —
+    /// pure movement, no folding (folding is Enter's / `o`'s job now). On a line,
+    /// jump to the file's own header; on a header (expanded or collapsed), move
+    /// focus to the sidebar when it is showing. `b` is the direct jump to the
+    /// sidebar for when the cascade is more than you want.
     fn nav_out(&mut self) {
         let file = self.current_file();
         if !self.cursor_is_header() {
@@ -2829,17 +2844,8 @@ impl App {
             }
             return;
         }
-        let collapsed = self
-            .diff
-            .files
-            .get(file)
-            .is_some_and(|f| self.collapsed_files.contains(f.display_path()));
-        if collapsed {
-            if self.sidebar_width(self.body_width.get()).is_some() {
-                self.focus_sidebar();
-            }
-        } else {
-            self.set_file_collapsed(file, Some(true));
+        if self.sidebar_width(self.body_width.get()).is_some() {
+            self.focus_sidebar();
         }
     }
 
@@ -3343,7 +3349,8 @@ impl App {
                 self.follow_conv();
             }
             // h: an open thread collapses; a collapsed one steps out to the
-            // thread index — the same cascade as a file header in the Files view.
+            // thread index. (The Files view moved folding onto Enter; the
+            // Conversation cascade still folds here — see the impl note.)
             Action::NavOut => {
                 if self.selected_thread().is_some() && !self.selected_collapsed() {
                     self.fold_selected(true);
@@ -5715,6 +5722,10 @@ impl App {
             && self
                 .selected_thread()
                 .is_some_and(|t| self.review.threads[t].anchor == Anchor::Review);
+        // On a Files-view file header, Enter is the tree-convention fold key, so
+        // the fold hint reads `enter fold` there (only on a header). `o` still
+        // folds everywhere and leads the hint off a header.
+        let on_files_header = !in_sidebar && self.view == View::Files && self.cursor_is_header();
         let mut parts = Vec::new();
         for (action, label) in candidates {
             if parts.len() >= 6 {
@@ -5732,7 +5743,12 @@ impl App {
                 } else {
                     (*label).to_string()
                 };
-                parts.push(format!("{} {shown}", key(*action)));
+                let key_label = if *action == Fold && on_files_header {
+                    "enter".to_string()
+                } else {
+                    key(*action)
+                };
+                parts.push(format!("{key_label} {shown}"));
             }
         }
         parts.join(" · ")
@@ -10731,11 +10747,21 @@ mod tests {
         // h jumps from a line back to its header.
         app.nav_out();
         assert!(app.cursor_is_header());
-        // h on an expanded header collapses the file (the hierarchy cascade).
+        // h on a header no longer folds — folding moved to Enter / `o`. With the
+        // sidebar hidden there is nowhere to step out to, so h leaves the cursor
+        // on the header and the file open.
         app.nav_out();
         assert!(
+            !app.collapsed_files.contains("a.rs"),
+            "h does not fold an open file"
+        );
+        assert!(app.cursor_is_header(), "h leaves the cursor on the header");
+
+        // Enter is what folds a file from its header (and re-expands it).
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
             app.collapsed_files.contains("a.rs"),
-            "h collapses an open file"
+            "Enter folds the file from its header"
         );
     }
 
@@ -10756,7 +10782,8 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         // A real draw wires up the sidebar; then key events drive the cascade
-        // line → header → fold → sidebar, checking focus at each step.
+        // line → header → sidebar (no fold hop — folding moved to Enter),
+        // checking focus at each step.
         let mut app = multi_file_app(&["a.rs", "b.rs"]);
         app.sidebar_override = Some(true);
         let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
@@ -10770,16 +10797,76 @@ mod tests {
         app.on_key(KeyCode::Char('h'), KeyModifiers::NONE);
         assert!(app.cursor_is_header());
         assert_eq!(app.focus, Focus::Body);
-        // h: an expanded header collapses the file.
-        app.on_key(KeyCode::Char('h'), KeyModifiers::NONE);
-        assert!(app.collapsed_files.contains("a.rs"));
-        assert_eq!(app.focus, Focus::Body);
-        // h: a collapsed header moves focus to the sidebar.
+        // h: a header steps straight out to the sidebar, without folding.
         app.on_key(KeyCode::Char('h'), KeyModifiers::NONE);
         assert_eq!(
             app.focus,
             Focus::Sidebar,
             "the h cascade reaches the sidebar"
+        );
+        assert!(
+            !app.collapsed_files.contains("a.rs"),
+            "h did not fold the file on its way out"
+        );
+    }
+
+    #[test]
+    fn enter_toggles_the_fold_on_a_file_header() {
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        app.sidebar_override = Some(false); // isolate from the sidebar
+        app.relayout();
+        app.cursor = 0; // a.rs header, expanded
+        assert!(app.cursor_is_header());
+        assert!(!app.collapsed_files.contains("a.rs"));
+
+        // Enter on an expanded header folds the file (cursor rests on the header).
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.collapsed_files.contains("a.rs"), "Enter folds the file");
+        assert!(app.cursor_is_header(), "the cursor stays on the header");
+
+        // Enter on the now-collapsed header re-expands it (a true toggle).
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            !app.collapsed_files.contains("a.rs"),
+            "Enter re-expands the collapsed file"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_non_header_line_does_not_fold() {
+        let mut app = multi_file_app(&["a.rs"]);
+        app.sidebar_override = Some(false);
+        app.relayout();
+        let line = app.file_first_line(0).expect("a.rs has a content line");
+        app.set_cursor(line);
+        assert!(!app.cursor_is_header());
+
+        // Enter on a diff line keeps its NavIn meaning (a no-op there): it must
+        // not fold the file, and must not move the cursor.
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            !app.collapsed_files.contains("a.rs"),
+            "Enter on a line does not fold the file"
+        );
+        assert_eq!(app.cursor, line, "Enter on a line does not move the cursor");
+    }
+
+    #[test]
+    fn enter_outside_a_files_header_still_navigates_in() {
+        // Enter keeps its NavIn role in the Conversation view: a collapsed thread
+        // expands (the file-header fold is Files-only, header-only).
+        let mut app = app_with_threads();
+        app.set_view(View::Conversation);
+        app.sidebar_override = Some(false);
+        app.focus = Focus::Body;
+        app.conv_cursor = 0;
+        app.fold_selected(true);
+        assert!(app.selected_collapsed(), "the thread starts collapsed");
+
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            !app.selected_collapsed(),
+            "Enter expands a collapsed thread (still NavIn outside a file header)"
         );
     }
 
@@ -11602,7 +11689,10 @@ mod tests {
         assert!(app.cursor_is_header());
         term.draw(|f| app.draw(f)).unwrap();
         let header = footer_text(&term);
-        assert!(header.contains("o fold"), "the header shows the fold hint");
+        assert!(
+            header.contains("enter fold"),
+            "the header shows the Enter fold hint: {header:?}"
+        );
         assert!(
             !header.contains("comment"),
             "and no comment hint on a header"
