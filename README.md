@@ -50,19 +50,31 @@ features use the `gh` CLI.
 
 ## Install
 
-### Prebuilt binaries
+```sh
+curl -fsSL https://loopkeep.run/lr.sh | sh
+```
 
-Download the archive for your platform from the
-[Releases](https://github.com/loopkeep/loopreview/releases) page
-(`.tar.gz` for macOS/Linux, `.zip` for Windows), unpack it, and put the
-`loopreview` binary (and its `lr` alias) somewhere on your `PATH`:
+This downloads the release for your platform, verifies it against the published
+`checksums.txt`, installs `loopreview` and its `lr` alias into `~/.local/bin`,
+and prints how to add that directory to your `PATH` if it isn't already. macOS
+and Linux, Apple silicon and x86-64. Override the destination with
+`LOOPREVIEW_BIN_DIR`, or pin a version with `LOOPREVIEW_VERSION`. Once installed,
+`lr update` keeps it current.
+
+Homebrew and `cargo-binstall` support are coming soon.
+
+### Manual download
+
+Prefer to place the binary yourself? Download the archive for your platform from
+the [Releases](https://github.com/loopkeep/loopreview/releases) page (`.tar.gz`
+for macOS/Linux, `.zip` for Windows) — this is also the route for Windows, which
+the script doesn't cover — then unpack it and put the `loopreview` binary (and
+its `lr` alias) somewhere on your `PATH`:
 
 ```sh
 tar xzf loopreview-*.tar.gz
 install -m755 loopreview lr ~/.local/bin/
 ```
-
-Homebrew and `cargo-binstall` support are coming soon.
 
 ### From source
 
