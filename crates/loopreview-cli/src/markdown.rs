@@ -92,16 +92,6 @@ struct DetailsFrame {
     has_summary: bool,
 }
 
-/// Render markdown `text` to styled lines (details always expanded). `wrap` is
-/// the wrap width, or `None` to keep each block on one (clipped) line.
-pub fn render(
-    text: &str,
-    wrap: Option<usize>,
-    highlighter: &Highlighter,
-) -> Vec<TextLine<'static>> {
-    render_rich(text, wrap, highlighter, &|_, _| true).lines
-}
-
 /// Render markdown with interactivity. `is_open(index, default_open)` decides
 /// whether the nth `<details>` is expanded — `default_open` is its `open`
 /// attribute, which the caller may override with session fold state.
@@ -1363,6 +1353,11 @@ mod tests {
     fn rich(src: &str, wrap: Option<usize>) -> Rendered {
         let hl = Highlighter::new();
         render_rich(src, wrap, &hl, &|_, default| default)
+    }
+
+    /// Lines-only render (details always expanded) — the common test shape.
+    fn render(text: &str, wrap: Option<usize>, hl: &Highlighter) -> Vec<TextLine<'static>> {
+        render_rich(text, wrap, hl, &|_, _| true).lines
     }
 
     #[test]

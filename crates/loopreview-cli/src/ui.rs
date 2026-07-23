@@ -740,6 +740,9 @@ struct App {
     submit: Option<SubmitModal>,
     /// Rendered inline block per thread, index-aligned to `review.threads`.
     comment_blocks: Vec<Vec<TextLine<'static>>>,
+    /// Per thread, the inline block's click regions (links/images/details toggles),
+    /// each region's `line` a block-line index; aligned to `comment_blocks`.
+    comment_block_regions: Vec<Vec<crate::markdown::MdRegion>>,
     /// Rendered Conversation block per thread (root, replies), same order.
     conv_blocks: Vec<Vec<TextLine<'static>>>,
     /// Per thread, the block-line index where each comment begins (root first,
@@ -901,7 +904,13 @@ impl App {
             .filter(|t| t.is_resolved())
             .map(|t| t.id.clone())
             .collect();
-        let comment_blocks = build_comment_blocks(&review, &highlighter, &collapsed);
+        let (comment_blocks, comment_block_regions) = build_comment_blocks(
+            &review,
+            &highlighter,
+            &collapsed,
+            &HashMap::new(),
+            &RefCell::new(HashMap::new()),
+        );
         let block_lens: Vec<usize> = comment_blocks.iter().map(Vec::len).collect();
         let layout = Layouts::build(&diff, &review, &block_lens, &HashSet::new());
         let outdated = outdated_flags(&review, &layout.placed);
@@ -953,6 +962,7 @@ impl App {
             input: None,
             submit: None,
             comment_blocks,
+            comment_block_regions,
             conv_blocks,
             conv_comment_starts,
             conv_block_regions,
@@ -1696,8 +1706,13 @@ impl App {
 
     fn apply_layout(&mut self, diff: Diff) {
         self.apply_default_folds();
-        self.comment_blocks =
-            build_comment_blocks(&self.review, &self.highlighter, &self.collapsed);
+        (self.comment_blocks, self.comment_block_regions) = build_comment_blocks(
+            &self.review,
+            &self.highlighter,
+            &self.collapsed,
+            &self.conv_folds,
+            &self.conv_effective,
+        );
         let block_lens: Vec<usize> = self.comment_blocks.iter().map(Vec::len).collect();
         let layout = Layouts::build(&diff, &self.review, &block_lens, &self.collapsed_files);
         self.thread_outdated = outdated_flags(&self.review, &layout.placed);
@@ -3940,20 +3955,59 @@ impl App {
 
     /// The thread whose inline comment header sits at Files body `row` (the first
     /// line of its comment block), for a fold-toggle click.
-    fn comment_header_at(&self, body_row: usize) -> Option<usize> {
+    /// The `(thread, block-line)` of the inline comment row at `body_row`, if any
+    /// (any line of the block, not just its header).
+    fn comment_block_at(&self, body_row: usize) -> Option<(usize, usize)> {
         if body_row >= self.body_height.get() {
             return None;
         }
         let i = self.scroll + body_row;
         if self.sbs() {
             match self.srows.get(i) {
-                Some(SRow::Comment(t, 0)) => Some(*t),
+                Some(SRow::Comment(t, k)) => Some((*t, *k)),
                 _ => None,
             }
         } else {
             match self.urows.get(i) {
-                Some(URow::Comment(t, 0)) => Some(*t),
+                Some(URow::Comment(t, k)) => Some((*t, *k)),
                 _ => None,
+            }
+        }
+    }
+
+    /// The click action on inline comment block-line `k` of thread `t` at column
+    /// `col`, from the cached inline regions.
+    fn inline_action_at(&self, t: usize, k: usize, col: u16) -> Option<crate::markdown::MdAction> {
+        self.comment_block_regions
+            .get(t)?
+            .iter()
+            .find(|r| r.line == k && col >= r.start && col < r.end)
+            .map(|r| r.action.clone())
+    }
+
+    /// Run an inline comment body click: open a URL, or fold/unfold that thread's
+    /// comment-body `<details>` (keyed like the Conversation, by thread + index).
+    fn run_inline_md_action(&mut self, thread: usize, action: crate::markdown::MdAction) {
+        match action {
+            crate::markdown::MdAction::Open(url) => {
+                self.status = Some(match (self.url_opener)(&url) {
+                    Ok(()) => format!("opened {url}"),
+                    Err(_) => format!("open it yourself: {url}"),
+                });
+            }
+            crate::markdown::MdAction::ToggleDetails(index) => {
+                let Some(id) = self.review.threads.get(thread).map(|t| t.id.clone()) else {
+                    return;
+                };
+                let key = (id, index);
+                let current = self
+                    .conv_effective
+                    .borrow()
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(false);
+                self.conv_folds.insert(key, !current);
+                self.relayout();
             }
         }
     }
@@ -5106,11 +5160,18 @@ impl App {
                     }
                     return;
                 }
-                // Files: an inline comment header toggles that thread's fold,
-                // distinct from a diff-line click (which moves the cursor).
-                if let Some(t) = self.comment_header_at(row) {
-                    let id = self.review.threads[t].id.clone();
-                    self.toggle_collapse(id);
+                // Files: an inline comment block. A link/image/details region on a
+                // body line acts; otherwise the header line (k == 0) toggles the
+                // thread fold, and a bare body-line click is a no-op.
+                if let Some((t, k)) = self.comment_block_at(row) {
+                    if let Some(action) = self.inline_action_at(t, k, col) {
+                        self.run_inline_md_action(t, action);
+                        return;
+                    }
+                    if k == 0 {
+                        let id = self.review.threads[t].id.clone();
+                        self.toggle_collapse(id);
+                    }
                     return;
                 }
                 if let Some(cursor) = self.cline_at_body(col, row) {
@@ -7791,16 +7852,26 @@ const EXCERPT_MAX: usize = 8;
 
 /// Render each thread's inline block (index-aligned to `review.threads`): a
 /// header naming the author and state, then the root comment's body as markdown.
+type CommentBlocksBuild = (
+    Vec<Vec<TextLine<'static>>>,
+    Vec<Vec<crate::markdown::MdRegion>>,
+);
+
 fn build_comment_blocks(
     review: &Review,
     highlighter: &Highlighter,
     collapsed: &HashSet<String>,
-) -> Vec<Vec<TextLine<'static>>> {
+    folds: &HashMap<(String, usize), bool>,
+    effective: &RefCell<HashMap<(String, usize), bool>>,
+) -> CommentBlocksBuild {
+    // The inline body prefix "  ▏ " is 4 display columns; a click region's column
+    // is offset past it.
+    const INLINE_INDENT: u16 = 4;
     let bar = Style::default().fg(COMMENT_BAR);
-    review
-        .threads
-        .iter()
-        .map(|thread| {
+    let mut blocks: Vec<Vec<TextLine<'static>>> = Vec::new();
+    let mut all_regions: Vec<Vec<crate::markdown::MdRegion>> = Vec::new();
+    for thread in &review.threads {
+        let block_regions = {
             let is_collapsed = collapsed.contains(&thread.id);
             let author = thread.root().map(|c| c.author.clone()).unwrap_or_default();
             let mut header = vec![
@@ -7837,18 +7908,45 @@ fn build_comment_blocks(
                 ));
             }
             let mut lines = vec![TextLine::from(header)];
+            let mut regions: Vec<crate::markdown::MdRegion> = Vec::new();
             if !is_collapsed && let Some(root) = thread.root() {
-                for body in
-                    crate::markdown::render(&root.body, Some(INLINE_COMMENT_WRAP), highlighter)
-                {
+                let is_open = |index: usize, default: bool| {
+                    let open = folds
+                        .get(&(thread.id.clone(), index))
+                        .copied()
+                        .unwrap_or(default);
+                    effective
+                        .borrow_mut()
+                        .insert((thread.id.clone(), index), open);
+                    open
+                };
+                let base = lines.len(); // body lines follow the header
+                let rendered = crate::markdown::render_rich(
+                    &root.body,
+                    Some(INLINE_COMMENT_WRAP),
+                    highlighter,
+                    &is_open,
+                );
+                for r in &rendered.regions {
+                    regions.push(crate::markdown::MdRegion {
+                        line: r.line + base,
+                        start: r.start + INLINE_INDENT,
+                        end: r.end + INLINE_INDENT,
+                        action: r.action.clone(),
+                    });
+                }
+                for body in rendered.lines {
                     let mut spans = vec![TextSpan::styled("  ▏ ", bar)];
                     spans.extend(body.spans);
                     lines.push(TextLine::from(spans));
                 }
             }
-            lines
-        })
-        .collect()
+            blocks.push(lines);
+            regions
+        };
+        all_regions.push(block_regions);
+    }
+    (blocks, all_regions)
 }
 
 /// Render each thread as a Conversation block (index-aligned to
@@ -13102,17 +13200,17 @@ mod tests {
             .iter()
             .position(|r| matches!(r, URow::Comment(0, 0)))
             .expect("an inline comment header row");
-        // The header row hit-tests as a comment header; a diff line does not.
-        assert_eq!(app.comment_header_at(hdr), Some(0));
+        // The header row hit-tests as a comment block (line 0); a diff line does not.
+        assert_eq!(app.comment_block_at(hdr), Some((0, 0)));
         let line_row = app
             .urows
             .iter()
             .position(|r| matches!(r, URow::Line { .. }))
             .expect("a diff line row");
         assert_eq!(
-            app.comment_header_at(line_row),
+            app.comment_block_at(line_row),
             None,
-            "a diff line is not a header"
+            "a diff line is not a comment block"
         );
         // Clicking the header folds the thread.
         let id = app.review.threads[0].id.clone();
@@ -14448,6 +14546,50 @@ mod tests {
         assert!(
             opened.contains("▾ More") && opened.contains("hidden line"),
             "the body shows after unfolding: {opened:?}"
+        );
+    }
+
+    #[test]
+    fn an_inline_comment_body_link_is_clickable() {
+        let mut app = pr_app();
+        app.review.threads.push(Thread {
+            id: "inl".into(),
+            anchor: Anchor::line("a.rs", Side::New, 2),
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: "c1".into(),
+                author: "octo".into(),
+                body: "see https://inline.example.com here".into(),
+                created_at: 0,
+                remote_id: Some("IC_1".into()),
+                kind: CommentKind::Published,
+            }],
+        });
+        app.collapsed.clear();
+        app.relayout();
+        // The inline comment block carries the link region (block-line relative).
+        let link = app.comment_block_regions[0]
+            .iter()
+            .find(|r| {
+                matches!(&r.action, crate::markdown::MdAction::Open(u) if u.contains("inline.example"))
+            })
+            .cloned()
+            .expect("an inline link region");
+        // Route the click through an injected recorder (never a real browser).
+        let opened = std::rc::Rc::new(RefCell::new(Vec::<String>::new()));
+        let sink = opened.clone();
+        app.url_opener = Box::new(move |u: &str| {
+            sink.borrow_mut().push(u.to_string());
+            Ok(())
+        });
+        let action = app
+            .inline_action_at(0, link.line, link.start)
+            .expect("the region is hit at its coordinates");
+        app.run_inline_md_action(0, action);
+        assert_eq!(
+            opened.borrow().as_slice(),
+            &["https://inline.example.com".to_string()],
+            "the inline link click routed to the opener"
         );
     }
 

@@ -235,9 +235,10 @@ Comment bodies and a pull request's or issue's description render as markdown �
 inline and fenced (syntax-highlighted) code, lists, block quotes, GitHub alerts
 (`> [!NOTE]` / `[!WARNING]` …), task lists (`- [ ]` / `- [x]`), tables, thematic
 breaks, footnotes, links and bare URLs, `[Image]` placeholders, and `<details>`
-folds. In the Overview and the Conversation, links and `[Image]` placeholders are
-clickable (they open on github.com); the Overview also folds a `<details>` on a
-click of its summary.
+folds. Everywhere markdown renders — the Overview, the Conversation, and inline
+comments in the diff — a link or `[Image]` placeholder opens on github.com when
+clicked, and a `<details>` folds or unfolds on a click of its summary (folds are
+per-session).
 
 ## Reviewing
 
