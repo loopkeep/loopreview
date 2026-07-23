@@ -24,6 +24,7 @@
 mod cmd;
 mod error;
 mod git;
+mod issue;
 mod pr;
 mod pull;
 mod push;
@@ -34,6 +35,7 @@ use std::path::{Path, PathBuf};
 use loopreview_core::{Comment, CommentKind, Thread};
 
 pub use error::GithubError;
+pub use issue::{ResolvedIssue, Subject};
 pub use pr::{
     IssueStatus, PrAuthor, PrQuery, PrRef, PrStatus, ResolvedPr, SubjectKind, parse_pr_query,
     subject_kind_from_issue_json,
@@ -104,6 +106,36 @@ impl GithubClient {
         match query {
             PrQuery::Detect => self.resolve_detected(),
             PrQuery::Ref(pr_ref) => self.resolve_ref(pr_ref),
+        }
+    }
+
+    /// Resolve a reference to its true subject — a pull request or an issue.
+    ///
+    /// `--detect` is a pull request by definition (a branch maps to a PR, not an
+    /// issue). For an explicit reference the type is decided by the API, never the
+    /// reference's look (GitHub redirects `/pull/N` ⇆ `/issues/N`): one
+    /// `GET /repos/{o}/{r}/issues/{n}` both classifies it (via the `pull_request`
+    /// key) and, for an issue, carries its facts — so the issue side needs no
+    /// second fetch.
+    pub fn resolve_subject(&self, query: &PrQuery) -> Result<Subject, GithubError> {
+        let pr_ref = match query {
+            PrQuery::Detect => return Ok(Subject::Pr(self.resolve_detected()?)),
+            PrQuery::Ref(pr_ref) => pr_ref,
+        };
+        let (owner, repo) = match (&pr_ref.owner, &pr_ref.repo) {
+            (Some(owner), Some(repo)) => (owner.clone(), repo.clone()),
+            _ => self.current_repo_slug()?,
+        };
+        let path = format!("repos/{owner}/{repo}/issues/{}", pr_ref.number);
+        let out = cmd::run_ok("gh", &["api", &path], &self.dir, None)?;
+        let kind = subject_kind_from_issue_json(&out)
+            .map_err(|e| GithubError::parse("gh api issues (subject kind)", e))?;
+        match kind {
+            SubjectKind::Pr => Ok(Subject::Pr(self.resolve_ref(pr_ref)?)),
+            SubjectKind::Issue => Ok(Subject::Issue(
+                ResolvedIssue::from_json(&out, &owner, &repo)
+                    .map_err(|e| GithubError::parse("gh api issues", e))?,
+            )),
         }
     }
 
@@ -266,6 +298,31 @@ impl GithubClient {
             &issue_comments,
             &reviews,
         ))
+    }
+
+    /// Fetch an issue's conversation — its flat comment timeline mapped onto the
+    /// same [`Thread`] model a PR conversation uses (no review threads, no
+    /// summaries; an issue has neither).
+    pub fn pull_issue(&self, issue: &ResolvedIssue) -> Result<Vec<Thread>, GithubError> {
+        let path = format!(
+            "repos/{}/{}/issues/{}/comments",
+            issue.owner, issue.repo, issue.number
+        );
+        let out = cmd::run_ok("gh", &["api", "--paginate", &path], &self.dir, None)?;
+        let comments = pull::parse_issue_comments(&out)?;
+        Ok(pull::build_threads(&[], &comments, &[]))
+    }
+
+    /// Re-fetch an issue's facts (state / body / …) — the refresh path, so the
+    /// header badge and Overview follow a close or an edit on Ctrl-R.
+    pub fn refresh_issue(&self, issue: &ResolvedIssue) -> Result<ResolvedIssue, GithubError> {
+        let path = format!(
+            "repos/{}/{}/issues/{}",
+            issue.owner, issue.repo, issue.number
+        );
+        let out = cmd::run_ok("gh", &["api", &path], &self.dir, None)?;
+        ResolvedIssue::from_json(&out, &issue.owner, &issue.repo)
+            .map_err(|e| GithubError::parse("gh api issues (refresh)", e))
     }
 
     /// Fetch the inline review threads via GraphQL.
@@ -491,12 +548,31 @@ impl GithubClient {
         pr: &ResolvedPr,
         body: &str,
     ) -> Result<Comment, GithubError> {
+        self.post_issue_comment(&pr.owner, &pr.repo, pr.number, body)
+    }
+
+    /// Post one new comment to an issue's conversation — the same endpoint as a
+    /// PR conversation comment, with the issue's coordinates.
+    pub fn create_issue_comment(
+        &self,
+        issue: &ResolvedIssue,
+        body: &str,
+    ) -> Result<Comment, GithubError> {
+        self.post_issue_comment(&issue.owner, &issue.repo, issue.number, body)
+    }
+
+    /// `POST /repos/{owner}/{repo}/issues/{number}/comments` — the shared path for
+    /// a PR-conversation and an issue comment.
+    fn post_issue_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<Comment, GithubError> {
         let payload = serde_json::to_string(&push::BodyPayload { body })
             .map_err(|e| GithubError::parse("conversation comment payload", e))?;
-        let path = format!(
-            "repos/{}/{}/issues/{}/comments",
-            pr.owner, pr.repo, pr.number
-        );
+        let path = format!("repos/{owner}/{repo}/issues/{number}/comments");
         let out = cmd::run_ok(
             "gh",
             &["api", "-X", "POST", &path, "--input", "-"],
@@ -551,7 +627,29 @@ impl GithubClient {
         endpoint: CommentEndpoint,
         body: &str,
     ) -> Result<(), GithubError> {
-        let (method, path) = endpoint.edit_request(&pr.owner, &pr.repo, pr.number);
+        self.edit_comment_at(&pr.owner, &pr.repo, pr.number, endpoint, body)
+    }
+
+    /// Edit a published issue comment — the same routing with the issue's
+    /// coordinates (an issue comment is a `CommentEndpoint::IssueComment`).
+    pub fn edit_issue_comment(
+        &self,
+        issue: &ResolvedIssue,
+        endpoint: CommentEndpoint,
+        body: &str,
+    ) -> Result<(), GithubError> {
+        self.edit_comment_at(&issue.owner, &issue.repo, issue.number, endpoint, body)
+    }
+
+    fn edit_comment_at(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        endpoint: CommentEndpoint,
+        body: &str,
+    ) -> Result<(), GithubError> {
+        let (method, path) = endpoint.edit_request(owner, repo, number);
         let payload = serde_json::to_string(&push::BodyPayload { body })
             .map_err(|e| GithubError::parse("edit payload", e))?;
         cmd::run_ok(
@@ -571,14 +669,32 @@ impl GithubClient {
         pr: &ResolvedPr,
         endpoint: CommentEndpoint,
     ) -> Result<(), GithubError> {
-        let path =
-            endpoint
-                .delete_path(&pr.owner, &pr.repo)
-                .ok_or_else(|| GithubError::Command {
-                    program: "gh".into(),
-                    code: 1,
-                    stderr: "a submitted review's summary cannot be deleted on GitHub".into(),
-                })?;
+        self.delete_comment_at(&pr.owner, &pr.repo, endpoint)
+    }
+
+    /// Delete a published issue comment — the same routing with the issue's
+    /// coordinates.
+    pub fn delete_issue_comment(
+        &self,
+        issue: &ResolvedIssue,
+        endpoint: CommentEndpoint,
+    ) -> Result<(), GithubError> {
+        self.delete_comment_at(&issue.owner, &issue.repo, endpoint)
+    }
+
+    fn delete_comment_at(
+        &self,
+        owner: &str,
+        repo: &str,
+        endpoint: CommentEndpoint,
+    ) -> Result<(), GithubError> {
+        let path = endpoint
+            .delete_path(owner, repo)
+            .ok_or_else(|| GithubError::Command {
+                program: "gh".into(),
+                code: 1,
+                stderr: "a submitted review's summary cannot be deleted on GitHub".into(),
+            })?;
         cmd::run_ok("gh", &["api", "-X", "DELETE", &path], &self.dir, None)?;
         Ok(())
     }
