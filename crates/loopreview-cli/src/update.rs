@@ -697,6 +697,12 @@ impl TempDir {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let dir = base.join(format!(".loopreview-update-{}-{nanos}", std::process::id()));
+        TempDir::create_private(dir)
+    }
+
+    /// Create the private working directory `dir` (restricted to its owner, 0700,
+    /// on Unix) and remove it on drop. Making the name unique is the caller's job.
+    fn create_private(dir: PathBuf) -> Result<TempDir> {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         #[cfg(unix)]
         {
@@ -709,9 +715,27 @@ impl TempDir {
 
     /// Create a uniquely named temp directory under the system temp dir (tests
     /// only; the update itself stages under the install directory).
+    ///
+    /// Parallel tests share this process's pid and can read the same
+    /// coarse-resolution clock, so a `{pid}-{nanos}` name alone occasionally
+    /// collides across threads — and because `create_dir_all` is idempotent both
+    /// callers "succeed" on one shared directory, only for the first `Drop` to
+    /// sweep it out from under the other. A process-wide counter breaks those ties
+    /// for good, keeping every test's staging area its own.
     #[cfg(test)]
     fn new() -> Result<TempDir> {
-        TempDir::new_in(&std::env::temp_dir())
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            ".loopreview-update-test-{}-{nanos}-{seq}",
+            std::process::id()
+        ));
+        TempDir::create_private(dir)
     }
 
     /// The directory's path.
