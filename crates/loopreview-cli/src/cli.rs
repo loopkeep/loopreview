@@ -244,7 +244,8 @@ pub enum SessionVerb {
 /// The `lr session comment` actions.
 #[derive(Subcommand, Debug)]
 pub enum CommentAction {
-    /// Add a comment thread at a line, or (with --conversation) on the PR as a whole.
+    /// Add a comment thread at a line, or (with --conversation) on the subject as
+    /// a whole (a pull request or an issue).
     Add {
         #[command(flatten)]
         target: Target,
@@ -257,7 +258,8 @@ pub enum CommentAction {
         /// The 1-based line number (omit with --conversation).
         #[arg(long)]
         line: Option<u32>,
-        /// Comment on the PR conversation as a whole, not tied to a line.
+        /// Comment on the conversation as a whole (a pull request or an issue), not
+        /// tied to a line.
         #[arg(long)]
         conversation: bool,
         /// The comment body (markdown).
@@ -393,7 +395,9 @@ pub enum Action {
     PatchFile(PathBuf),
     /// `lr patch`: a patch from standard input.
     PatchStdin,
-    /// A GitHub pull request, from a bare `lr <ref>` or `lr --detect`.
+    /// A GitHub subject — a pull request or an issue — from a bare `lr <ref>`, or
+    /// the current branch's pull request from `lr --detect`. The type is resolved
+    /// at load.
     Pr { query: Option<String>, detect: bool },
     /// A reserved verb that is not implemented yet.
     NotYet(&'static str),
@@ -605,6 +609,22 @@ mod tests {
                 .no_watch
         );
         assert!(!Cli::parse_from(["lr", "diff"]).resolve().no_watch);
+    }
+
+    #[test]
+    fn exclude_untracked_is_a_global_flag() {
+        // `global = true`, so it parses on bare `lr` and alongside a subcommand.
+        assert!(
+            Cli::parse_from(["lr", "--exclude-untracked"])
+                .resolve()
+                .exclude_untracked
+        );
+        assert!(
+            Cli::parse_from(["lr", "diff", "--exclude-untracked"])
+                .resolve()
+                .exclude_untracked
+        );
+        assert!(!Cli::parse_from(["lr", "diff"]).resolve().exclude_untracked);
     }
 
     #[test]

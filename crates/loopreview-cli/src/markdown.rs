@@ -508,6 +508,9 @@ fn render_table(
             None => break, // all at the floor — accept a slight overflow
         }
     }
+    // Known limitation: many columns in a very narrow pane can sum past the width
+    // even with every column at MIN_COL, so the rightmost cells visually clip.
+    // Accepted for now — a readable minimum beats reflowing a table into nonsense.
 
     let mut out = table_row(
         &table.head,

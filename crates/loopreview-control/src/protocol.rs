@@ -225,9 +225,9 @@ pub struct SessionInfo {
     pub repo: Option<String>,
     /// A human-readable description of the diff source.
     pub source: String,
-    /// The pull request (or, in future, issue) under review — absent for a plain
-    /// diff. Optional and skipped when absent, so older clients decode either way.
-    /// Boxed to keep `SessionInfo` (and so the `Response` enum) small.
+    /// The pull request or issue under review — absent for a plain diff. Optional
+    /// and skipped when absent, so older clients decode either way. Boxed to keep
+    /// `SessionInfo` (and so the `Response` enum) small.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<Box<SubjectInfo>>,
 }
@@ -236,7 +236,7 @@ pub struct SessionInfo {
 /// an agent can read the change's intent before reviewing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubjectInfo {
-    /// `pr` today; `issue` once issue review lands.
+    /// The subject kind: `pr` or `issue`.
     pub kind: String,
     /// The pull-request / issue number.
     pub number: u64,
@@ -262,7 +262,8 @@ pub struct SubjectInfo {
 /// The human reviewer's current focus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextInfo {
-    /// The active view: `files` or `conversation`.
+    /// The active view: `overview`, `files`, or `conversation` (an issue has no
+    /// `files`).
     pub view: String,
     /// The file under the cursor, if any.
     pub file: Option<String>,

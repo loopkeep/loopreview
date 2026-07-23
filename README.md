@@ -39,9 +39,9 @@ features use the `gh` CLI.
   two-way comment sync, drafts that persist across sessions, and a submit modal
   (Comment / Approve / Request changes / Pending). The header shows the PR's
   status (Draft / Open / Merged / Closed) beside its `#number`, and it follows a
-  transition on refresh. An **Overview** tab (PR only) shows the PR's facts —
-  number, status, title, author, `base ← head`, dates — and its rendered
-  description, read-only.
+  transition on refresh. An **Overview** tab (on a pull request or an issue) shows
+  the subject's facts — number, status, title, author, `base ← head` (pull
+  requests), dates — and its rendered description, read-only.
 - **Agent control plane** — a running review hosts a local socket so an agent can
   read the diff structure, move your cursor, leave local notes (or drafts to
   submit), and block on review events (`lr session …`).
@@ -120,13 +120,13 @@ files from a working-tree review.
 | Key | Action |
 | --- | --- |
 | `q` / `Esc` / `Ctrl-C` | Quit |
-| `Tab` / `Shift+Tab` | Cycle the views forward / back (a repo diff has Files ⇆ Conversation; a pull request adds an **Overview** tab on the left, so Files → Shift+Tab reaches Overview and Tab reaches Conversation; a plain patch has no tabs) |
+| `Tab` / `Shift+Tab` | Cycle the views forward / back (a repo diff has Files ⇆ Conversation; a pull request adds an **Overview** tab on the left, so Files → Shift+Tab reaches Overview and Tab reaches Conversation; an issue has Overview ⇆ Conversation with no Files and opens on Overview; a plain patch has no tabs) |
 | `?` | Open the command palette — a searchable list of every action with its current key; actions that apply right now are listed first, the rest greyed |
 | `b` | Toggle the file-explorer sidebar |
 | `Ctrl-P` | Open the fuzzy file finder |
-| `Ctrl-O` | Open the current spot on github.com — a published comment under the Conversation cursor deep-links to it, otherwise the PR page (pull requests) |
-| `Ctrl-R` | Refresh from GitHub (pull requests) |
-| `Ctrl-S` | Open the submit modal (pull requests) |
+| `Ctrl-O` | Open the current spot on github.com — a published comment under the Conversation cursor deep-links to it, otherwise the subject's page (pull requests and issues) |
+| `Ctrl-R` | Refresh from GitHub (pull requests and issues) |
+| `Ctrl-S` | Open the submit modal (pull requests), or send your queued comments (issues) |
 
 **Finding your way.** Two things share the work, so you never have to memorize
 keys. The footer shows just the few actions worth reaching for at the cursor's
@@ -137,6 +137,17 @@ ones that apply here listed first and the rest greyed with the reason. So you ca
 just press `?`, type what you want, and run it. In the palette, type to
 fuzzy-filter, `↑`/`↓` (or `Ctrl-N`/`Ctrl-P`) to move, `Enter` to run the selected
 action (an inapplicable one reports why), `Esc` to close.
+
+**Overview view** (pull requests and issues)
+
+The leftmost tab: the subject's facts and rendered description, read-only. It is
+scroll-only, and has no sidebar.
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` (or `↓` / `↑`) | Scroll a line |
+| `Ctrl-D` / `Ctrl-U` (or `Space` / `PageUp`) | Scroll a half / full page |
+| `g` / `G` (or `Home` / `End`) | Top / bottom |
 
 **Files (diff) view**
 
@@ -175,7 +186,8 @@ clear where your keys will land. Each file row carries a change-status letter
 its `+`/`−` line counts (plus a badge when it has comments); files are grouped
 under dim directory header rows (root files first, without a header). The header
 rows are labels only — the cursor and clicks land on files. Pin a fixed width
-with the `sidebar_width` config key.
+with the `sidebar_width` config key. The Overview view has no sidebar (there are
+no files to list).
 
 | Key | Action |
 | --- | --- |
@@ -198,12 +210,12 @@ move; `Enter` opens the file; `Esc` closes.
 | `l` (or `→`) | Go in: expand a folded thread, or scroll an open one to its top |
 | `h` (or `←`) | Go out to the thread index (pure movement, never folds — `b` also jumps there) |
 | `Enter` | On a thread's header (its root), toggle its fold (open ⇆ collapsed); on a reply it does nothing |
-| `c` | New conversation comment — a note tied to nothing in the diff (a draft on a pull request, sent as a PR comment; a local note otherwise) |
+| `c` | New conversation comment — a note tied to nothing in the diff (a draft on a pull request or an issue, sent as a comment there; a local note otherwise) |
 | `r` | Reply to the selected thread (a reply to a conversation thread always stays local — the footer shows `r local reply`) |
 | `x` | Resolve / reopen |
 | `e` | Edit your own comment at the cursor (root or reply; a published edit syncs to GitHub) |
 | `d` | Remove your own comment at the cursor (a draft reply removes itself, a draft root its thread; your own published comment is deleted from GitHub, with confirmation) |
-| `t` | Toggle the comment at the cursor between a draft and a local note — a reply needs its root to be a draft first, and a conversation reply can't (it stays local) (pull requests) |
+| `t` | Toggle the comment at the cursor between a draft and a local note — a reply needs its root to be a draft first, and a conversation reply can't (it stays local) (pull requests and issues) |
 | `o` | Collapse / expand |
 | `X` | Close the review (asks to confirm) |
 
@@ -216,7 +228,7 @@ key that saves. Prefer `Enter` to save? Set `composer_enter = "save"` (below) �
 worth it only where your terminal reports `Shift+Enter` (the Kitty protocol),
 which then becomes the newline (with `Alt+Enter` as a fallback).
 
-Comment bodies and the PR description render as markdown — headings, emphasis,
+Comment bodies and a pull request's or issue's description render as markdown — headings, emphasis,
 inline and fenced (syntax-highlighted) code, lists, block quotes, GitHub alerts
 (`> [!NOTE]` / `[!WARNING]` …), task lists (`- [ ]` / `- [x]`), and tables.
 

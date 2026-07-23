@@ -12,7 +12,8 @@ already has open, through its local socket.
 
 Each running `lr` hosts its own socket and registers itself; there is no daemon.
 If no session is live, ask the human to open one (`lr` in their repository, or
-`lr <ref>` — a number, `#N`, `owner/repo#N`, or a URL — for a pull request).
+`lr <ref>` — a number, `#N`, `owner/repo#N`, or a URL — for a pull request or an
+issue; the type is resolved automatically).
 
 ## Golden workflow
 
@@ -66,8 +67,9 @@ lr session comment list [<id>|--repo .] [--json]
   (its content is the conversation and the `subject` body), and `navigate --file`
   has nothing to point at. Read the `subject` and the threads; comment with
   `comment add --conversation` (a line comment has no meaning without files).
-- `context` reports the human's current view (`files`/`conversation`), the line
-  under their cursor, the thread there (if any), and `event_seq` — the latest
+- `context` reports the human's current view (`overview`/`files`/`conversation`;
+  an issue has no `files`), the line under their cursor, the thread there (if any),
+  and `event_seq` — the latest
   event number, which you pass to `wait --after` to avoid missing events.
 - `review --json` returns the file/hunk structure and every thread. It omits line
   text by default to keep your context small; add `--patch` for the raw diff
@@ -93,12 +95,14 @@ outdated or file-level anchor opens the Conversation view instead of a diff line
 
 Your comments carry a **kind**. By default they are **local** — attached to the
 review for the human to read, but never sent to GitHub. Pass `--draft` to make a
-comment a **draft**: on a pull request the human can submit drafts to GitHub
-(Ctrl-S in the TUI). This split is deliberate — an agent converses in local
-notes, and marks the few worth publishing with `--draft`, so nothing reaches
-GitHub by accident. Outside a pull request there is nowhere to submit, so
-`--draft` is a no-op and everything stays local. You never publish, and you
-cannot resolve a published pull-request thread — that stays the human's call.
+comment a **draft**: on a pull request or an issue the human can send drafts to
+GitHub with Ctrl-S in the TUI (the submit modal on a pull request, a direct send
+on an issue). This split is deliberate — an agent converses in local notes, and
+marks the few worth publishing with `--draft`, so nothing reaches GitHub by
+accident. Outside a GitHub subject (a plain diff or a local review) there is
+nowhere to send, so `--draft` is a no-op and everything stays local. You never
+publish, and you cannot resolve a published pull-request thread — that stays the
+human's call.
 
 `--author` names who is speaking; it defaults to `agent`. Prefer a stable,
 specific name (your role or model) so a multi-agent conversation reads clearly.
@@ -121,19 +125,23 @@ lr session comment rm --repo . --comment <id>                     # withdraw a l
   Use `--conversation` instead of `--file`/`--line` to leave a comment on the
   whole change (an overall verdict or summary, tied to no line) — the two are
   mutually exclusive. Like any agent comment it is local by default; `--draft`
-  queues it to submit as a PR comment.
+  queues it to send as a pull-request or issue comment. On an issue (no diff)
+  `--file`/`--line` have nothing to bind to, so `--conversation` is the only way
+  to comment.
 - Comment `--body` is **markdown**: headings, emphasis, inline/fenced code, lists,
   block quotes, GitHub alerts (`> [!NOTE]` / `[!TIP]` / `[!IMPORTANT]` /
   `[!WARNING]` / `[!CAUTION]`), task lists (`- [ ]`), and tables all render.
   Reach for an alert only where it genuinely earns attention — a real risk or a
   must-read caveat — not as decoration on ordinary notes.
-- `--draft` queues a comment for the human to submit; without it the comment (or
-  reply) is a local note. `--draft` only matters on a pull request. A `--draft`
-  **reply** is refused under a local-note root — it could never be sent while the
-  root stays off GitHub — so reply without `--draft`, or have the root promoted
-  to a draft first. A reply to a **conversation** thread (one not tied to a line)
-  is always local: `--draft` on it is refused, since GitHub's conversation is
-  flat and the reply would post as an unrelated top-level comment.
+- `--draft` queues a comment for the human to send; without it the comment (or
+  reply) is a local note. `--draft` matters on a pull request or an issue (a plain
+  diff or local review has nowhere to send). A `--draft` **reply** is refused under
+  a local-note root — it could never be sent while the root stays off GitHub — so
+  reply without `--draft`, or have the root promoted to a draft first. A reply to a
+  **conversation** thread (one not tied to a line) is always local: `--draft` on it
+  is refused, since GitHub's conversation is flat and the reply would post as an
+  unrelated top-level comment. (An issue's whole thread is that flat conversation,
+  so send new issue comments with `--conversation --draft`, not replies.)
 - `comment edit --comment <id> --body <text>` replaces the body of one of your
   own unpublished comments (a draft or local note, root or reply). It refuses a
   published comment (writing to GitHub is the human's action) and another
