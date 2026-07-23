@@ -234,19 +234,22 @@ pub enum SessionVerb {
 /// The `lr session comment` actions.
 #[derive(Subcommand, Debug)]
 pub enum CommentAction {
-    /// Add a comment thread at a line.
+    /// Add a comment thread at a line, or (with --conversation) on the PR as a whole.
     Add {
         #[command(flatten)]
         target: Target,
-        /// The file to comment on.
+        /// The file to comment on (a line comment; omit with --conversation).
         #[arg(long)]
-        file: String,
+        file: Option<String>,
         /// Which side the line is measured on.
         #[arg(long, value_enum, default_value_t = LineSide::New)]
         side: LineSide,
-        /// The 1-based line number.
+        /// The 1-based line number (omit with --conversation).
         #[arg(long)]
-        line: u32,
+        line: Option<u32>,
+        /// Comment on the PR conversation as a whole, not tied to a line.
+        #[arg(long)]
+        conversation: bool,
         /// The comment body (markdown).
         #[arg(long)]
         body: String,
@@ -602,8 +605,8 @@ mod tests {
                             ..
                         },
                 } => {
-                    assert_eq!(file, "a.rs");
-                    assert_eq!(line, 10);
+                    assert_eq!(file.as_deref(), Some("a.rs"));
+                    assert_eq!(line, Some(10));
                     assert_eq!(author.as_deref(), Some("agent"));
                     assert_eq!(side, LineSide::New);
                 }

@@ -91,6 +91,8 @@ lr session comment add --repo . --file src/app.rs --line 120 \
   --body "This retries without a backoff — is that intended under load?"
 lr session comment add --repo . --file src/app.rs --line 120 --draft --author reviewer-bot \
   --body "Nit: use the shared client here."         # queued for the human to submit
+lr session comment add --repo . --conversation \
+  --body "Overall the retry story is solid; one nit inline."   # a note on the whole change, no line
 lr session comment reply --repo . --thread <id> --body "Good point — flagged."
 lr session comment edit --repo . --comment <id> --body "Revised: use the shared client."  # fix your own wording
 lr session comment resolve --repo . --thread <id> --author agent   # local reviews and your own drafts
@@ -99,6 +101,10 @@ lr session comment rm --repo . --comment <id>                     # withdraw a l
 
 - `comment add` needs `--file`, `--line`, and `--body`; `--side` defaults to
   `new` and `--author` to `agent`. The line must be one shown in the current diff.
+  Use `--conversation` instead of `--file`/`--line` to leave a comment on the
+  whole change (an overall verdict or summary, tied to no line) — the two are
+  mutually exclusive. Like any agent comment it is local by default; `--draft`
+  queues it to submit as a PR comment.
 - `--draft` queues a comment for the human to submit; without it the comment (or
   reply) is a local note. `--draft` only matters on a pull request. A `--draft`
   **reply** is refused under a local-note root — it could never be sent while the

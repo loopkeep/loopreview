@@ -4002,13 +4002,37 @@ impl App {
         if self.store.is_none() && self.pr.is_none() {
             return Err("comments need a git repository or a pull request".to_string());
         }
+        // A conversation comment (Anchor::Review) is tied to nothing in the diff —
+        // an agent's overall note (a run verdict, a summary). It takes no line.
+        if add.conversation {
+            if add.file.is_some() || add.line.is_some() {
+                return Err("--conversation takes no --file/--line".to_string());
+            }
+            let kind = self.agent_kind(add.draft);
+            let (thread, comment) = self.add_thread(Anchor::Review, &add.author, &add.body, kind);
+            let done = self.persist("comment added").unwrap_or_default();
+            self.relayout();
+            self.status = Some(format!("agent: {done} (conversation)"));
+            return Ok(protocol::CommentResult {
+                thread,
+                comment,
+                draft: kind == CommentKind::Draft,
+            });
+        }
+        // Otherwise it is a line comment, which needs a file and a line.
+        let (Some(file), Some(line)) = (add.file.as_deref(), add.line) else {
+            return Err(
+                "a line comment needs --file and --line (or use --conversation)".to_string(),
+            );
+        };
+        let side = add.side.unwrap_or(Side::New);
         // Locate the line so the anchor captures its commit and context.
         let file_idx = self
             .diff
             .files
             .iter()
-            .position(|f| f.display_path() == add.file)
-            .ok_or_else(|| format!("no file {} in the current review", add.file))?;
+            .position(|f| f.display_path() == file)
+            .ok_or_else(|| format!("no file {file} in the current review"))?;
         let found = self.diff.files[file_idx]
             .hunks
             .iter()
@@ -4017,34 +4041,32 @@ impl App {
                 h.lines
                     .iter()
                     .position(|l| {
-                        let n = if add.side == Side::New {
+                        let n = if side == Side::New {
                             l.new_lineno
                         } else {
                             l.old_lineno
                         };
-                        n == Some(add.line)
+                        n == Some(line)
                     })
                     .map(|li| (hi, li))
             });
         let (hi, li) = found.ok_or_else(|| {
             format!(
-                "line {} ({}) is not shown in the diff for {}",
-                add.line,
-                if add.side == Side::New { "new" } else { "old" },
-                add.file
+                "line {line} ({}) is not shown in the diff for {file}",
+                if side == Side::New { "new" } else { "old" },
             )
         })?;
-        let commit = if add.side == Side::New {
+        let commit = if side == Side::New {
             self.diff.provenance.head.clone()
         } else {
             self.diff.provenance.base.clone()
         };
         let context = context_snippet(&self.diff.files[file_idx].hunks[hi], li);
         let anchor = Anchor::Line {
-            file: add.file.clone(),
-            side: add.side,
-            start: add.line,
-            end: add.line,
+            file: file.to_string(),
+            side,
+            start: line,
+            end: line,
             commit,
             context,
         };
@@ -4052,7 +4074,7 @@ impl App {
         let (thread, comment) = self.add_thread(anchor, &add.author, &add.body, kind);
         let done = self.persist("comment added").unwrap_or_default();
         self.relayout();
-        self.status = Some(format!("agent: {done} ({}:{})", add.file, add.line));
+        self.status = Some(format!("agent: {done} ({file}:{line})"));
         Ok(protocol::CommentResult {
             thread,
             comment,
@@ -8014,12 +8036,13 @@ mod tests {
         let mut app = sample_app();
         let before = app.events.latest_seq();
         let response = app.handle_control(Request::CommentAdd(protocol::CommentAdd {
-            file: "a.rs".into(),
-            side: Side::New,
-            line: 2,
+            file: Some("a.rs".into()),
+            side: Some(Side::New),
+            line: Some(2),
             body: "look here".into(),
             author: "agent".into(),
             draft: false,
+            conversation: false,
         }));
         match response {
             Response::Ok(Reply::Comment(result)) => {
@@ -8039,12 +8062,13 @@ mod tests {
     fn control_comment_rm_removes_a_draft_thread() {
         let mut app = sample_app();
         let add = app.handle_control(Request::CommentAdd(protocol::CommentAdd {
-            file: "a.rs".into(),
-            side: Side::New,
-            line: 2,
+            file: Some("a.rs".into()),
+            side: Some(Side::New),
+            line: Some(2),
             body: "note".into(),
             author: "agent".into(),
             draft: false,
+            conversation: false,
         }));
         let thread_id = match add {
             Response::Ok(Reply::Comment(r)) => r.thread,
@@ -8117,12 +8141,13 @@ mod tests {
     fn control_comment_edit_replaces_own_comment_body() {
         let mut app = sample_app();
         let add = app.handle_control(Request::CommentAdd(protocol::CommentAdd {
-            file: "a.rs".into(),
-            side: Side::New,
-            line: 2,
+            file: Some("a.rs".into()),
+            side: Some(Side::New),
+            line: Some(2),
             body: "before".into(),
             author: "agent".into(),
             draft: false,
+            conversation: false,
         }));
         let comment_id = match add {
             Response::Ok(Reply::Comment(r)) => r.comment,
@@ -8145,12 +8170,13 @@ mod tests {
         let mut app = sample_app();
         // An agent's own local note, plus a published comment by someone else.
         let add = app.handle_control(Request::CommentAdd(protocol::CommentAdd {
-            file: "a.rs".into(),
-            side: Side::New,
-            line: 2,
+            file: Some("a.rs".into()),
+            side: Some(Side::New),
+            line: Some(2),
             body: "mine".into(),
             author: "agent".into(),
             draft: false,
+            conversation: false,
         }));
         let own = match add {
             Response::Ok(Reply::Comment(r)) => r.comment,
@@ -8196,12 +8222,13 @@ mod tests {
     fn tui_d_removes_a_draft_thread_after_confirm() {
         let mut app = sample_app();
         let _ = app.handle_control(Request::CommentAdd(protocol::CommentAdd {
-            file: "a.rs".into(),
-            side: Side::New,
-            line: 2,
+            file: Some("a.rs".into()),
+            side: Some(Side::New),
+            line: Some(2),
             body: "note".into(),
             author: "me".into(),
             draft: false,
+            conversation: false,
         }));
         app.view = View::Conversation;
         app.conv_cursor = 0;
@@ -8362,12 +8389,13 @@ mod tests {
 
     fn add(app: &mut App, line: u32, draft: bool) {
         app.handle_control(Request::CommentAdd(protocol::CommentAdd {
-            file: "a.rs".into(),
-            side: Side::New,
-            line,
+            file: Some("a.rs".into()),
+            side: Some(Side::New),
+            line: Some(line),
             body: "n".into(),
             author: "agent".into(),
             draft,
+            conversation: false,
         }));
     }
 
@@ -9505,15 +9533,94 @@ mod tests {
     fn control_comment_add_rejects_a_line_not_in_the_diff() {
         let mut app = sample_app();
         let response = app.handle_control(Request::CommentAdd(protocol::CommentAdd {
-            file: "a.rs".into(),
-            side: Side::New,
-            line: 99,
+            file: Some("a.rs".into()),
+            side: Some(Side::New),
+            line: Some(99),
             body: "x".into(),
             author: "agent".into(),
             draft: false,
+            conversation: false,
         }));
         assert!(matches!(response, Response::Error(_)));
         assert!(app.review.threads.is_empty());
+    }
+
+    #[test]
+    fn control_add_creates_a_conversation_comment() {
+        let mut app = pr_app();
+        // Default (no --draft): a local conversation note.
+        let result = app
+            .control_comment_add(protocol::CommentAdd {
+                file: None,
+                side: None,
+                line: None,
+                body: "overall this reads well".into(),
+                author: "agent".into(),
+                draft: false,
+                conversation: true,
+            })
+            .expect("a conversation comment is created");
+        let thread = app
+            .review
+            .threads
+            .iter()
+            .find(|t| t.id == result.thread)
+            .unwrap();
+        assert_eq!(thread.anchor, Anchor::Review);
+        assert!(
+            thread.root().unwrap().is_local(),
+            "an agent conversation comment defaults to local"
+        );
+        assert_eq!(thread.root().unwrap().body, "overall this reads well");
+
+        // With --draft on a PR it queues for submit (same plan as the UI's `c`).
+        let result = app
+            .control_comment_add(protocol::CommentAdd {
+                file: None,
+                side: None,
+                line: None,
+                body: "queue this one".into(),
+                author: "agent".into(),
+                draft: true,
+                conversation: true,
+            })
+            .unwrap();
+        let thread = app
+            .review
+            .threads
+            .iter()
+            .find(|t| t.id == result.thread)
+            .unwrap();
+        assert!(thread.root().unwrap().is_draft(), "--draft queues it");
+    }
+
+    #[test]
+    fn control_conversation_add_refuses_a_line_and_a_line_add_needs_one() {
+        // --conversation with a line is contradictory.
+        let mut app = pr_app();
+        let res = app.control_comment_add(protocol::CommentAdd {
+            file: Some("a.rs".into()),
+            side: Some(Side::New),
+            line: Some(2),
+            body: "x".into(),
+            author: "agent".into(),
+            draft: false,
+            conversation: true,
+        });
+        assert!(res.is_err(), "conversation + line is refused: {res:?}");
+
+        // A non-conversation add with no line has nothing to anchor to.
+        let mut app = sample_app();
+        let res = app.control_comment_add(protocol::CommentAdd {
+            file: None,
+            side: None,
+            line: None,
+            body: "x".into(),
+            author: "agent".into(),
+            draft: false,
+            conversation: false,
+        });
+        assert!(res.is_err(), "a line comment needs file+line: {res:?}");
     }
 
     #[test]
@@ -9702,12 +9809,13 @@ mod tests {
     fn control_review_and_list_expose_the_diff_and_threads() {
         let mut app = sample_app();
         let _ = app.handle_control(Request::CommentAdd(protocol::CommentAdd {
-            file: "a.rs".into(),
-            side: Side::New,
-            line: 1,
+            file: Some("a.rs".into()),
+            side: Some(Side::New),
+            line: Some(1),
             body: "note".into(),
             author: "agent".into(),
             draft: false,
+            conversation: false,
         }));
         match app.handle_control(Request::Review {
             include_patch: true,

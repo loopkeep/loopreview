@@ -188,18 +188,26 @@ fn comment(action: CommentAction) -> Result<()> {
             file,
             side,
             line,
+            conversation,
             body,
             author,
             draft,
             json,
         } => {
+            // Side is only meaningful for a line comment.
+            let side = if conversation {
+                None
+            } else {
+                Some(core_side(side))
+            };
             let request = Request::CommentAdd(protocol::CommentAdd {
                 file,
-                side: core_side(side),
+                side,
                 line,
                 body,
                 author: author.unwrap_or_else(|| "agent".to_string()),
                 draft,
+                conversation,
             });
             let Reply::Comment(result) = call(&target, request)? else {
                 bail!("unexpected reply");

@@ -73,15 +73,19 @@ pub struct Navigate {
     pub line: Option<u32>,
 }
 
-/// Add a new comment thread anchored to a line.
+/// Add a new comment thread — anchored to a line, or (with `conversation`) to
+/// the PR conversation as a whole.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommentAdd {
-    /// The file the line belongs to.
-    pub file: String,
-    /// Which side the line is measured on.
-    pub side: Side,
-    /// The 1-based line number.
-    pub line: u32,
+    /// The file the line belongs to. Omitted for a conversation comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Which side the line is measured on. Omitted for a conversation comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<Side>,
+    /// The 1-based line number. Omitted for a conversation comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
     /// The comment body (markdown).
     pub body: String,
     /// The comment author (agent comments are attributed; the CLI defaults an
@@ -91,6 +95,10 @@ pub struct CommentAdd {
     /// local notes by default and are never sent to GitHub without this.
     #[serde(default)]
     pub draft: bool,
+    /// Create a conversation comment ([`Anchor::Review`], not tied to any line).
+    /// Mutually exclusive with `file`/`line`.
+    #[serde(default)]
+    pub conversation: bool,
 }
 
 /// Reply to an existing thread by id.
@@ -487,12 +495,13 @@ mod tests {
             }),
             Request::Reload,
             Request::CommentAdd(CommentAdd {
-                file: "a.rs".into(),
-                side: Side::New,
-                line: 3,
+                file: Some("a.rs".into()),
+                side: Some(Side::New),
+                line: Some(3),
                 body: "look here".into(),
                 author: "agent".into(),
                 draft: true,
+                conversation: false,
             }),
             Request::CommentReply(CommentReply {
                 thread: "t1".into(),
@@ -521,6 +530,32 @@ mod tests {
         for request in &requests {
             assert_eq!(&round_trip(request), request);
         }
+    }
+
+    #[test]
+    fn comment_add_decodes_legacy_line_form_and_the_conversation_form() {
+        // A legacy client sends file/side/line with no `conversation` field — it
+        // must still decode (the fields are Some, conversation defaults false).
+        let legacy: CommentAdd = serde_json::from_str(
+            r#"{"file":"a.rs","side":"new","line":3,"body":"x","author":"agent","draft":true}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.file.as_deref(), Some("a.rs"));
+        assert_eq!(legacy.side, Some(Side::New));
+        assert_eq!(legacy.line, Some(3));
+        assert!(legacy.draft);
+        assert!(!legacy.conversation);
+
+        // A conversation comment omits the line fields.
+        let convo: CommentAdd =
+            serde_json::from_str(r#"{"body":"overall LGTM","author":"agent","conversation":true}"#)
+                .unwrap();
+        assert!(convo.file.is_none() && convo.side.is_none() && convo.line.is_none());
+        assert!(convo.conversation);
+        // And it round-trips without re-introducing the null line fields.
+        let json = serde_json::to_string(&convo).unwrap();
+        assert!(!json.contains("file") && !json.contains("line"));
+        assert_eq!(round_trip(&convo), convo);
     }
 
     #[test]
