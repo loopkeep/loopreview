@@ -2068,7 +2068,7 @@ impl App {
         // comment; Files: the thread anchored at the cursor line's root).
         let target = self.edit_target();
         let target_unpublished_kind = || {
-            self.pr.is_some()
+            self.has_subject()
                 && target.is_some_and(|(ti, ci)| {
                     self.review.threads[ti]
                         .comments
@@ -2393,8 +2393,8 @@ impl App {
     ///   local thread never strands a queued draft reply.
     /// - A published comment is on the remote for good; its kind never changes.
     fn toggle_selected_kind(&mut self) {
-        if self.pr.is_none() {
-            self.status = Some("local/draft applies only to a pull request".to_string());
+        if !self.has_subject() {
+            self.status = Some("local/draft applies only to a pull request or issue".to_string());
             return;
         }
         // Same targeting as edit/delete: the cursor's comment in Conversation, the
@@ -9367,6 +9367,30 @@ mod tests {
         assert!(
             !app.is_resolvable(1),
             "a published issue comment can't resolve"
+        );
+    }
+
+    #[test]
+    fn t_toggles_kind_on_an_issue_conversation_root() {
+        let mut app = issue_app();
+        app.set_view(View::Conversation);
+        app.focus = Focus::Body;
+        app.review.threads.push(Thread {
+            id: "conv".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![comment_of("root", "tester", None, CommentKind::Local)],
+        });
+        app.relayout();
+        app.conv_cursor = 0;
+        app.conv_comment = 0;
+        // t promotes the local root to a draft (it will send on Ctrl-S).
+        app.toggle_selected_kind();
+        let ti = app.conv_order[app.conv_cursor];
+        assert_eq!(
+            app.review.threads[ti].root().unwrap().disposition(),
+            CommentKind::Draft,
+            "t promotes an issue conversation root to a draft"
         );
     }
 
