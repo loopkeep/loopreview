@@ -745,6 +745,12 @@ struct App {
     /// Per thread, the block-line index where each comment begins (root first,
     /// then replies) — lets the Conversation cursor land on a single comment.
     conv_comment_starts: Vec<Vec<usize>>,
+    /// Per thread, the block-relative click regions (links/images) over its
+    /// comment bodies, aligned to `conv_blocks`.
+    conv_block_regions: Vec<Vec<crate::markdown::MdRegion>>,
+    /// The composed Conversation click regions from the last draw (absolute line
+    /// indices in the scrolled line list), for mouse hit-testing.
+    conv_regions: RefCell<Vec<crate::markdown::MdRegion>>,
     /// Whether each thread is outdated (line-anchored but no longer in the diff),
     /// index-aligned to `review.threads`. Drives the thread index's status icon.
     thread_outdated: Vec<bool>,
@@ -890,7 +896,7 @@ impl App {
         let layout = Layouts::build(&diff, &review, &block_lens, &HashSet::new());
         let outdated = outdated_flags(&review, &layout.placed);
         let conv_order = conv_display_order(&review);
-        let (conv_blocks, conv_comment_starts): (Vec<_>, Vec<_>) = build_conversation(
+        let (conv_blocks, conv_comment_starts, conv_block_regions) = build_conversation(
             &review,
             &diff,
             CONV_DEFAULT_WIDTH,
@@ -898,9 +904,7 @@ impl App {
             &outdated,
             &collapsed,
             repo_dir.as_deref(),
-        )
-        .into_iter()
-        .unzip();
+        );
         let num_width = digits(layout.max_lineno).max(3);
         let file_count = diff.files.len();
         let cline_index = layout
@@ -939,6 +943,8 @@ impl App {
             comment_blocks,
             conv_blocks,
             conv_comment_starts,
+            conv_block_regions,
+            conv_regions: RefCell::new(Vec::new()),
             thread_outdated: outdated,
             conv_order,
             conv_comment: 0,
@@ -1681,7 +1687,11 @@ impl App {
         let layout = Layouts::build(&diff, &self.review, &block_lens, &self.collapsed_files);
         self.thread_outdated = outdated_flags(&self.review, &layout.placed);
         let conv_width = self.body_width.get().clamp(40, 120);
-        (self.conv_blocks, self.conv_comment_starts) = build_conversation(
+        (
+            self.conv_blocks,
+            self.conv_comment_starts,
+            self.conv_block_regions,
+        ) = build_conversation(
             &self.review,
             &diff,
             conv_width,
@@ -1689,9 +1699,7 @@ impl App {
             &self.thread_outdated,
             &self.collapsed,
             self.repo_dir.as_deref(),
-        )
-        .into_iter()
-        .unzip();
+        );
         self.conv_order = conv_display_order(&self.review);
         self.conv_cursor = self
             .conv_cursor
@@ -5059,13 +5067,18 @@ impl App {
                 if self.view == View::Overview {
                     let line = self.overview_scroll + row;
                     if let Some(action) = self.overview_action_at(line, col) {
-                        self.run_overview_md_action(action);
+                        self.run_md_action(action);
                     }
                     return;
                 }
-                // Conversation: a thread header toggles its fold (and selects);
-                // a body line just selects.
+                // Conversation: a click on a body link/image opens it; else a
+                // thread header toggles its fold (and selects), a body line selects.
                 if self.view == View::Conversation {
+                    let line = self.conv_scroll + row;
+                    if let Some(action) = self.conv_action_at(line, col) {
+                        self.run_md_action(action);
+                        return;
+                    }
                     if let Some((pos, is_header)) = self.conv_hit(row) {
                         self.set_conv(pos);
                         if is_header && let Some(t) = self.selected_thread() {
@@ -6011,9 +6024,21 @@ impl App {
             .map(|r| r.action.clone())
     }
 
-    /// Run a markdown click action: open a URL, or toggle a `<details>` fold in
-    /// the Overview (re-clamping the scroll to the new, folded height).
-    fn run_overview_md_action(&mut self, action: crate::markdown::MdAction) {
+    /// The click action at absolute Conversation line `line`, column `col`, from
+    /// the regions cached by the last draw (comment-body links/images only).
+    fn conv_action_at(&self, line: usize, col: u16) -> Option<crate::markdown::MdAction> {
+        self.conv_regions
+            .borrow()
+            .iter()
+            .find(|r| r.line == line && col >= r.start && col < r.end)
+            .map(|r| r.action.clone())
+    }
+
+    /// Run a markdown click action (shared by the Overview and Conversation): open
+    /// a URL, or toggle a `<details>` fold. Only the Overview emits toggles today
+    /// (comment bodies pass link/image opens only), so a toggle acts on the
+    /// Overview fold state and re-clamps its scroll.
+    fn run_md_action(&mut self, action: crate::markdown::MdAction) {
         match action {
             crate::markdown::MdAction::Open(url) => {
                 self.status = Some(match (self.url_opener)(&url) {
@@ -6050,8 +6075,12 @@ impl App {
         let select_bg = CONV_SELECT_BG;
         let width = area.width as usize;
         let mut lines: Vec<TextLine> = Vec::new();
+        // Click regions for the composed line list, absolute so mouse_down can map
+        // a scrolled row straight to an action.
+        let mut regions: Vec<crate::markdown::MdRegion> = Vec::new();
         for (pos, &ti) in self.conv_order.iter().enumerate() {
             let block = &self.conv_blocks[ti];
+            let thread_start = lines.len();
             let selected = pos == self.conv_cursor;
             // Within the selected thread, the cursor rests on one comment; tint
             // that comment's line range (plus the header, so the thread reads as
@@ -6097,8 +6126,19 @@ impl App {
                     None => lines.push(line.clone()),
                 }
             }
-            lines.push(TextLine::from(""));
+            // This thread's body regions, shifted to their composed line indices
+            // (tinting re-styles content in place, so columns are unchanged).
+            for r in &self.conv_block_regions[ti] {
+                regions.push(crate::markdown::MdRegion {
+                    line: r.line + thread_start,
+                    start: r.start,
+                    end: r.end,
+                    action: r.action.clone(),
+                });
+            }
+            lines.push(TextLine::from("")); // a blank between threads
         }
+        self.conv_regions.replace(regions);
         let height = area.height as usize;
         let start = self.conv_scroll.min(lines.len().saturating_sub(1));
         let end = (start + height).min(lines.len());
@@ -7733,6 +7773,13 @@ fn build_comment_blocks(
 /// its comments (root first, then replies) begins — so the Conversation view can
 /// highlight the one comment the cursor rests on. A collapsed thread's only stop
 /// is its header line (`[0]`).
+type ConversationBuild = (
+    Vec<Vec<TextLine<'static>>>,
+    Vec<Vec<usize>>,
+    Vec<Vec<crate::markdown::MdRegion>>,
+);
+
+#[allow(clippy::type_complexity)]
 fn build_conversation(
     review: &Review,
     diff: &Diff,
@@ -7741,9 +7788,13 @@ fn build_conversation(
     outdated: &[bool],
     collapsed: &HashSet<String>,
     repo_dir: Option<&Path>,
-) -> Vec<(Vec<TextLine<'static>>, Vec<usize>)> {
+) -> ConversationBuild {
     let now = now();
-    review
+    let built: Vec<(
+        Vec<TextLine<'static>>,
+        Vec<usize>,
+        Vec<crate::markdown::MdRegion>,
+    )> = review
         .threads
         .iter()
         .enumerate()
@@ -7751,6 +7802,9 @@ fn build_conversation(
             let is_outdated = outdated.get(ti).copied().unwrap_or(false);
             let is_collapsed = collapsed.contains(&thread.id);
             let mut lines = Vec::new();
+            // Click regions (links/images) over this thread's comment bodies,
+            // block-relative; details stay expanded in comment bodies for now.
+            let mut regions: Vec<crate::markdown::MdRegion> = Vec::new();
             // An informative one-line header (the thread index's vocabulary): a
             // fold chevron, the status glyph, the anchor, the author, and the
             // reply count — so a collapsed thread still says what it is.
@@ -7796,7 +7850,7 @@ fn build_conversation(
 
             if is_collapsed {
                 // A collapsed thread has a single stop: its header line.
-                return (lines, vec![0]);
+                return (lines, vec![0], regions);
             }
 
             // Track where each comment's meta line lands within the block.
@@ -7832,19 +7886,27 @@ fn build_conversation(
             if let Some(root) = thread.root() {
                 comment_starts.push(lines.len());
                 lines.push(comment_meta_line(root, now, false));
-                lines.extend(crate::markdown::render(
-                    &root.body,
-                    Some(width),
-                    highlighter,
-                ));
+                let base = lines.len();
+                let rendered =
+                    crate::markdown::render_rich(&root.body, Some(width), highlighter, &|_, _| {
+                        true
+                    });
+                collect_open_regions(&rendered.regions, base, 0, &mut regions);
+                lines.extend(rendered.lines);
             }
             for reply in thread.replies() {
                 comment_starts.push(lines.len());
                 lines.push(comment_meta_line(reply, now, true));
-                for line in
-                    crate::markdown::render(&reply.body, Some(width.saturating_sub(2)), highlighter)
-                {
-                    let mut spans = vec![TextSpan::raw("  ")];
+                let base = lines.len();
+                let rendered = crate::markdown::render_rich(
+                    &reply.body,
+                    Some(width.saturating_sub(2)),
+                    highlighter,
+                    &|_, _| true,
+                );
+                collect_open_regions(&rendered.regions, base, 2, &mut regions);
+                for line in rendered.lines {
+                    let mut spans = vec![TextSpan::raw("  ")]; // a reply is indented 2 cols
                     spans.extend(line.spans);
                     lines.push(TextLine::from(spans));
                 }
@@ -7852,9 +7914,39 @@ fn build_conversation(
             if comment_starts.is_empty() {
                 comment_starts.push(0);
             }
-            (lines, comment_starts)
+            (lines, comment_starts, regions)
         })
-        .collect()
+        .collect();
+    let mut blocks = Vec::with_capacity(built.len());
+    let mut starts = Vec::with_capacity(built.len());
+    let mut all_regions = Vec::with_capacity(built.len());
+    for (b, s, r) in built {
+        blocks.push(b);
+        starts.push(s);
+        all_regions.push(r);
+    }
+    (blocks, starts, all_regions)
+}
+
+/// Copy the `Open` regions from a rendered comment body into `out`, offsetting
+/// each by the body's `base` line in the block and a left `indent`. Details
+/// toggles are dropped — comment-body `<details>` render expanded for now.
+fn collect_open_regions(
+    regions: &[crate::markdown::MdRegion],
+    base: usize,
+    indent: u16,
+    out: &mut Vec<crate::markdown::MdRegion>,
+) {
+    for region in regions {
+        if matches!(region.action, crate::markdown::MdAction::Open(_)) {
+            out.push(crate::markdown::MdRegion {
+                line: region.line + base,
+                start: region.start + indent,
+                end: region.end + indent,
+                action: region.action.clone(),
+            });
+        }
+    }
 }
 
 /// The author/timestamp line for a comment; replies are marked and indented.
@@ -14016,7 +14108,7 @@ mod tests {
         let action = app
             .overview_action_at(link.line, link.start)
             .expect("the region is hit at its own coordinates");
-        app.run_overview_md_action(action);
+        app.run_md_action(action);
         assert_eq!(
             opened.borrow().as_slice(),
             &["https://example.com/xyz".to_string()],
@@ -14054,7 +14146,7 @@ mod tests {
         let action = app
             .overview_action_at(toggle.line, toggle.start)
             .expect("the toggle is hit");
-        app.run_overview_md_action(action);
+        app.run_md_action(action);
         assert_eq!(app.overview_folds.get(&0), Some(&true), "now open");
         let opened = md_text(&app.overview_render(60));
         assert!(
@@ -14080,6 +14172,91 @@ mod tests {
                 "a rule line separates facts from body"
             );
         }
+    }
+
+    #[test]
+    fn a_conversation_body_link_is_clickable() {
+        let mut app = pr_app();
+        app.review.threads.push(Thread {
+            id: "t1".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: "c1".into(),
+                author: "octo".into(),
+                body: "see https://example.org/deep here".into(),
+                created_at: 0,
+                remote_id: Some("IC_1".into()),
+                kind: CommentKind::Published,
+            }],
+        });
+        app.collapsed.clear();
+        app.relayout();
+        app.set_view(View::Conversation);
+        app.focus = Focus::Body;
+        // Draw to compose and cache the click regions for the scrolled line list.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let region = app
+            .conv_regions
+            .borrow()
+            .iter()
+            .find(|r| {
+                matches!(&r.action, crate::markdown::MdAction::Open(u) if u.contains("example.org"))
+            })
+            .cloned()
+            .expect("a conversation body link region");
+        // Route the click through an injected recorder (never a real browser).
+        let opened = std::rc::Rc::new(RefCell::new(Vec::<String>::new()));
+        let sink = opened.clone();
+        app.url_opener = Box::new(move |u: &str| {
+            sink.borrow_mut().push(u.to_string());
+            Ok(())
+        });
+        let action = app
+            .conv_action_at(region.line, region.start)
+            .expect("the region is hit at its coordinates");
+        app.run_md_action(action);
+        assert_eq!(
+            opened.borrow().as_slice(),
+            &["https://example.org/deep".to_string()],
+            "the conversation link click routed to the opener"
+        );
+    }
+
+    #[test]
+    fn conversation_non_link_clicks_fall_through_to_selection() {
+        // No-regression: a plain comment body registers no link regions, so a
+        // content click still reaches the existing selection / header-fold path.
+        let mut app = pr_app();
+        app.review.threads.push(Thread {
+            id: "t1".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: "c1".into(),
+                author: "octo".into(),
+                body: "just plain text".into(),
+                created_at: 0,
+                remote_id: Some("IC_1".into()),
+                kind: CommentKind::Published,
+            }],
+        });
+        app.collapsed.clear();
+        app.relayout();
+        app.set_view(View::Conversation);
+        app.focus = Focus::Body;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(
+            app.conv_regions.borrow().is_empty(),
+            "a plain body has no link regions"
+        );
+        assert!(app.conv_action_at(0, 0).is_none());
     }
 
     #[test]

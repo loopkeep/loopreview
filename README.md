@@ -235,7 +235,9 @@ Comment bodies and a pull request's or issue's description render as markdown â€
 inline and fenced (syntax-highlighted) code, lists, block quotes, GitHub alerts
 (`> [!NOTE]` / `[!WARNING]` â€¦), task lists (`- [ ]` / `- [x]`), tables, thematic
 breaks, footnotes, links and bare URLs, `[Image]` placeholders, and `<details>`
-folds. In the Overview, links/images and `<details>` summaries are clickable.
+folds. In the Overview and the Conversation, links and `[Image]` placeholders are
+clickable (they open on github.com); the Overview also folds a `<details>` on a
+click of its summary.
 
 ## Reviewing
 
