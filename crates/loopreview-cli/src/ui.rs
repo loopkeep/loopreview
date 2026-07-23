@@ -1857,6 +1857,15 @@ impl App {
         let in_sidebar =
             self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some();
         if in_sidebar {
+            // The Conversation index also offers `d` — delete the selected thread
+            // via its root — when that root is actually removable (yours to delete,
+            // its id synced, etc.). The file index carries no comment actions.
+            if action == Delete {
+                return self.view == View::Conversation
+                    && self
+                        .selected_thread()
+                        .is_some_and(|ti| self.delete_target_for(ti, 0).is_ok());
+            }
             return matches!(action, MoveDown | MoveUp | Top | Bottom | NavIn | Fold);
         }
         // Body movement always applies. (`NavIn` is handled per-view below — in
@@ -2001,6 +2010,16 @@ impl App {
         }
     }
 
+    /// Arm the delete confirmation for thread `ti`'s root — `d` from the
+    /// Conversation index. Routes through the same target logic as `d` on a root
+    /// elsewhere: the ownership gate, the cascade count, and the refusal reasons.
+    fn request_delete_thread(&mut self, ti: usize) {
+        match self.delete_target_for(ti, 0) {
+            Ok(target) => self.confirming_delete = Some(target),
+            Err(reason) => self.status = Some(reason),
+        }
+    }
+
     /// Carry out a confirmed delete: a published comment goes to GitHub in the
     /// background (then removed locally on success); an unpublished draft/local
     /// is removed in place.
@@ -2090,6 +2109,13 @@ impl App {
                 0,
             )
         };
+        self.delete_target_for(ti, ci)
+    }
+
+    /// What deleting comment `ci` of thread `ti` removes, or a reason it can't —
+    /// the shared core of [`Self::delete_target`], also called with `ci = 0` to
+    /// target a thread's root from the Conversation index (`d` on an entry).
+    fn delete_target_for(&self, ti: usize, ci: usize) -> Result<DeleteTarget, String> {
         let thread_id = self.review.threads[ti].id.clone();
         let comment = self.review.threads[ti]
             .comments
@@ -3164,7 +3190,8 @@ impl App {
 
     /// Route a key while the thread index (Conversation sidebar) has focus. The
     /// grammar mirrors the file index: j/k select, l/Enter jump into the thread,
-    /// o folds it.
+    /// o folds it; `d` removes the selected thread via its root (the only
+    /// comment action the index carries).
     fn thread_index_action(&mut self, action: Action) {
         let n = self.review.threads.len();
         if n == 0 {
@@ -3177,6 +3204,11 @@ impl App {
             Action::Bottom => self.set_conv(n - 1),
             Action::NavIn => self.jump_to_thread(self.conv_cursor),
             Action::Fold => self.toggle_collapse_conv(),
+            Action::Delete => {
+                if let Some(ti) = self.selected_thread() {
+                    self.request_delete_thread(ti);
+                }
+            }
             _ => {}
         }
     }
@@ -4695,6 +4727,10 @@ impl App {
                 }
             }
             Region::Content { col, row } => {
+                // Clicking the content pane focuses it — the clicked pane takes
+                // focus, so a diff-line click, drag-select, or comment-action click
+                // pulls focus out of the sidebar (a sidebar click keeps it there).
+                self.focus = Focus::Body;
                 // Conversation: a thread header toggles its fold (and selects);
                 // a body line just selects.
                 if self.view == View::Conversation {
@@ -5379,7 +5415,15 @@ impl App {
         } else if target.comment_id.is_some() {
             format!("Withdraw your reply on {label}?")
         } else {
-            format!("Withdraw your draft thread on {label}?")
+            // A whole thread — name the total it takes (the root plus any replies),
+            // so a delete from the index is never a blind count. The excerpt below
+            // identifies which thread, so the count leads (and never truncates off
+            // the end of a labelled line on a narrow terminal).
+            let total = target.also_removed + 1;
+            format!(
+                "Withdraw this thread ({total} comment{})?",
+                if total == 1 { "" } else { "s" }
+            )
         };
         // Removing this empties the thread of published comments — the local notes
         // under it go too. Warn on its own line (the message above is long and
@@ -5764,7 +5808,7 @@ impl App {
         // siblings `edit` and `delete` rank right behind it, so the three that act
         // on that comment appear together when they are all yours to run.
         let candidates: &[(Action, &str)] = if in_sidebar {
-            &[(NavIn, "open"), (Fold, "fold")]
+            &[(NavIn, "open"), (Fold, "fold"), (Delete, "delete")]
         } else if self.view == View::Conversation {
             &[
                 (Reply, "reply"),
@@ -10169,6 +10213,149 @@ mod tests {
     }
 
     #[test]
+    fn d_in_the_thread_index_deletes_a_local_thread() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = sample_app(); // a worktree review: comments are local, no PR
+        app.body_width.set(120);
+        app.sidebar_override = Some(true);
+        app.review.threads.push(Thread {
+            id: "conv".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![
+                comment_of("root", "tester", None, CommentKind::Local),
+                comment_of("r1", "tester", None, CommentKind::Local),
+                comment_of("r2", "tester", None, CommentKind::Local),
+            ],
+        });
+        app.relayout();
+        app.set_view(View::Conversation);
+        app.focus = Focus::Sidebar;
+        app.conv_cursor = 0;
+        assert!(
+            app.sidebar_width(app.body_width.get()).is_some(),
+            "the thread index is shown"
+        );
+        assert_eq!(app.selected_thread(), Some(0));
+
+        // d in the index arms the whole-thread delete (root ci = None), counting
+        // the cascaded replies.
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        let target = app
+            .confirming_delete
+            .as_ref()
+            .expect("d armed the confirmation");
+        assert!(target.comment_id.is_none(), "the thread root is the target");
+        assert_eq!(target.also_removed, 2, "its two replies are counted");
+
+        // The prompt names the total.
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(
+            screen_text(&term).contains("(3 comments)"),
+            "the confirm names the thread's comment count"
+        );
+
+        // y confirms; the whole thread is gone.
+        app.on_key(KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.confirming_delete.is_none(), "the modal closed");
+        assert!(
+            !app.review.threads.iter().any(|t| t.id == "conv"),
+            "the thread was removed"
+        );
+    }
+
+    #[test]
+    fn d_in_the_index_routes_a_published_root_to_github() {
+        let mut app = pr_app(); // git name + viewer both "tester"
+        app.body_width.set(120);
+        app.sidebar_override = Some(true);
+        app.review.threads.push(Thread {
+            id: "issuecomment:5".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![comment_of("root", "tester", Some("5"), CommentKind::Draft)],
+        });
+        app.relayout();
+        app.set_view(View::Conversation);
+        app.focus = Focus::Sidebar;
+        app.conv_cursor = 0;
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        let target = app
+            .confirming_delete
+            .as_ref()
+            .expect("d armed the confirmation");
+        assert!(
+            target.published.is_some(),
+            "my published root routes to a GitHub delete"
+        );
+        assert_eq!(target.comment_id.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn d_in_the_index_refuses_someone_elses_published_root() {
+        let mut app = pr_app();
+        app.body_width.set(120);
+        app.sidebar_override = Some(true);
+        app.review.threads.push(Thread {
+            id: "issuecomment:9".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![comment_of(
+                "root",
+                "someone-else",
+                Some("9"),
+                CommentKind::Draft,
+            )],
+        });
+        app.relayout();
+        app.set_view(View::Conversation);
+        app.focus = Focus::Sidebar;
+        app.conv_cursor = 0;
+        app.on_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(
+            app.confirming_delete.is_none(),
+            "someone else's published comment is not armed"
+        );
+        assert!(
+            app.status.as_deref().unwrap_or("").contains("your own"),
+            "the refusal names the reason: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn the_thread_index_footer_offers_delete_only_there() {
+        let mut app = sample_app();
+        app.body_width.set(120);
+        app.sidebar_override = Some(true);
+        app.review.threads.push(Thread {
+            id: "conv".into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![comment_of("root", "tester", None, CommentKind::Local)],
+        });
+        app.relayout();
+        app.set_view(View::Conversation);
+        app.focus = Focus::Sidebar;
+        app.conv_cursor = 0;
+        let key = app.keymap.key_for(Action::Delete).unwrap().to_string();
+        assert!(
+            app.footer_ops().contains(&format!("{key} delete")),
+            "the thread index offers delete: {:?}",
+            app.footer_ops()
+        );
+        // The file index (Files view sidebar) carries no comment actions.
+        app.set_view(View::Files);
+        assert!(
+            !app.footer_ops().contains("delete"),
+            "the file index has no delete: {:?}",
+            app.footer_ops()
+        );
+    }
+
+    #[test]
     fn deleting_one_published_comment_keeps_a_thread_that_still_has_another() {
         let mut app = pr_app();
         // An inline thread with two published comments.
@@ -12793,6 +12980,46 @@ mod tests {
             "added",
             "selection ends at the drag row"
         );
+    }
+
+    #[test]
+    fn a_diff_click_or_drag_pulls_focus_out_of_the_sidebar() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = sample_app();
+        app.mode = Mode::Unified;
+        app.sidebar_override = Some(true);
+        app.body_width.set(120);
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        assert!(app.hit.get().sidebar_w > 0, "the sidebar is shown");
+        // As if the reviewer had been browsing the file index.
+        app.focus = Focus::Sidebar;
+
+        let row_of = |term: &Terminal<TestBackend>, needle: &str| -> u16 {
+            let buffer = term.backend().buffer();
+            for y in 0..24u16 {
+                let text: String = (0..120u16).map(|x| buffer[(x, y)].symbol()).collect();
+                if text.contains(needle) {
+                    return y;
+                }
+            }
+            panic!("row containing {needle:?} is rendered");
+        };
+        let keep_row = row_of(&term, "keep");
+        let added_row = row_of(&term, "added");
+        let col = app.hit.get().sidebar_w + 5;
+
+        // A press on a diff line focuses the body and lands the cursor there —
+        // the clicked pane takes focus.
+        app.mouse_down(col, keep_row);
+        assert_eq!(app.focus, Focus::Body, "a diff click focuses the body");
+        assert_eq!(clicked_line(&app), "keep");
+
+        // A drag to another content line keeps the focus in the body and selects.
+        app.mouse_drag(col, added_row);
+        assert_eq!(app.focus, Focus::Body, "the drag stays in the body");
+        assert!(app.selection.is_some(), "the drag builds a selection");
     }
 
     fn hit(body_top: u16, sidebar_w: u16, tabs_row: Option<u16>, files_end: u16) -> HitLayout {

@@ -157,7 +157,7 @@ action (an inapplicable one reports why), `Esc` to close.
 | `t` | Toggle the thread's root between a draft and a local note (pull requests) |
 | `o` | Fold: expand the current file if collapsed, else fold the thread at the cursor, else collapse the current file |
 | Wheel | Scroll the diff (or the sidebar, when the pointer is over it) |
-| Click | Move the cursor; a file header (in the diff) folds/unfolds it; a sidebar row jumps to that file (expanding it if collapsed) without folding; a tab switches views; the footer's layout indicator (`[unified]`/`[split]`) toggles the layout; the header's `#N` opens the pull request on github.com |
+| Click | Focuses the pane you click; moves the cursor; a file header (in the diff) folds/unfolds it; a sidebar row jumps to that file (expanding it if collapsed) without folding; a tab switches views; the footer's layout indicator (`[unified]`/`[split]`) toggles the layout; the header's `#N` opens the pull request on github.com |
 | Drag | Select a line range (then `c` to comment) |
 
 **Sidebar** (focused after `b`)
@@ -176,6 +176,7 @@ with the `sidebar_width` config key.
 | `j` / `k` | Select a file — the diff previews it (scrolls to that file); the list scrolls to follow (the wheel scrolls it too); skips directory headers |
 | `Enter` (or `l` / `→`) | Jump to the file: expand it if collapsed, land on its header, and move focus to the diff — navigate only, never fold (fold with `Enter` on the header in the diff, or `o` here) |
 | `o` | Fold / unfold the selected file in place |
+| `d` | In the Conversation thread index only: delete the selected thread — its root delete flow (confirm with the comment count; a published root deletes from GitHub, your own only) |
 | `Esc` (or `h` / `←`) | Return focus to the diff |
 
 **File finder** (`Ctrl-P`): type to fuzzy-filter; `↑` / `↓` (or `Ctrl-P` / `Ctrl-N`)
