@@ -140,14 +140,17 @@ action (an inapplicable one reports why), `Esc` to close.
 
 **Overview view** (pull requests and issues)
 
-The leftmost tab: the subject's facts and rendered description, read-only. It is
-scroll-only, and has no sidebar.
+The leftmost tab: the subject's facts and rendered description, read-only. It has
+no sidebar. Keys scroll it; the mouse is interactive — click a link or an
+`[Image]` placeholder to open it on github.com, and click a `<details>` summary
+(`▸` / `▾`) to fold or unfold that section (folds are per-session).
 
 | Key | Action |
 | --- | --- |
 | `j` / `k` (or `↓` / `↑`) | Scroll a line |
 | `Ctrl-D` / `Ctrl-U` (or `Space` / `PageUp`) | Scroll a half / full page |
 | `g` / `G` (or `Home` / `End`) | Top / bottom |
+| Click | Open a link/image, or fold/unfold a `<details>` |
 
 **Files (diff) view**
 
@@ -230,7 +233,9 @@ which then becomes the newline (with `Alt+Enter` as a fallback).
 
 Comment bodies and a pull request's or issue's description render as markdown — headings, emphasis,
 inline and fenced (syntax-highlighted) code, lists, block quotes, GitHub alerts
-(`> [!NOTE]` / `[!WARNING]` …), task lists (`- [ ]` / `- [x]`), and tables.
+(`> [!NOTE]` / `[!WARNING]` …), task lists (`- [ ]` / `- [x]`), tables, thematic
+breaks, footnotes, links and bare URLs, `[Image]` placeholders, and `<details>`
+folds. In the Overview, links/images and `<details>` summaries are clickable.
 
 ## Reviewing
 
