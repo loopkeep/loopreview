@@ -37,7 +37,9 @@ features use the `gh` CLI.
   GitHub-style Conversation view, and persists per repository.
 - **GitHub pull requests** — review a PR in the TUI without a checkout, with
   two-way comment sync, drafts that persist across sessions, and a submit modal
-  (Comment / Approve / Request changes / Pending).
+  (Comment / Approve / Request changes / Pending). The header shows the PR's
+  status (Draft / Open / Merged / Closed) beside its `#number`, and it follows a
+  transition on refresh.
 - **Agent control plane** — a running review hosts a local socket so an agent can
   read the diff structure, move your cursor, leave local notes (or drafts to
   submit), and block on review events (`lr session …`).

@@ -43,7 +43,7 @@ use loopreview_core::{
     ThreadState, word_diff,
 };
 
-use loopreview_github::CommentEndpoint;
+use loopreview_github::{CommentEndpoint, PrStatus};
 
 use crate::control::{self, UiRequest};
 use crate::highlight::{Highlighter, LineHighlighter, Span as HlSpan};
@@ -237,8 +237,12 @@ enum JobMsg {
 
 /// The result a finished [`Job`] applies to the review.
 enum JobOutcome {
-    /// A re-pulled thread list to merge with local drafts.
-    Refreshed(Vec<Thread>),
+    /// A re-pulled thread list to merge with local drafts, plus the PR's fresh
+    /// lifecycle status (`None` when the status re-fetch failed — keep the old).
+    Refreshed {
+        threads: Vec<Thread>,
+        status: Option<PrStatus>,
+    },
     /// The thread (by id) had its resolution synced. Id, not index: the review
     /// can shift while the network job runs.
     Resolved { thread_id: String, resolved: bool },
@@ -828,6 +832,9 @@ struct App {
     job: Option<Job>,
     /// The pull-request handle, when reviewing a PR (enables sync/submit).
     pr: Option<Arc<PrHandle>>,
+    /// The PR's lifecycle status for the header badge — resolved at load, and
+    /// re-fetched on refresh so a transition (open → merged) follows.
+    pr_status: Option<PrStatus>,
     /// The store key for the current PR's drafts (`owner/repo#number`).
     pr_key: Option<String>,
     /// The repo directory, for reconstructing outdated lines from history.
@@ -952,6 +959,7 @@ impl App {
             load_error: None,
             job: None,
             pr: None,
+            pr_status: None,
             pr_key: None,
             repo_dir,
             source: None,
@@ -991,6 +999,7 @@ impl App {
         self.normalize_resolved_drafts();
         self.normalize_conversation_reply_drafts();
         self.pr = loaded.pr.map(Arc::new);
+        self.pr_status = self.pr.as_deref().map(PrHandle::status);
         self.pr_key = loaded.pr_key;
         self.apply_layout(loaded.diff);
         self.cursor = 0;
@@ -1055,9 +1064,14 @@ impl App {
     /// Apply a finished background action.
     fn apply_job(&mut self, result: Result<JobOutcome, String>) {
         match result {
-            Ok(JobOutcome::Refreshed(threads)) => {
+            Ok(JobOutcome::Refreshed { threads, status }) => {
                 let (merged, cleaned, orphans) = crate::prsync::merge_drafts(&self.review, threads);
                 self.review.threads = merged;
+                // Follow a lifecycle transition (open → merged, …); a failed
+                // status re-fetch (`None`) leaves the badge as it was.
+                if let Some(status) = status {
+                    self.pr_status = Some(status);
+                }
                 let mut notes = Vec::new();
                 if cleaned > 0 {
                     notes.push(format!("cleaned {cleaned} stale draft(s)"));
@@ -1170,7 +1184,10 @@ impl App {
             "Refreshing",
             Box::new(move |progress| {
                 progress("fetching comments…");
-                Ok(JobOutcome::Refreshed(pr.pull()?))
+                let threads = pr.pull()?;
+                // Best-effort: a status re-fetch failure keeps the current badge.
+                let status = pr.fetch_status().ok();
+                Ok(JobOutcome::Refreshed { threads, status })
             }),
         );
     }
@@ -5705,6 +5722,14 @@ impl App {
                 self.label[hash..].to_string(),
                 bar.fg(PR_ACCENT).add_modifier(Modifier::UNDERLINED),
             ));
+            // The lifecycle badge sits just after the #N link — a separate span,
+            // so it is not underlined and not inside the recorded click columns.
+            if let Some(status) = self.pr_status {
+                spans.push(TextSpan::styled(
+                    format!(" {}", status.label()),
+                    bar.fg(pr_status_color(status)),
+                ));
+            }
             spans.push(TextSpan::styled(" ", bar.fg(Color::Gray)));
         } else {
             spans.push(TextSpan::styled(
@@ -7506,6 +7531,17 @@ fn outdated_flags(review: &Review, placed: &[bool]) -> Vec<bool> {
 }
 
 /// A human label for where a thread is anchored.
+/// The header-badge color for a PR status, following GitHub's color semantics:
+/// open is green, merged is magenta/purple, closed is red, a draft is dim gray.
+fn pr_status_color(status: PrStatus) -> Color {
+    match status {
+        PrStatus::Open => Color::Green,
+        PrStatus::Merged => Color::Magenta,
+        PrStatus::Closed => Color::Red,
+        PrStatus::Draft => Color::DarkGray,
+    }
+}
+
 fn anchor_label(anchor: &Anchor) -> String {
     match anchor {
         Anchor::Line {
@@ -10398,7 +10434,10 @@ mod tests {
         });
         app.relayout();
         // The fresh pull no longer has the thread — it was deleted on GitHub.
-        app.apply_job(Ok(JobOutcome::Refreshed(Vec::new())));
+        app.apply_job(Ok(JobOutcome::Refreshed {
+            threads: Vec::new(),
+            status: None,
+        }));
         assert!(
             app.status
                 .as_deref()
@@ -12840,6 +12879,42 @@ mod tests {
             "off a pull request there is no link"
         );
         assert_eq!(hit_region(15, 0, app.hit.get()), Region::Outside);
+    }
+
+    #[test]
+    fn the_header_shows_the_pr_status_badge() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = pr_app();
+        app.label = "PR #1".to_string();
+        app.pr_status = Some(PrStatus::Merged);
+        let mut term = Terminal::new(TestBackend::new(120, 6)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let buf = term.backend().buffer();
+        let header: String = (0..120u16).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            header.contains("#1 Merged"),
+            "the badge sits just after #1: {header:?}"
+        );
+
+        // The badge is not part of the clickable/underlined link — the recorded
+        // columns still cover only "#1".
+        let (x0, x1) = app.header_pr_link.get().expect("the #N link is recorded");
+        assert_eq!(
+            (x1 - x0) as usize,
+            "#1".chars().count(),
+            "the link spans only #1, not the badge"
+        );
+
+        // The badge carries the status color (merged = magenta).
+        let merged_col = (0..114u16)
+            .find(|&x| (x..x + 6).map(|c| buf[(c, 0)].symbol()).collect::<String>() == "Merged")
+            .expect("the badge text is rendered");
+        assert_eq!(
+            buf[(merged_col, 0)].fg,
+            Color::Magenta,
+            "the merged badge uses the merged color"
+        );
     }
 
     /// Empirical: render, read the buffer to find the screen row of a known

@@ -71,6 +71,12 @@ pub struct ResolvedPr {
     /// The PR state, e.g. `OPEN`, `MERGED`, `CLOSED`.
     #[serde(default)]
     pub state: String,
+    /// Whether the PR is a draft (`isDraft`) — an open PR not yet ready for review.
+    #[serde(default, rename = "isDraft")]
+    pub is_draft: bool,
+    /// The merge timestamp (`mergedAt`), present only once the PR is merged.
+    #[serde(default, rename = "mergedAt")]
+    pub merged_at: Option<String>,
     /// The canonical PR URL.
     #[serde(default)]
     pub url: String,
@@ -85,6 +91,52 @@ impl ResolvedPr {
     /// A short label such as `PR #42` for UI headers.
     pub fn label(&self) -> String {
         format!("PR #{}", self.number)
+    }
+
+    /// The PR's lifecycle status, for the header badge.
+    pub fn status(&self) -> PrStatus {
+        PrStatus::derive(&self.state, self.is_draft, self.merged_at.is_some())
+    }
+}
+
+/// A pull request's lifecycle status — the four states GitHub shows distinctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrStatus {
+    /// Open but not yet ready for review.
+    Draft,
+    /// Open and ready.
+    Open,
+    /// Merged (a merged PR is also closed — this wins).
+    Merged,
+    /// Closed without merging.
+    Closed,
+}
+
+impl PrStatus {
+    /// Derive the status from the raw PR fields, in GitHub's precedence: merged
+    /// wins over closed (a merged PR is technically closed too), then a draft flag
+    /// distinguishes an open PR, else it is plain open. `merged` is the merge fact
+    /// (a `mergedAt` timestamp); a `MERGED` state string counts as merged too.
+    pub fn derive(state: &str, is_draft: bool, merged: bool) -> PrStatus {
+        if merged || state.eq_ignore_ascii_case("merged") {
+            PrStatus::Merged
+        } else if state.eq_ignore_ascii_case("closed") {
+            PrStatus::Closed
+        } else if is_draft {
+            PrStatus::Draft
+        } else {
+            PrStatus::Open
+        }
+    }
+
+    /// The badge text.
+    pub fn label(self) -> &'static str {
+        match self {
+            PrStatus::Draft => "Draft",
+            PrStatus::Open => "Open",
+            PrStatus::Merged => "Merged",
+            PrStatus::Closed => "Closed",
+        }
     }
 }
 
@@ -175,6 +227,52 @@ pub fn parse_pr_query(input: &str) -> Option<PrRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr_status_follows_github_precedence() {
+        use PrStatus::*;
+        // The plain four.
+        assert_eq!(PrStatus::derive("OPEN", false, false), Open);
+        assert_eq!(PrStatus::derive("OPEN", true, false), Draft);
+        assert_eq!(PrStatus::derive("CLOSED", false, false), Closed);
+        assert_eq!(PrStatus::derive("MERGED", false, true), Merged);
+
+        // Precedence: merged wins over closed — a merged PR is closed too, and
+        // labelling it "Closed" would mislead. This is the load-bearing case.
+        assert_eq!(PrStatus::derive("CLOSED", false, true), Merged);
+        // A `MERGED` state with no timestamp still reads as merged.
+        assert_eq!(PrStatus::derive("MERGED", false, false), Merged);
+        // A draft flag never overrides a terminal (closed/merged) state.
+        assert_eq!(PrStatus::derive("CLOSED", true, false), Closed);
+        assert_eq!(PrStatus::derive("MERGED", true, true), Merged);
+
+        // The state string is matched case-insensitively (gh casing varies).
+        assert_eq!(PrStatus::derive("open", false, false), Open);
+        assert_eq!(PrStatus::derive("closed", false, false), Closed);
+        assert_eq!(PrStatus::derive("merged", false, false), Merged);
+    }
+
+    #[test]
+    fn resolved_pr_derives_its_status() {
+        let mut pr = ResolvedPr {
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 1,
+            title: "t".into(),
+            base_ref: "main".into(),
+            head_ref: "feat".into(),
+            state: "OPEN".into(),
+            is_draft: true,
+            merged_at: None,
+            url: String::new(),
+        };
+        assert_eq!(pr.status(), PrStatus::Draft);
+        pr.is_draft = false;
+        assert_eq!(pr.status(), PrStatus::Open);
+        pr.merged_at = Some("2026-07-23T00:00:00Z".into());
+        pr.state = "CLOSED".into(); // merged PRs report closed on some paths
+        assert_eq!(pr.status(), PrStatus::Merged, "the merge fact wins");
+    }
 
     #[test]
     fn parses_pull_url() {

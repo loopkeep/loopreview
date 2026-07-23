@@ -9,7 +9,9 @@
 use std::path::PathBuf;
 
 use loopreview_core::{Anchor, Diff, DiffSource, Review, Thread};
-use loopreview_github::{CommentEndpoint, GithubClient, PrQuery, ResolvedPr, ReviewEvent};
+use loopreview_github::{
+    CommentEndpoint, GithubClient, PrQuery, PrStatus, ResolvedPr, ReviewEvent,
+};
 
 /// Build a [`PrQuery`] from the CLI arguments, or an error message.
 pub fn query(text: Option<String>, detect: bool) -> Result<PrQuery, String> {
@@ -90,6 +92,8 @@ impl PrHandle {
                 base_ref: "main".into(),
                 head_ref: "feature".into(),
                 state: "OPEN".into(),
+                is_draft: false,
+                merged_at: None,
                 url: format!("https://github.com/owner/repo/pull/{number}"),
             },
             viewer: Some("tester".into()),
@@ -108,6 +112,20 @@ impl PrHandle {
     /// The authenticated GitHub login, when known.
     pub fn viewer(&self) -> Option<&str> {
         self.viewer.as_deref()
+    }
+
+    /// The PR's lifecycle status (draft / open / merged / closed), for the header
+    /// badge — as resolved at load.
+    pub fn status(&self) -> PrStatus {
+        self.pr.status()
+    }
+
+    /// Re-fetch the PR's status from GitHub — the refresh path, so the badge
+    /// follows a transition (open → merged, closed → …) on Ctrl-R.
+    pub fn fetch_status(&self) -> Result<PrStatus, String> {
+        self.client
+            .fetch_pr_status(&self.pr)
+            .map_err(|e| e.to_string())
     }
 
     /// Re-pull the PR's threads from GitHub.
