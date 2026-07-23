@@ -100,7 +100,10 @@ lr session comment rm --repo . --comment <id>                     # withdraw a l
 - `comment add` needs `--file`, `--line`, and `--body`; `--side` defaults to
   `new` and `--author` to `agent`. The line must be one shown in the current diff.
 - `--draft` queues a comment for the human to submit; without it the comment (or
-  reply) is a local note. `--draft` only matters on a pull request.
+  reply) is a local note. `--draft` only matters on a pull request. A `--draft`
+  **reply** is refused under a local-note root — it could never be sent while the
+  root stays off GitHub — so reply without `--draft`, or have the root promoted
+  to a draft first.
 - `comment edit --comment <id> --body <text>` replaces the body of one of your
   own unpublished comments (a draft or local note, root or reply). It refuses a
   published comment (writing to GitHub is the human's action) and another
@@ -171,3 +174,6 @@ Guidelines:
   from `review` output; the line must be part of the current diff.
 - **"resolving a published pull-request thread is a human action"** — leave it
   for the human; you can still reply.
+- **"the thread root is local — promote it first, or reply without --draft"** —
+  you passed `--draft` on a reply whose thread root is a local note; drop
+  `--draft` (the reply inherits local) or ask the human to make the root a draft.
