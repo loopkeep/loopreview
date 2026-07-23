@@ -1,14 +1,17 @@
 //! A small markdown renderer for comment bodies.
 //!
 //! Parses with `pulldown-cmark` and paints to ratatui lines: headings, emphasis,
-//! inline and fenced code (syntax-highlighted via [`Highlighter`]), lists, and
-//! block quotes. Paragraphs word-wrap to a width when one is given (the
-//! Conversation pane), or render unwrapped for tight inline display.
+//! inline and fenced code (syntax-highlighted via [`Highlighter`]), lists, block
+//! quotes, GitHub alerts (`> [!NOTE]` …), task lists, and GFM tables. Paragraphs
+//! word-wrap to a width when one is given (the Conversation and Overview panes),
+//! or render unwrapped for tight inline display.
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TextLine, Span as TextSpan};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::palette;
 
@@ -28,11 +31,18 @@ pub fn render(
         spans: Vec::new(),
         style: Style::default(),
         list: Vec::new(),
-        quote: 0,
+        quotes: Vec::new(),
+        task: None,
         code: None,
         link: None,
+        table: None,
     };
-    let options = Options::ENABLE_STRIKETHROUGH;
+    // GFM adds alert blockquotes (`> [!NOTE]`); tables and task lists are the
+    // other two GFM constructs a PR body leans on.
+    let options = Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_GFM
+        | Options::ENABLE_TABLES
+        | Options::ENABLE_TASKLISTS;
     for event in Parser::new_ext(text, options) {
         renderer.event(event);
     }
@@ -44,20 +54,34 @@ struct List {
     next: Option<u64>,
 }
 
+/// A table being collected, cell by cell, until its end lays it out.
+struct TableBuild {
+    aligns: Vec<Alignment>,
+    head: Vec<Vec<TextSpan<'static>>>,
+    rows: Vec<Vec<Vec<TextSpan<'static>>>>,
+    in_head: bool,
+    row: Vec<Vec<TextSpan<'static>>>,
+}
+
 struct Renderer<'a> {
     wrap: Option<usize>,
     highlighter: &'a Highlighter,
     out: Vec<TextLine<'static>>,
-    /// Inline spans accumulating for the current block.
+    /// Inline spans accumulating for the current block (or table cell).
     spans: Vec<TextSpan<'static>>,
     /// The active inline style (emphasis/strong/strikethrough).
     style: Style,
     list: Vec<List>,
-    quote: usize,
+    /// The blockquote nesting, each `Some(kind)` for a GitHub alert.
+    quotes: Vec<Option<BlockQuoteKind>>,
+    /// A pending task-list checkbox for the next list item (`Some(checked)`).
+    task: Option<bool>,
     /// Fenced code-block language + collected text, while inside one.
     code: Option<(String, String)>,
     /// A link's destination, while inside one.
     link: Option<String>,
+    /// A table being built, while inside one.
+    table: Option<TableBuild>,
 }
 
 impl Renderer<'_> {
@@ -79,6 +103,9 @@ impl Renderer<'_> {
                     self.style.fg(palette::CODE_FG).bg(palette::CODE_INLINE_BG),
                 ));
             }
+            // A `- [ ]` / `- [x]` marker: remembered so the item's bullet becomes
+            // a checkbox (rather than adding a second glyph beside the bullet).
+            Event::TaskListMarker(checked) => self.task = Some(checked),
             Event::SoftBreak | Event::HardBreak => {
                 self.spans.push(TextSpan::styled(" ", self.style));
             }
@@ -93,7 +120,12 @@ impl Renderer<'_> {
             Tag::Strikethrough => self.style = self.style.add_modifier(Modifier::CROSSED_OUT),
             Tag::Link { dest_url, .. } => self.link = Some(dest_url.into_string()),
             Tag::List(start) => self.list.push(List { next: start }),
-            Tag::BlockQuote(_) => self.quote += 1,
+            Tag::BlockQuote(kind) => {
+                self.quotes.push(kind);
+                if let Some(kind) = kind {
+                    self.alert_header(kind);
+                }
+            }
             Tag::CodeBlock(kind) => {
                 self.flush_block();
                 let lang = match kind {
@@ -107,6 +139,28 @@ impl Renderer<'_> {
                 };
                 self.code = Some((lang, String::new()));
             }
+            Tag::Table(aligns) => {
+                self.flush_block();
+                self.table = Some(TableBuild {
+                    aligns,
+                    head: Vec::new(),
+                    rows: Vec::new(),
+                    in_head: false,
+                    row: Vec::new(),
+                });
+            }
+            Tag::TableHead => {
+                if let Some(t) = &mut self.table {
+                    t.in_head = true;
+                    t.row = Vec::new();
+                }
+            }
+            Tag::TableRow => {
+                if let Some(t) = &mut self.table {
+                    t.row = Vec::new();
+                }
+            }
+            Tag::TableCell => self.spans.clear(),
             _ => {}
         }
     }
@@ -140,27 +194,81 @@ impl Renderer<'_> {
             TagEnd::List(_) => {
                 self.list.pop();
             }
-            TagEnd::BlockQuote(_) => self.quote = self.quote.saturating_sub(1),
+            TagEnd::BlockQuote(_) => {
+                self.quotes.pop();
+            }
             TagEnd::Item => self.flush_block(),
             TagEnd::CodeBlock => self.flush_code(),
+            TagEnd::TableCell => {
+                let cell = std::mem::take(&mut self.spans);
+                if let Some(t) = &mut self.table {
+                    t.row.push(cell);
+                }
+            }
+            TagEnd::TableHead => {
+                if let Some(t) = &mut self.table {
+                    t.head = std::mem::take(&mut t.row);
+                    t.in_head = false;
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(t) = &mut self.table
+                    && !t.in_head
+                {
+                    let row = std::mem::take(&mut t.row);
+                    t.rows.push(row);
+                }
+            }
+            TagEnd::Table => self.flush_table(),
             _ => {}
         }
+    }
+
+    /// Emit a GitHub alert's coloured header line (`⚠ Warning`, …) at the top of
+    /// its blockquote, with the quote bars in the same colour.
+    fn alert_header(&mut self, kind: BlockQuoteKind) {
+        self.flush_block();
+        let (glyph, label, color) = alert_style(kind);
+        let bars = "▏ ".repeat(self.quotes.len());
+        self.out.push(TextLine::from(vec![
+            TextSpan::styled(bars, Style::default().fg(color)),
+            TextSpan::styled(
+                format!("{glyph} {label}"),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+
+    /// The colour of the nearest enclosing alert, for tinting its quote bar.
+    fn alert_color(&self) -> Option<Color> {
+        self.quotes
+            .iter()
+            .rev()
+            .flatten()
+            .next()
+            .map(|k| alert_style(*k).2)
     }
 
     /// The prefix strings for the first and continuation lines of the current
     /// block, from the list and blockquote nesting.
     fn prefixes(&mut self) -> (String, String) {
-        let quote = "▏ ".repeat(self.quote);
+        let quote = "▏ ".repeat(self.quotes.len());
         let indent = "  ".repeat(self.list.len().saturating_sub(1));
+        let task = self.task.take();
         match self.list.last_mut() {
             Some(list) => {
-                let bullet = match &mut list.next {
-                    Some(n) => {
-                        let marker = format!("{n}. ");
-                        *n += 1;
-                        marker
+                // A task item shows a checkbox in place of its bullet.
+                let bullet = if let Some(checked) = task {
+                    if checked { "☑ " } else { "☐ " }.to_string()
+                } else {
+                    match &mut list.next {
+                        Some(n) => {
+                            let marker = format!("{n}. ");
+                            *n += 1;
+                            marker
+                        }
+                        None => "• ".to_string(),
                     }
-                    None => "• ".to_string(),
                 };
                 let pad = " ".repeat(bullet.chars().count());
                 (
@@ -177,9 +285,10 @@ impl Renderer<'_> {
         if self.spans.is_empty() {
             return;
         }
+        let color = self.alert_color();
         let (first, cont) = self.prefixes();
         let spans = std::mem::take(&mut self.spans);
-        let lines = wrap_spans(&spans, self.wrap, &first, &cont);
+        let lines = wrap_spans(&spans, self.wrap, &first, &cont, color);
         self.out.extend(lines);
     }
 
@@ -204,6 +313,17 @@ impl Renderer<'_> {
         }
     }
 
+    /// Lay out the collected table and emit its lines.
+    fn flush_table(&mut self) {
+        let Some(table) = self.table.take() else {
+            return;
+        };
+        let prefix = "▏ ".repeat(self.quotes.len());
+        let color = self.alert_color();
+        let lines = render_table(&table, self.wrap, &prefix, color);
+        self.out.extend(lines);
+    }
+
     fn finish(mut self) -> Vec<TextLine<'static>> {
         self.flush_block();
         if self.out.is_empty() {
@@ -224,15 +344,28 @@ fn heading_depth(level: HeadingLevel) -> usize {
     }
 }
 
+/// A GitHub alert's glyph, label, and colour, following GitHub's semantics.
+fn alert_style(kind: BlockQuoteKind) -> (&'static str, &'static str, Color) {
+    match kind {
+        BlockQuoteKind::Note => ("ⓘ", "Note", Color::Blue),
+        BlockQuoteKind::Tip => ("✔", "Tip", Color::Green),
+        BlockQuoteKind::Important => ("★", "Important", Color::Magenta),
+        BlockQuoteKind::Warning => ("⚠", "Warning", Color::Yellow),
+        BlockQuoteKind::Caution => ("⚠", "Caution", Color::Red),
+    }
+}
+
 /// Word-wrap styled spans to `wrap` display columns (when set), prefixing the
-/// first line with `first` and the rest with `cont`.
+/// first line with `first` and the rest with `cont`. `prefix_color` tints the
+/// prefix (an alert's bar colour, else the default dim).
 fn wrap_spans(
     spans: &[TextSpan<'static>],
     wrap: Option<usize>,
     first: &str,
     cont: &str,
+    prefix_color: Option<Color>,
 ) -> Vec<TextLine<'static>> {
-    let prefix_style = Style::default().fg(Color::DarkGray);
+    let prefix_style = Style::default().fg(prefix_color.unwrap_or(Color::DarkGray));
 
     let Some(width) = wrap else {
         // No wrapping: one line, prefixed.
@@ -300,6 +433,267 @@ fn build_line(
     TextLine::from(line)
 }
 
+fn span_width(spans: &[TextSpan<'static>]) -> usize {
+    spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum()
+}
+
+/// Lay out a GFM table to fit `wrap` columns: natural column widths when they
+/// fit, else shrink the widest and wrap cell content to multiple lines. Never
+/// wider than the pane. `prefix` (quote bars) leads every line.
+fn render_table(
+    table: &TableBuild,
+    wrap: Option<usize>,
+    prefix: &str,
+    prefix_color: Option<Color>,
+) -> Vec<TextLine<'static>> {
+    let cols = table
+        .head
+        .len()
+        .max(table.rows.iter().map(Vec::len).max().unwrap_or(0));
+    if cols == 0 {
+        return Vec::new();
+    }
+    let prefix_style = Style::default().fg(prefix_color.unwrap_or(Color::DarkGray));
+    let dim = Style::default().fg(Color::DarkGray);
+    let gutter = " │ ";
+    let gutter_w = UnicodeWidthStr::width(gutter);
+
+    // Natural column widths (max cell width in each column, ≥ 1).
+    let mut widths = vec![1usize; cols];
+    for row in std::iter::once(&table.head).chain(table.rows.iter()) {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(span_width(cell));
+        }
+    }
+
+    // No wrapping: one line per row, cells joined by the gutter (the caller's
+    // 1-line clip bounds it).
+    let Some(total) = wrap else {
+        let mut out = vec![table_flat_row(
+            &table.head,
+            cols,
+            prefix,
+            prefix_style,
+            dim,
+            gutter,
+            true,
+        )];
+        out.extend(
+            table
+                .rows
+                .iter()
+                .map(|r| table_flat_row(r, cols, prefix, prefix_style, dim, gutter, false)),
+        );
+        return out;
+    };
+
+    // Shrink the widest columns until the row fits the pane.
+    let avail = total.saturating_sub(prefix_width(prefix));
+    let content_avail = avail
+        .saturating_sub(gutter_w * cols.saturating_sub(1))
+        .max(cols);
+    const MIN_COL: usize = 3;
+    while widths.iter().sum::<usize>() > content_avail {
+        let widest = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w > MIN_COL)
+            .max_by_key(|(_, w)| **w)
+            .map(|(i, _)| i);
+        match widest {
+            Some(i) => widths[i] -= 1,
+            None => break, // all at the floor — accept a slight overflow
+        }
+    }
+
+    let mut out = table_row(
+        &table.head,
+        &widths,
+        &table.aligns,
+        prefix,
+        prefix_style,
+        dim,
+        gutter,
+        true,
+    );
+    // The header separator (a dim rule, gutters crossed).
+    let mut sep = vec![TextSpan::styled(prefix.to_string(), prefix_style)];
+    for (i, &w) in widths.iter().enumerate() {
+        if i > 0 {
+            sep.push(TextSpan::styled("─┼─".to_string(), dim));
+        }
+        sep.push(TextSpan::styled("─".repeat(w), dim));
+    }
+    out.push(TextLine::from(sep));
+    for row in &table.rows {
+        out.extend(table_row(
+            row,
+            &widths,
+            &table.aligns,
+            prefix,
+            prefix_style,
+            dim,
+            gutter,
+            false,
+        ));
+    }
+    out
+}
+
+/// One un-wrapped table row (for the no-wrap path).
+fn table_flat_row(
+    row: &[Vec<TextSpan<'static>>],
+    cols: usize,
+    prefix: &str,
+    prefix_style: Style,
+    dim: Style,
+    gutter: &str,
+    bold: bool,
+) -> TextLine<'static> {
+    let mut spans = vec![TextSpan::styled(prefix.to_string(), prefix_style)];
+    for i in 0..cols {
+        if i > 0 {
+            spans.push(TextSpan::styled(gutter.to_string(), dim));
+        }
+        if let Some(cell) = row.get(i) {
+            for s in cell {
+                let style = if bold {
+                    s.style.add_modifier(Modifier::BOLD)
+                } else {
+                    s.style
+                };
+                spans.push(TextSpan::styled(s.content.to_string(), style));
+            }
+        }
+    }
+    TextLine::from(spans)
+}
+
+/// A table row wrapped to `widths`, aligned per column, as one or more lines.
+#[allow(clippy::too_many_arguments)]
+fn table_row(
+    row: &[Vec<TextSpan<'static>>],
+    widths: &[usize],
+    aligns: &[Alignment],
+    prefix: &str,
+    prefix_style: Style,
+    dim: Style,
+    gutter: &str,
+    bold: bool,
+) -> Vec<TextLine<'static>> {
+    let cols = widths.len();
+    let empty: Vec<TextSpan<'static>> = Vec::new();
+    let wrapped: Vec<Vec<Vec<TextSpan<'static>>>> = (0..cols)
+        .map(|i| wrap_cell(row.get(i).unwrap_or(&empty), widths[i], bold))
+        .collect();
+    let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+
+    let mut lines = Vec::new();
+    for li in 0..height {
+        let mut spans = vec![TextSpan::styled(prefix.to_string(), prefix_style)];
+        for i in 0..cols {
+            if i > 0 {
+                spans.push(TextSpan::styled(gutter.to_string(), dim));
+            }
+            let line = wrapped[i].get(li).cloned().unwrap_or_default();
+            let content_w = span_width(&line);
+            let pad = widths[i].saturating_sub(content_w);
+            let (lpad, rpad) = match aligns.get(i).copied().unwrap_or(Alignment::None) {
+                Alignment::Right => (pad, 0),
+                Alignment::Center => (pad / 2, pad - pad / 2),
+                Alignment::Left | Alignment::None => (0, pad),
+            };
+            if lpad > 0 {
+                spans.push(TextSpan::raw(" ".repeat(lpad)));
+            }
+            spans.extend(line);
+            if rpad > 0 {
+                spans.push(TextSpan::raw(" ".repeat(rpad)));
+            }
+        }
+        lines.push(TextLine::from(spans));
+    }
+    lines
+}
+
+/// Word-wrap one cell's styled spans to `width` columns, hard-breaking a word
+/// that is itself too wide. Header cells render bold.
+fn wrap_cell(spans: &[TextSpan<'static>], width: usize, bold: bool) -> Vec<Vec<TextSpan<'static>>> {
+    let width = width.max(1);
+    let mut words: Vec<(String, Style)> = Vec::new();
+    for s in spans {
+        let style = if bold {
+            s.style.add_modifier(Modifier::BOLD)
+        } else {
+            s.style
+        };
+        for w in s.content.split(' ') {
+            if !w.is_empty() {
+                words.push((w.to_string(), style));
+            }
+        }
+    }
+    let mut lines: Vec<Vec<TextSpan<'static>>> = Vec::new();
+    let mut cur: Vec<TextSpan<'static>> = Vec::new();
+    let mut used = 0usize;
+    for (word, style) in words {
+        let mut word = word;
+        loop {
+            let ww = UnicodeWidthStr::width(word.as_str());
+            let sep = usize::from(!cur.is_empty());
+            if used + sep + ww <= width {
+                if sep == 1 {
+                    cur.push(TextSpan::styled(" ", style));
+                    used += 1;
+                }
+                cur.push(TextSpan::styled(word, style));
+                used += ww;
+                break;
+            }
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+                used = 0;
+                continue; // retry the word on a fresh line
+            }
+            // The word alone exceeds the column: hard-break it.
+            let (head, tail) = split_at_width(&word, width);
+            cur.push(TextSpan::styled(head, style));
+            lines.push(std::mem::take(&mut cur));
+            used = 0;
+            word = tail;
+            if word.is_empty() {
+                break;
+            }
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(Vec::new());
+    }
+    lines
+}
+
+/// Split `s` at `width` display columns, always taking at least one char (so a
+/// wide glyph in a narrow column makes progress rather than looping).
+fn split_at_width(s: &str, width: usize) -> (String, String) {
+    let mut w = 0;
+    let mut idx = 0;
+    for (i, ch) in s.char_indices() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if i > 0 && w + cw > width {
+            break;
+        }
+        w += cw;
+        idx = i + ch.len_utf8();
+    }
+    (s[..idx].to_string(), s[idx..].to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +701,15 @@ mod tests {
     /// The concatenated plain text of a rendered line.
     fn text_of(line: &TextLine) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// The foreground colour of the first span carrying `needle`.
+    fn color_of(lines: &[TextLine], needle: &str) -> Option<Color> {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains(needle))
+            .map(|s| s.style.fg.unwrap_or(Color::Reset))
     }
 
     #[test]
@@ -334,5 +737,117 @@ mod tests {
         let joined: String = lines.iter().map(text_of).collect();
         assert!(joined.contains('x'));
         assert!(joined.contains('y'));
+    }
+
+    #[test]
+    fn github_alerts_get_a_coloured_header_and_no_raw_marker() {
+        let hl = Highlighter::new();
+        for (src, label, color) in [
+            ("> [!NOTE]\n> hi", "Note", Color::Blue),
+            ("> [!TIP]\n> hi", "Tip", Color::Green),
+            ("> [!IMPORTANT]\n> hi", "Important", Color::Magenta),
+            ("> [!WARNING]\n> hi", "Warning", Color::Yellow),
+            ("> [!CAUTION]\n> hi", "Caution", Color::Red),
+        ] {
+            let lines = render(src, Some(40), &hl);
+            let joined: String = lines.iter().map(text_of).collect();
+            assert!(joined.contains(label), "{label} header shown: {joined:?}");
+            assert!(
+                !joined.contains("[!"),
+                "the raw alert marker is gone: {joined:?}"
+            );
+            assert_eq!(color_of(&lines, label), Some(color), "{label} is coloured");
+        }
+    }
+
+    #[test]
+    fn a_plain_blockquote_is_unchanged() {
+        let hl = Highlighter::new();
+        let lines = render("> just a quote", Some(40), &hl);
+        let joined: String = lines.iter().map(text_of).collect();
+        assert!(joined.contains("just a quote"));
+        assert!(!joined.contains("Note") && !joined.contains("[!"));
+        assert!(joined.contains('▏'), "the quote bar is kept");
+    }
+
+    #[test]
+    fn task_list_items_render_checkboxes() {
+        let hl = Highlighter::new();
+        let lines = render("- [ ] todo\n- [x] done", None, &hl);
+        assert_eq!(text_of(&lines[0]), "☐ todo");
+        assert_eq!(text_of(&lines[1]), "☑ done");
+    }
+
+    #[test]
+    fn a_table_aligns_columns_with_a_header_rule() {
+        let hl = Highlighter::new();
+        let src = "\
+| Left | Mid | Right |
+| :--- | :-: | ----: |
+| a | bb | c |
+| dd | e | fff |";
+        let lines = render(src, Some(40), &hl);
+        let texts: Vec<String> = lines.iter().map(text_of).collect();
+        // Header, a dim rule, then two body rows.
+        assert!(texts[0].contains("Left") && texts[0].contains("Right"));
+        assert!(
+            texts[1].contains('─'),
+            "a rule under the header: {:?}",
+            texts[1]
+        );
+        assert!(texts.iter().any(|t| t.contains("fff")), "body rendered");
+        // Header cells are bold.
+        let left = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("Left"))
+            .unwrap();
+        assert!(left.style.add_modifier.contains(Modifier::BOLD));
+        // Right-aligned column pads on the left: "c" sits at the column's end.
+        let right_row = &texts[2];
+        assert!(
+            right_row.trim_end().ends_with('c'),
+            "right column is right-aligned: {right_row:?}"
+        );
+    }
+
+    #[test]
+    fn a_wide_table_shrinks_and_wraps_within_the_pane() {
+        let hl = Highlighter::new();
+        let src = "\
+| Col |
+| --- |
+| one two three four five six seven eight |";
+        let width = 16;
+        let lines = render(src, Some(width), &hl);
+        for line in &lines {
+            assert!(
+                UnicodeWidthStr::width(text_of(line).as_str()) <= width,
+                "no line exceeds the pane: {:?}",
+                text_of(line)
+            );
+        }
+        // The long cell wrapped to more than the header + rule + one line.
+        assert!(lines.len() > 3, "the cell wrapped across lines");
+    }
+
+    #[test]
+    fn table_cells_keep_inline_styles_and_cjk_width() {
+        let hl = Highlighter::new();
+        let src = "\
+| Name | Note |
+| --- | --- |
+| `code` | 日本語 |";
+        let lines = render(src, Some(40), &hl);
+        // The inline code cell keeps its code background.
+        let code = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("code"));
+        assert!(code.is_some_and(|s| s.style.bg == Some(palette::CODE_INLINE_BG)));
+        // No line overruns despite the wide CJK glyphs.
+        for line in &lines {
+            assert!(UnicodeWidthStr::width(text_of(line).as_str()) <= 40);
+        }
     }
 }
