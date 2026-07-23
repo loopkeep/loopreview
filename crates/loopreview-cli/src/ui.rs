@@ -2367,7 +2367,7 @@ impl App {
             }
             let Some(endpoint) = self.published_endpoint(&thread_id, &comment_id) else {
                 return Err(
-                    "this comment has no synced API id — refresh the PR (Ctrl-R); if that doesn't help, manage it on GitHub".to_string(),
+                    "this comment has no synced API id — refresh (Ctrl-R); if that doesn't help, manage it on GitHub".to_string(),
                 );
             };
             // A submitted review's summary has no GitHub delete.
@@ -2570,7 +2570,7 @@ impl App {
         // A published comment needs an addressable id on GitHub to edit (a pulled
         // comment can report a null databaseId).
         if published && self.published_endpoint(&thread_id, &comment_id).is_none() {
-            self.status = Some("this comment has no synced API id — refresh the PR (Ctrl-R); if that doesn't help, manage it on GitHub".to_string());
+            self.status = Some("this comment has no synced API id — refresh (Ctrl-R); if that doesn't help, manage it on GitHub".to_string());
             return;
         }
         self.input = Some(Compose {
@@ -2641,10 +2641,11 @@ impl App {
 
     /// What saving the composer does, phrased for the current context (used in
     /// the hint bar next to whichever key saves): a plain review has no
-    /// local/draft split ("save comment"); on a pull request the word tracks the
-    /// resulting kind — "save draft" (queued for submit) or "save note" (local).
+    /// local/draft split ("save comment"); on a GitHub subject (pull request or
+    /// issue) the word tracks the resulting kind — "save draft" (queued to
+    /// submit/send) or "save note" (local).
     fn compose_save_label(&self) -> &'static str {
-        if self.pr.is_none() {
+        if !self.has_subject() {
             return "save comment";
         }
         let Some(compose) = self.input.as_ref() else {
@@ -5727,8 +5728,15 @@ impl App {
             .border_style(Style::default().fg(Color::Yellow));
         let inner = block.inner(area);
         f.render_widget(block, area);
-        let prompt = if self.pr.is_some() {
-            "Discard your local drafts for this pull request?".to_string()
+        // A GitHub subject (PR or issue) only discards its local drafts here — it
+        // never deletes the shared store — so the prompt must not threaten that.
+        let prompt = if self.has_subject() {
+            let subject = if self.is_issue() {
+                "issue"
+            } else {
+                "pull request"
+            };
+            format!("Discard your local drafts for this {subject}?")
         } else {
             format!(
                 "Delete all {} thread(s) and close this review?",
@@ -5974,6 +5982,7 @@ impl App {
                 "No description provided.",
                 Style::default().fg(Color::DarkGray),
             )));
+            lines.push(TextLine::from("")); // bottom breathing room at the scroll end
             self.overview_regions.replace(Vec::new());
             self.overview_effective.replace(HashMap::new());
             return crate::markdown::Rendered {
@@ -5997,6 +6006,7 @@ impl App {
             region.line += preamble;
         }
         lines.extend(body.lines);
+        lines.push(TextLine::from("")); // bottom breathing room at the scroll end
         self.overview_effective.replace(effective.into_inner());
         self.overview_regions.replace(body.regions.clone());
         crate::markdown::Rendered {
@@ -6319,9 +6329,10 @@ impl App {
     /// review), never a filename — the threads there span files.
     fn pane_title(&self) -> String {
         if self.view == View::Conversation {
-            return match &self.pr {
-                Some(pr) => format!(" PR #{} — {} ", pr.number(), pr.title()),
-                None => format!(" Review — {} ", self.label),
+            return match (&self.pr, &self.issue) {
+                (Some(pr), _) => format!(" PR #{} — {} ", pr.number(), pr.title()),
+                (_, Some(issue)) => format!(" Issue #{} — {} ", issue.number(), issue.title()),
+                _ => format!(" Review — {} ", self.label),
             };
         }
         match self.diff.files.get(self.current_file()) {
@@ -6488,7 +6499,9 @@ impl App {
             // palette's grey-out). Everything else is one `? all` away.
             spans.push(TextSpan::styled(self.footer_ops(), bar.fg(Color::DarkGray)));
             if self.action_available(Action::Submit) {
-                spans.push(TextSpan::styled(" · ^s submit", bar.fg(PR_ACCENT)));
+                // An issue has no submit modal — Ctrl-S sends the queued comments.
+                let verb = if self.is_issue() { "send" } else { "submit" };
+                spans.push(TextSpan::styled(format!(" · ^s {verb}"), bar.fg(PR_ACCENT)));
             }
             let palette_key = self.keymap.key_for(Action::Palette).unwrap_or("?");
             spans.push(TextSpan::styled(
@@ -14008,7 +14021,7 @@ mod tests {
         // Regression: the #N link and the status badge were PR-gated, so an issue
         // header showed a plain label with no link and no badge.
         let mut app = issue_app();
-        app.label = "issue owner/repo#5".to_string(); // as the real issue load sets it
+        app.label = "Issue #5".to_string(); // as the real issue load sets it
         app.set_view(View::Overview);
         let mut term = Terminal::new(TestBackend::new(120, 6)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
@@ -14156,6 +14169,54 @@ mod tests {
     }
 
     #[test]
+    fn issue_display_matches_the_pr_shape() {
+        let mut app = issue_app();
+        app.set_view(View::Conversation);
+        // Frame title: `Issue #N — <title>`, symmetric with a PR.
+        assert_eq!(app.pane_title(), " Issue #5 — Flaky retry ");
+        // The subject label is capitalized and slug-less.
+        assert_eq!(app.issue.as_ref().unwrap().number(), 5);
+        // The composer no longer falls to the plain-review "save comment".
+        assert_ne!(app.compose_save_label(), "save comment");
+    }
+
+    #[test]
+    fn the_issue_close_modal_discards_drafts_not_delete_all() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = issue_app();
+        app.confirming_close = true;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(
+            screen.contains("Discard your local drafts for this issue?"),
+            "the issue close prompt is about drafts: {screen:?}"
+        );
+        assert!(
+            !screen.contains("Delete all"),
+            "no scary delete-all wording for an issue: {screen:?}"
+        );
+    }
+
+    #[test]
+    fn the_issue_footer_says_send_not_submit() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut app = issue_app();
+        app.set_view(View::Conversation);
+        app.status = None; // so the footer shows the action hints, not a status
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(
+            screen.contains("^s send"),
+            "issue footer says send: {screen:?}"
+        );
+        assert!(!screen.contains("^s submit"), "not submit: {screen:?}");
+    }
+
+    #[test]
     fn the_overview_shows_a_rule_below_the_facts() {
         // Both a PR and an issue Overview separate the facts block from the body
         // with a dim, full-width rule.
@@ -14257,6 +14318,19 @@ mod tests {
             "a plain body has no link regions"
         );
         assert!(app.conv_action_at(0, 0).is_none());
+    }
+
+    #[test]
+    fn the_overview_body_ends_with_bottom_padding() {
+        // A trailing blank so the last body line doesn't sit on the pane's floor.
+        let app = issue_app();
+        let lines = app.overview_lines(40);
+        assert!(
+            lines
+                .last()
+                .is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty())),
+            "the overview ends with a blank line"
+        );
     }
 
     #[test]

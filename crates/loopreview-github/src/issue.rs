@@ -59,9 +59,10 @@ impl ResolvedIssue {
         format!("{}/{}", self.owner, self.repo)
     }
 
-    /// A short label such as `issue #42` for UI headers.
+    /// A short label such as `Issue #42` for UI headers — capitalized and
+    /// slug-less, the same shape as a pull request's `PR #42`.
     pub fn label(&self) -> String {
-        format!("issue #{}", self.number)
+        format!("Issue #{}", self.number)
     }
 
     /// Parse the REST issue response, filling `owner`/`repo` (not in the body).
@@ -138,7 +139,7 @@ mod tests {
         assert_eq!(issue.url, "https://github.com/o/r/issues/42");
         assert_eq!(issue.status(), IssueStatus::NotPlanned);
         assert_eq!(issue.slug(), "o/r");
-        assert_eq!(issue.label(), "issue #42");
+        assert_eq!(issue.label(), "Issue #42");
     }
 
     #[test]

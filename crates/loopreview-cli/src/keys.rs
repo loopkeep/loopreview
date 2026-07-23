@@ -146,7 +146,7 @@ impl Action {
             Action::ToggleSidebar => "Toggle the file sidebar",
             Action::FileFinder => "Open the fuzzy file finder",
             Action::Refresh => "Refresh from GitHub",
-            Action::Submit => "Open the submit modal",
+            Action::Submit => "Submit or send your queued comments to GitHub",
             Action::Palette => "Open this command palette",
             Action::OpenGithub => "Open the current spot on github.com",
         }

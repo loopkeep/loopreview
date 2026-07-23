@@ -53,7 +53,7 @@ lr session comment list [<id>|--repo .] [--json]
 
 - `list`/`get` report the session id, pid, repo, and **source** — a descriptive
   label such as `working tree`, `git diff main...`, `show HEAD~1 (a1b2c3d)` (one
-  commit's changes), `PR #7`, or `issue owner/repo#5`. When a repo has more than
+  commit's changes), `PR #7`, or `Issue #5`. When a repo has more than
   one live session (say a worktree review and a `lr show`), match on the source
   string to pick the id you want.
 - On a **pull-request or issue** session, `get` also carries a `subject` object:

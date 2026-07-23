@@ -69,7 +69,7 @@ pub fn fetch_subject(
             })
         }
         Subject::Issue(issue) => {
-            let label = format!("issue {}#{}", issue.slug(), issue.number);
+            let label = issue.label();
             progress(&format!("fetching {label} comments…"));
             let threads = client.pull_issue(&issue).map_err(|e| e.to_string())?;
             let viewer = client.viewer_login().ok();
@@ -192,6 +192,16 @@ impl IssueHandle {
     /// keyspace as a PR (a number is either a PR or an issue, never both).
     pub fn draft_key(&self) -> String {
         format!("{}#{}", self.issue.slug(), self.issue.number)
+    }
+
+    /// The issue number.
+    pub fn number(&self) -> u64 {
+        self.issue.number
+    }
+
+    /// The issue title.
+    pub fn title(&self) -> &str {
+        &self.issue.title
     }
 
     /// The canonical issue URL — the page to open, and a published comment's
