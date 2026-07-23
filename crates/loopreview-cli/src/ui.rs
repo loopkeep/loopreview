@@ -2932,6 +2932,35 @@ impl App {
         }
     }
 
+    /// Jump the diff view to `file`'s header: expand it if collapsed, land the
+    /// cursor on the header row, and move focus to the body. The sidebar activate
+    /// (click / `l` / Enter) uses this — it navigates but never folds, so landing
+    /// on the header means a second Enter (the diff pane's header-fold) collapses
+    /// the file, keeping the old toggle as a predictable two-key sequence.
+    fn jump_to_file_header(&mut self, file: usize) {
+        if file >= self.diff.files.len() {
+            return;
+        }
+        if let Some(path) = self
+            .diff
+            .files
+            .get(file)
+            .map(|f| f.display_path().to_string())
+            && self.collapsed_files.remove(&path)
+        {
+            let diff = std::mem::take(&mut self.diff);
+            self.apply_layout(diff);
+        }
+        self.view = View::Files;
+        self.focus = Focus::Body;
+        self.sidebar_cursor = file;
+        self.hscroll = 0; // a file jump resets horizontal scroll
+        if let Some(header) = self.file_first.get(file).copied().flatten() {
+            self.cursor = header.min(self.clines.len().saturating_sub(1));
+            self.follow_cursor();
+        }
+    }
+
     /// `b`: hidden → show and focus; visible & body-focused → focus it; visible &
     /// focused → hide. The override is temporary — a resize re-evaluates the mode.
     fn toggle_sidebar(&mut self) {
@@ -3038,8 +3067,9 @@ impl App {
             Action::MoveUp => self.move_sidebar_file(-1),
             Action::Top => self.jump_sidebar_file(SidebarEnd::First),
             Action::Bottom => self.jump_sidebar_file(SidebarEnd::Last),
-            // `l` / Enter toggle the file (expand + jump, or collapse in place);
-            // `o` is a pure fold toggle; `h` is a no-op (the outermost level).
+            // `l` / Enter jump to the file (expanding it if collapsed) and hand
+            // focus to the body — navigate only, never fold. `o` is a pure fold
+            // toggle; `h` is a no-op (the outermost level).
             Action::NavIn => self.sidebar_activate(self.sidebar_cursor),
             Action::Fold => self.toggle_fold_at(self.sidebar_cursor),
             _ => {}
@@ -3077,26 +3107,14 @@ impl App {
         }
     }
 
-    /// Activate a file from the sidebar (`l` / Enter / click): a collapsed file
-    /// expands and the body jumps to it (focus follows into the body); an
-    /// already-open file collapses in place, focus staying in the sidebar.
+    /// Activate a file from the sidebar (`l` / Enter / click): navigate to it —
+    /// jump/confirm only, never fold. A table-of-contents entry navigates (the
+    /// GitHub file-tree / VS Code standard), it does not toggle: a collapsed file
+    /// expands, an open file is simply jumped to; either way the cursor lands on
+    /// the file's header and focus moves to the body. Folding an open file is the
+    /// diff pane's Enter on that header — reachable as a second Enter after this.
     fn sidebar_activate(&mut self, file: usize) {
-        if file >= self.diff.files.len() {
-            return;
-        }
-        self.sidebar_cursor = file;
-        let collapsed = self
-            .diff
-            .files
-            .get(file)
-            .is_some_and(|f| self.collapsed_files.contains(f.display_path()));
-        if collapsed {
-            self.jump_to_file(file);
-        } else {
-            self.set_file_collapsed(file, Some(true));
-            self.focus = Focus::Sidebar;
-            self.follow_sidebar();
-        }
+        self.jump_to_file_header(file);
     }
 
     /// Route a key while the thread index (Conversation sidebar) has focus. The
@@ -12299,7 +12317,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_toggle_selects_and_jumps() {
+    fn sidebar_activate_jumps_without_folding() {
         let mut app = multi_file_app(&["a.rs", "b.rs", "c.rs"]);
         for p in ["a.rs", "b.rs", "c.rs"] {
             app.collapsed_files.insert(p.to_string());
@@ -12311,20 +12329,22 @@ mod tests {
         app.sidebar_action(Action::MoveDown);
         app.sidebar_action(Action::MoveDown);
         assert_eq!(app.sidebar_cursor, 2);
-        // l on a collapsed file expands it and jumps the body into it.
+        // l on a collapsed file expands it and jumps the body onto its header.
         app.sidebar_action(Action::NavIn);
         assert_eq!(app.current_file(), 2);
         assert_eq!(app.focus, Focus::Body);
+        assert!(app.cursor_is_header(), "the jump lands on the file header");
         assert!(!app.collapsed_files.contains("c.rs"));
-        // Activating the now-open file again collapses it, focus staying put.
+        // Activating the now-open file again does NOT fold it — it just re-jumps
+        // (navigate, never toggle). Folding is the diff pane's Enter on the header.
         app.focus_sidebar();
         app.sidebar_action(Action::NavIn);
-        assert!(app.collapsed_files.contains("c.rs"));
-        assert_eq!(
-            app.focus,
-            Focus::Sidebar,
-            "collapsing from the sidebar keeps focus there"
+        assert!(
+            !app.collapsed_files.contains("c.rs"),
+            "re-activating an open file does not fold it"
         );
+        assert_eq!(app.focus, Focus::Body, "activating jumps into the body");
+        assert!(app.cursor_is_header());
     }
 
     #[test]
@@ -12636,7 +12656,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_click_in_the_sidebar_toggles_the_file() {
+    fn mouse_click_in_the_sidebar_jumps_to_the_file() {
         let mut app = multi_file_app(&["a.rs", "b.rs", "c.rs"]);
         app.mode = Mode::Unified;
         app.sidebar_override = Some(true);
@@ -12645,7 +12665,7 @@ mod tests {
         app.relayout();
         app.hit.set(hit(1, 22, None, 0));
         // Sidebar body row 2 (screen row 3) is the third file, collapsed:
-        // clicking it expands and opens the file in the body.
+        // clicking it expands and opens the file in the body (on its header).
         app.mouse_down(3, 3);
         assert_eq!(
             app.current_file(),
@@ -12654,10 +12674,14 @@ mod tests {
         );
         assert_eq!(app.focus, Focus::Body);
         assert!(!app.collapsed_files.contains("c.rs"));
-        // Clicking the now-open file collapses it, focus moving to the sidebar.
+        // Clicking the now-open file does not collapse it — the table of contents
+        // navigates, it never toggles; the click just re-jumps into the body.
         app.mouse_down(3, 3);
-        assert!(app.collapsed_files.contains("c.rs"));
-        assert_eq!(app.focus, Focus::Sidebar);
+        assert!(
+            !app.collapsed_files.contains("c.rs"),
+            "a click on an open file does not fold it"
+        );
+        assert_eq!(app.focus, Focus::Body);
     }
 
     #[test]
