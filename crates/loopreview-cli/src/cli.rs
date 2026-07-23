@@ -8,7 +8,8 @@
 //! reviews one commit's own changes. The hidden `daemon` verb stays reserved for
 //! a later milestone so the namespace stays stable (`session` and `update` are
 //! implemented; there is no `pr` verb — a bare reference is the entry point).
-//! `--help` / `--version` are handled by clap before the TTY guard.
+//! `--help` and the version flag (`-v` / `-V` / `--version`) are handled by clap
+//! before the TTY guard.
 
 use std::path::PathBuf;
 
@@ -63,11 +64,25 @@ pub enum WaitEvent {
         `lr diff <target>` compares git refs; `lr patch <file>` reviews a saved patch; \
         `lr show [commit]` reviews one commit's own changes.",
     disable_help_subcommand = true,
+    // Replace clap's built-in `-V`/`--version` with a custom flag so `-v` prints
+    // the version too (lr has no verbose flag to collide with). The `version`
+    // above still supplies the version string this flag renders.
+    disable_version_flag = true,
     args_conflicts_with_subcommands = true
 )]
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// Print version. Accepts `-v`, `-V`, or `--version`; handled before the TTY
+    /// guard, like `--help`. Not global — it stays a top-level flag so it never
+    /// shadows a subcommand argument.
+    #[arg(
+        short = 'v',
+        visible_short_alias = 'V',
+        long = "version",
+        action = clap::ArgAction::Version,
+    )]
+    version: (),
     /// A GitHub pull request or issue to review: a number (`123`), `#N`,
     /// `owner/repo#N`, or a URL — the type is resolved automatically. Quote `#N`
     /// — most shells treat a bare `#` as a comment.
@@ -431,6 +446,7 @@ impl Cli {
             no_watch,
             exclude_untracked,
             mode,
+            version,
         } = self;
         match command {
             Some(Command::Session(args)) => Dispatch::Session(args),
@@ -443,6 +459,7 @@ impl Cli {
                     no_watch,
                     exclude_untracked,
                     mode,
+                    version,
                 }
                 .resolve(),
             ),
@@ -533,6 +550,35 @@ mod tests {
     #[test]
     fn bare_invocation_dispatches() {
         assert_eq!(action_of(&["lr"]), Action::Dispatch);
+    }
+
+    #[test]
+    fn every_version_form_prints_the_version() {
+        use clap::error::ErrorKind;
+        // `-v`, `-V`, and `--version` all render the version and exit — clap
+        // surfaces that as a `DisplayVersion` "error" carrying the text.
+        for form in ["-v", "-V", "--version"] {
+            let err = Cli::try_parse_from(["lr", form]).expect_err("version exits parsing");
+            assert_eq!(
+                err.kind(),
+                ErrorKind::DisplayVersion,
+                "`{form}` shows version"
+            );
+            assert!(
+                err.to_string().contains(env!("CARGO_PKG_VERSION")),
+                "`{form}` output carries the version: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_dash_v_is_the_version_flag_not_a_reference() {
+        // `lr -v` must trigger the version flag, not be swallowed as the bare
+        // dispatch target (a PR reference).
+        let err = Cli::try_parse_from(["lr", "-v"]).expect_err("`-v` exits parsing");
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        // And a real reference still dispatches to a PR, unaffected.
+        assert!(matches!(action_of(&["lr", "123"]), Action::Pr { .. }));
     }
 
     #[test]
