@@ -188,6 +188,9 @@ move; `Enter` opens the file; `Esc` closes.
 | `j` / `k` | Move between comments (root and replies), crossing into the next/previous thread at a thread's ends |
 | `g` / `G` | First / last thread |
 | `Ctrl-D` / `Ctrl-U` (or `PageDown` / `PageUp`) | Scroll |
+| `l` (or `→`) | Go in: expand a folded thread, or scroll an open one to its top |
+| `h` (or `←`) | Go out to the thread index (pure movement, never folds — `b` also jumps there) |
+| `Enter` | On a thread's header (its root), toggle its fold (open ⇆ collapsed); on a reply it does nothing |
 | `c` | New conversation comment — a note tied to nothing in the diff (a draft on a pull request, sent as a PR comment; a local note otherwise) |
 | `r` | Reply to the selected thread (a reply to a conversation thread always stays local — the footer shows `r local reply`) |
 | `x` | Resolve / reopen |

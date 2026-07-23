@@ -1773,16 +1773,19 @@ impl App {
         }
         self.status = None;
 
-        // Enter is handled directly, not through the keymap: on a Files-view file
-        // header it toggles that file's fold (the tree-UI convention — `h`/`l` are
-        // pure movement now), and everywhere else it keeps its `NavIn` meaning
-        // (expand/enter a thread, activate a sidebar row). Comment- and diff-line
-        // Enter is unchanged: `NavIn` is a no-op on a diff line.
+        // Enter is handled directly, not through the keymap. It toggles a fold on
+        // the tree's header — a file header in the Files view, a thread's root in
+        // the Conversation view — the common tree-UI convention (`h`/`l` are pure
+        // movement, `o` also folds). In the sidebar it keeps its `NavIn` meaning
+        // (activate the row); on a diff line or a conversation reply it does
+        // nothing, the same no-op `NavIn` has there.
         if code == KeyCode::Enter {
-            if !in_sidebar && self.view == View::Files && self.cursor_is_header() {
-                self.set_file_collapsed(self.current_file(), None);
-            } else {
+            if in_sidebar {
                 self.run_action(Action::NavIn);
+            } else if self.view == View::Files && self.cursor_is_header() {
+                self.set_file_collapsed(self.current_file(), None);
+            } else if self.view == View::Conversation && self.conv_on_thread_header() {
+                self.toggle_collapse_conv();
             }
             return;
         }
@@ -2394,6 +2397,12 @@ impl App {
             return;
         }
         let Some((anchor, target)) = self.compose_target() else {
+            // A file header (or an empty diff) has no line to anchor to — say so
+            // and point at the two ways to comment, rather than a silent no-op.
+            self.status = Some(
+                "move to a diff line to comment, or press Tab for a conversation comment"
+                    .to_string(),
+            );
             return;
         };
         self.input = Some(Compose {
@@ -3334,6 +3343,14 @@ impl App {
         }
     }
 
+    /// In the Conversation view, whether the cursor rests on the selected thread's
+    /// root — its header line, the fold anchor (mirroring a file header). The
+    /// cursor sits on the root whenever it is not down on a reply (and a collapsed
+    /// thread shows only its header, so it always is). This is where Enter folds.
+    fn conv_on_thread_header(&self) -> bool {
+        !self.conv_order.is_empty() && self.conv_comment == 0
+    }
+
     fn toggle_collapse(&mut self, id: String) {
         // A hand fold/unfold sticks for the session (defaults won't override it).
         self.manual_fold.insert(id.clone());
@@ -3383,15 +3400,11 @@ impl App {
                 }
                 self.follow_conv();
             }
-            // h: an open thread collapses; a collapsed one steps out to the
-            // thread index. (The Files view moved folding onto Enter; the
-            // Conversation cascade still folds here — see the impl note.)
-            Action::NavOut => {
-                if self.selected_thread().is_some() && !self.selected_collapsed() {
-                    self.fold_selected(true);
-                } else if self.sidebar_width(self.body_width.get()).is_some() {
-                    self.focus_sidebar();
-                }
+            // h: step straight out to the thread index — pure movement, no
+            // folding (Enter and `o` fold now), mirroring the Files view's
+            // line/header → sidebar cascade.
+            Action::NavOut if self.sidebar_width(self.body_width.get()).is_some() => {
+                self.focus_sidebar();
             }
             _ => {}
         }
@@ -5771,10 +5784,15 @@ impl App {
             && self
                 .selected_thread()
                 .is_some_and(|t| self.review.threads[t].anchor == Anchor::Review);
-        // On a Files-view file header, Enter is the tree-convention fold key, so
-        // the fold hint reads `enter fold` there (only on a header). `o` still
-        // folds everywhere and leads the hint off a header.
-        let on_files_header = !in_sidebar && self.view == View::Files && self.cursor_is_header();
+        // On a fold header — a file header (Files) or a thread's root
+        // (Conversation) — Enter is the tree-convention fold key, so the fold hint
+        // reads `enter fold` there. `o` still folds everywhere and leads the hint
+        // off a header.
+        let on_fold_header = !in_sidebar
+            && match self.view {
+                View::Files => self.cursor_is_header(),
+                View::Conversation => self.conv_on_thread_header(),
+            };
         let mut parts = Vec::new();
         for (action, label) in candidates {
             if parts.len() >= 6 {
@@ -5792,7 +5810,7 @@ impl App {
                 } else {
                     (*label).to_string()
                 };
-                let key_label = if *action == Fold && on_files_header {
+                let key_label = if *action == Fold && on_fold_header {
                     "enter".to_string()
                 } else {
                     key(*action)
@@ -11175,7 +11193,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_h_l_fold_expand_and_focus() {
+    fn conversation_enter_folds_h_moves_out_l_expands() {
         let mut app = multi_file_app(&["a.rs"]);
         app.sidebar_override = Some(true);
         app.body_width.set(120);
@@ -11186,18 +11204,64 @@ mod tests {
         app.view = View::Conversation;
         app.focus = Focus::Body;
         app.conv_cursor = 0;
+        app.conv_comment = 0;
         assert!(!app.selected_collapsed());
-        // h collapses an open thread (focus stays in the body).
+
+        // Enter on the thread header toggles its fold (folding moved off h).
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            app.selected_collapsed(),
+            "Enter folds the thread from its header"
+        );
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!app.selected_collapsed(), "Enter re-expands it");
+
+        // h steps straight out to the thread index — pure movement, no fold.
         app.conversation_action(Action::NavOut);
-        assert!(app.selected_collapsed(), "h folds an open thread");
-        assert_eq!(app.focus, Focus::Body);
-        // h again (now collapsed) focuses the thread index.
-        app.conversation_action(Action::NavOut);
-        assert_eq!(app.focus, Focus::Sidebar, "h on a collapsed thread → index");
+        assert_eq!(app.focus, Focus::Sidebar, "h goes to the thread index");
+        assert!(!app.selected_collapsed(), "h did not fold on the way out");
+
         // l expands a collapsed thread.
         app.focus = Focus::Body;
+        app.fold_selected(true);
         app.conversation_action(Action::NavIn);
         assert!(!app.selected_collapsed(), "l expands a collapsed thread");
+    }
+
+    #[test]
+    fn conversation_enter_on_a_reply_does_not_fold() {
+        // Enter folds only from the thread header; on a reply it is a no-op, the
+        // same as Enter on a diff line in the Files view.
+        let mut app = app_with_threads(); // first thread has two replies
+        app.sidebar_override = Some(false);
+        app.set_view(View::Conversation);
+        app.focus = Focus::Body;
+        app.conv_cursor = 0;
+        app.conv_comment = 1; // down on a reply, not the root/header
+        assert!(!app.conv_on_thread_header());
+        app.on_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            !app.selected_collapsed(),
+            "Enter on a reply does not fold the thread"
+        );
+    }
+
+    #[test]
+    fn c_on_a_file_header_guides_instead_of_no_op() {
+        // A silent no-op is a project no-no: pressing c with nothing to anchor to
+        // (a file header) explains the two ways to comment.
+        let mut app = sample_app();
+        app.mode = Mode::Unified;
+        app.sidebar_override = Some(false);
+        app.cursor = 0; // the file header — no line to anchor a comment to
+        assert!(app.cursor_is_header());
+        app.on_key(KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(app.input.is_none(), "no composer opens on a header");
+        let status = app.status.as_deref().unwrap_or("");
+        assert!(
+            status.contains("diff line") && status.contains("Tab"),
+            "the status points at both ways to comment: {status:?}"
+        );
     }
 
     #[test]
@@ -11378,12 +11442,11 @@ mod tests {
         assert_eq!(app.view, View::Conversation);
         assert_eq!(app.conv_cursor, 0);
 
-        // h folds the open thread (focus stays); h again steps out to the index.
+        // h steps straight out to the thread index — pure movement, no fold.
         app.body_width.set(120);
         app.conversation_action(Action::NavOut);
-        assert!(app.selected_collapsed(), "h folds the open thread first");
-        app.conversation_action(Action::NavOut);
-        assert_eq!(app.focus, Focus::Sidebar, "h on a collapsed thread → index");
+        assert_eq!(app.focus, Focus::Sidebar, "h goes to the thread index");
+        assert!(!app.selected_collapsed(), "h did not fold on the way out");
     }
 
     #[test]
