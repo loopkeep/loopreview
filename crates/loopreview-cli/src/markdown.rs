@@ -27,10 +27,26 @@ use crate::highlight::Highlighter;
 /// The action a rendered [`MdRegion`] triggers when clicked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MdAction {
-    /// Open a URL (a link, autolink, or image) in the browser.
-    Open(String),
+    /// Open a URL (a link, autolink, or image) in the browser. `label`, when
+    /// set, is what the status line shows in place of the raw URL: a `#N` /
+    /// `owner/repo#N` reference autolink always targets `/issues/N` (GitHub
+    /// redirects a PR from there), so showing that internal URL misleads —
+    /// display the reference as it was clicked instead. `None` for links, images,
+    /// and bare-URL autolinks, where the URL itself is the honest thing to show.
+    Open { url: String, label: Option<String> },
     /// Fold or unfold the nth `<details>` in this render (0-based).
     ToggleDetails(usize),
+}
+
+impl MdAction {
+    /// An `Open` whose status line shows the URL itself — a link, an image, or a
+    /// bare-URL autolink.
+    pub(crate) fn open_url(url: impl Into<String>) -> MdAction {
+        MdAction::Open {
+            url: url.into(),
+            label: None,
+        }
+    }
 }
 
 /// A clickable region on a rendered line: columns `[start, end)` carry `action`.
@@ -381,7 +397,7 @@ impl Renderer<'_> {
                         .fg(palette::LINK_FG)
                         .add_modifier(Modifier::UNDERLINED),
                 ),
-                action: Some(MdAction::Open(url)),
+                action: Some(MdAction::open_url(url)),
             });
             return;
         }
@@ -390,7 +406,7 @@ impl Renderer<'_> {
             .fg(palette::LINK_FG)
             .add_modifier(Modifier::UNDERLINED);
         let mut rest = text;
-        while let Some((start, end, url)) = find_autolink(rest, self.slug) {
+        while let Some((start, end, action)) = find_autolink(rest, self.slug) {
             if start > 0 {
                 self.spans.push(Piece::plain(TextSpan::styled(
                     rest[..start].to_string(),
@@ -399,7 +415,7 @@ impl Renderer<'_> {
             }
             self.spans.push(Piece {
                 span: TextSpan::styled(rest[start..end].to_string(), link_style),
-                action: Some(MdAction::Open(url)),
+                action: Some(action),
             });
             rest = &rest[end..];
         }
@@ -424,7 +440,7 @@ impl Renderer<'_> {
                     .fg(palette::LINK_FG)
                     .add_modifier(Modifier::UNDERLINED),
             ),
-            action: (!url.is_empty()).then(|| MdAction::Open(url.to_string())),
+            action: (!url.is_empty()).then(|| MdAction::open_url(url)),
         });
     }
 
@@ -832,11 +848,12 @@ fn next_url(s: &str) -> Option<(&str, &str, &str)> {
 }
 
 /// The earliest autolink in `s` — a bare URL, or (when `slug` is known) a `#N` /
-/// `owner/repo#N` reference — as `(start, end, url)` byte offsets and target.
-fn find_autolink(s: &str, slug: Option<&str>) -> Option<(usize, usize, String)> {
-    let mut best: Option<(usize, usize, String)> = None;
+/// `owner/repo#N` reference — as `(start, end, action)` byte offsets and the
+/// click action (a reference carries its clicked text as the display label).
+fn find_autolink(s: &str, slug: Option<&str>) -> Option<(usize, usize, MdAction)> {
+    let mut best: Option<(usize, usize, MdAction)> = None;
     if let Some((pre, url, _)) = next_url(s) {
-        best = Some((pre.len(), pre.len() + url.len(), url.to_string()));
+        best = Some((pre.len(), pre.len() + url.len(), MdAction::open_url(url)));
     }
     if let Some(slug) = slug
         && let Some(candidate) = next_issue_ref(s, slug)
@@ -853,9 +870,11 @@ fn slug_word(c: u8) -> bool {
 }
 
 /// The first `#N` / `owner/repo#N` reference in `s` at a word boundary, as
-/// `(start, end, url)`. `#N` targets `slug`'s repo; `owner/repo#N` its own. The
-/// `/issues/N` path is correct even for a PR — GitHub redirects it.
-fn next_issue_ref(s: &str, slug: &str) -> Option<(usize, usize, String)> {
+/// `(start, end, action)`. `#N` targets `slug`'s repo; `owner/repo#N` its own.
+/// The `/issues/N` path is correct even for a PR — GitHub redirects it — but
+/// because that redirect makes the URL a poor thing to show, the action carries
+/// the clicked reference text as its display label.
+fn next_issue_ref(s: &str, slug: &str) -> Option<(usize, usize, MdAction)> {
     let b = s.as_bytes();
     let mut from = 0;
     while let Some(rel) = s[from..].find('#') {
@@ -875,13 +894,23 @@ fn next_issue_ref(s: &str, slug: &str) -> Option<(usize, usize, String)> {
             return Some((
                 start,
                 end,
-                format!("https://github.com/{owner_repo}/issues/{num}"),
+                MdAction::Open {
+                    url: format!("https://github.com/{owner_repo}/issues/{num}"),
+                    label: Some(s[start..end].to_string()),
+                },
             ));
         }
         // A bare `#N`: only at a boundary (not mid-word, not after a slash path).
         let boundary = hash == 0 || !(slug_word(b[hash - 1]) || b[hash - 1] == b'/');
         if boundary {
-            return Some((hash, end, format!("https://github.com/{slug}/issues/{num}")));
+            return Some((
+                hash,
+                end,
+                MdAction::Open {
+                    url: format!("https://github.com/{slug}/issues/{num}"),
+                    label: Some(s[hash..end].to_string()),
+                },
+            ));
         }
         from = hash + 1;
     }
@@ -1663,7 +1692,7 @@ mod tests {
         let region = r
             .regions
             .iter()
-            .find(|reg| reg.action == MdAction::Open("https://example.com/path".to_string()))
+            .find(|reg| reg.action == MdAction::open_url("https://example.com/path"))
             .expect("a click region for the url");
         let line = text_of(&r.lines[region.line]);
         let slice: String = line
@@ -1702,7 +1731,7 @@ mod tests {
         let region = r
             .regions
             .iter()
-            .find(|reg| reg.action == MdAction::Open("https://c.ai".to_string()))
+            .find(|reg| reg.action == MdAction::open_url("https://c.ai"))
             .expect("a link region");
         let slice: String = text_of(&r.lines[region.line])
             .chars()
@@ -1758,16 +1787,24 @@ mod tests {
             Some(90),
             "acme/widget",
         );
+        // The URL targets /issues/N (GitHub redirects a PR from there), but the
+        // action's label is the reference as clicked — shown in place of the URL.
         assert!(
             r.regions.iter().any(|reg| reg.action
-                == MdAction::Open("https://github.com/acme/widget/issues/1256".to_string())),
-            "#N links to the subject repo: {:?}",
+                == MdAction::Open {
+                    url: "https://github.com/acme/widget/issues/1256".to_string(),
+                    label: Some("#1256".to_string()),
+                }),
+            "#N links to the subject repo, labelled `#1256`: {:?}",
             r.regions
         );
         assert!(
             r.regions.iter().any(|reg| reg.action
-                == MdAction::Open("https://github.com/octo/other/issues/7".to_string())),
-            "owner/repo#N links to that repo: {:?}",
+                == MdAction::Open {
+                    url: "https://github.com/octo/other/issues/7".to_string(),
+                    label: Some("octo/other#7".to_string()),
+                }),
+            "owner/repo#N links to that repo, labelled `octo/other#7`: {:?}",
             r.regions
         );
         // Without a slug, `#N` stays plain text.
@@ -1796,7 +1833,7 @@ mod tests {
         assert!(
             r.regions
                 .iter()
-                .any(|reg| reg.action == MdAction::Open("https://ex.com/a.png".to_string())),
+                .any(|reg| reg.action == MdAction::open_url("https://ex.com/a.png")),
             "the image opens its url"
         );
     }
@@ -1819,7 +1856,7 @@ mod tests {
         assert!(
             r.regions
                 .iter()
-                .any(|reg| reg.action == MdAction::Open("https://docs.example.com".to_string())),
+                .any(|reg| reg.action == MdAction::open_url("https://docs.example.com")),
             "regions: {:?}",
             r.regions
         );
@@ -1895,9 +1932,9 @@ mod tests {
             Some(60),
         );
         assert!(
-            !r.regions
-                .iter()
-                .any(|reg| matches!(&reg.action, MdAction::Open(u) if u.contains("inside"))),
+            !r.regions.iter().any(
+                |reg| matches!(&reg.action, MdAction::Open { url, .. } if url.contains("inside"))
+            ),
             "no region for a link inside a folded details"
         );
     }

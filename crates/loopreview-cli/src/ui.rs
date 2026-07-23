@@ -4025,15 +4025,26 @@ impl App {
             .map(|r| r.action.clone())
     }
 
+    /// Launch a clicked markdown URL and build the status line. A reference
+    /// autolink (`#N` / `owner/repo#N`) passes a `label` — the reference as
+    /// clicked — which is shown instead of the redirect-prone `/issues/N` URL;
+    /// the "open it yourself" hint still names the URL so it can be opened by hand.
+    fn open_md_url(&self, url: &str, label: Option<&str>) -> String {
+        match (self.url_opener)(url) {
+            Ok(()) => format!("opened {}", label.unwrap_or(url)),
+            Err(_) => match label {
+                Some(label) => format!("open it yourself: {label} → {url}"),
+                None => format!("open it yourself: {url}"),
+            },
+        }
+    }
+
     /// Run an inline comment body click: open a URL, or fold/unfold that thread's
     /// comment-body `<details>` (keyed like the Conversation, by thread + index).
     fn run_inline_md_action(&mut self, thread: usize, action: crate::markdown::MdAction) {
         match action {
-            crate::markdown::MdAction::Open(url) => {
-                self.status = Some(match (self.url_opener)(&url) {
-                    Ok(()) => format!("opened {url}"),
-                    Err(_) => format!("open it yourself: {url}"),
-                });
+            crate::markdown::MdAction::Open { url, label } => {
+                self.status = Some(self.open_md_url(&url, label.as_deref()));
             }
             crate::markdown::MdAction::ToggleDetails(index) => {
                 let Some(id) = self.review.threads.get(thread).map(|t| t.id.clone()) else {
@@ -6177,11 +6188,8 @@ impl App {
     /// `<details>` (the toggle index routes through `conv_details` to its thread).
     fn run_conv_md_action(&mut self, action: crate::markdown::MdAction) {
         match action {
-            crate::markdown::MdAction::Open(url) => {
-                self.status = Some(match (self.url_opener)(&url) {
-                    Ok(()) => format!("opened {url}"),
-                    Err(_) => format!("open it yourself: {url}"),
-                });
+            crate::markdown::MdAction::Open { url, label } => {
+                self.status = Some(self.open_md_url(&url, label.as_deref()));
             }
             crate::markdown::MdAction::ToggleDetails(global) => {
                 let Some(key) = self.conv_details.borrow().get(global).cloned() else {
@@ -6207,11 +6215,8 @@ impl App {
     /// Overview fold state and re-clamps its scroll.
     fn run_md_action(&mut self, action: crate::markdown::MdAction) {
         match action {
-            crate::markdown::MdAction::Open(url) => {
-                self.status = Some(match (self.url_opener)(&url) {
-                    Ok(()) => format!("opened {url}"),
-                    Err(_) => format!("open it yourself: {url}"),
-                });
+            crate::markdown::MdAction::Open { url, label } => {
+                self.status = Some(self.open_md_url(&url, label.as_deref()));
             }
             crate::markdown::MdAction::ToggleDetails(index) => {
                 let current = self
@@ -6302,14 +6307,12 @@ impl App {
             let thread_id = &self.review.threads[ti].id;
             for r in &self.conv_block_regions[ti] {
                 let action = match &r.action {
-                    crate::markdown::MdAction::Open(url) => {
-                        crate::markdown::MdAction::Open(url.clone())
-                    }
                     crate::markdown::MdAction::ToggleDetails(local) => {
                         let global = details.len();
                         details.push((thread_id.clone(), *local));
                         crate::markdown::MdAction::ToggleDetails(global)
                     }
+                    open => open.clone(),
                 };
                 regions.push(crate::markdown::MdRegion {
                     line: r.line + thread_start,
@@ -8212,10 +8215,10 @@ fn collect_regions(
 ) {
     for region in regions {
         let action = match &region.action {
-            crate::markdown::MdAction::Open(url) => crate::markdown::MdAction::Open(url.clone()),
             crate::markdown::MdAction::ToggleDetails(local) => {
                 crate::markdown::MdAction::ToggleDetails(local + details_base)
             }
+            open => open.clone(),
         };
         out.push(crate::markdown::MdRegion {
             line: region.line + base,
@@ -14400,7 +14403,9 @@ mod tests {
         let link = rendered
             .regions
             .iter()
-            .find(|r| matches!(&r.action, crate::markdown::MdAction::Open(u) if u.contains("xyz")))
+            .find(
+                |r| matches!(&r.action, crate::markdown::MdAction::Open { url, .. } if url.contains("xyz")),
+            )
             .expect("a link region in the overview body");
         // Resolve the click through the cached regions (with scroll offset 0) and
         // run it — the injected opener records the URL.
@@ -14420,6 +14425,67 @@ mod tests {
                 .contains("example.com/xyz"),
             "the status names the opened url: {:?}",
             app.status
+        );
+    }
+
+    #[test]
+    fn an_overview_reference_click_shows_the_reference_not_the_redirect_url() {
+        let mut app = issue_app(); // pr_key owner/repo#5 → slug enables `#N` autolinks
+        let opened = std::rc::Rc::new(RefCell::new(Vec::<String>::new()));
+        let sink = opened.clone();
+        app.url_opener = Box::new(move |url: &str| {
+            sink.borrow_mut().push(url.to_string());
+            Ok(())
+        });
+        if let Some(ov) = app.pr_overview.as_mut() {
+            ov.body = "Fixes #42 now".into();
+        }
+        let rendered = app.overview_render(60);
+        let link = rendered
+            .regions
+            .iter()
+            .find(|r| matches!(&r.action, crate::markdown::MdAction::Open { label, .. } if label.as_deref() == Some("#42")))
+            .expect("a `#42` reference region carrying its label");
+        let action = app
+            .overview_action_at(link.line, link.start)
+            .expect("the region is hit at its own coordinates");
+        app.run_md_action(action);
+        // The browser still receives the real /issues/42 URL (GitHub redirects it)…
+        assert_eq!(
+            opened.borrow().as_slice(),
+            &["https://github.com/owner/repo/issues/42".to_string()],
+        );
+        // …but the status shows the reference as clicked, not that internal URL.
+        let status = app.status.as_deref().unwrap_or("");
+        assert_eq!(
+            status, "opened #42",
+            "status shows the reference, got {status:?}"
+        );
+        assert!(
+            !status.contains("/issues/"),
+            "no redirect URL leaks: {status:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_reference_open_names_both_the_reference_and_the_url() {
+        // When the browser can't be launched, the hint keeps the URL so the user
+        // can open it by hand — alongside the reference they clicked.
+        let mut app = issue_app();
+        assert_eq!(
+            app.open_md_url("https://github.com/owner/repo/issues/42", Some("#42")),
+            "opened #42",
+            "a reference open reports the reference on success",
+        );
+        app.url_opener = Box::new(|_: &str| Err(std::io::Error::other("no browser")));
+        assert_eq!(
+            app.open_md_url("https://github.com/owner/repo/issues/42", Some("#42")),
+            "open it yourself: #42 → https://github.com/owner/repo/issues/42",
+        );
+        // A bare URL (no label) still shows the URL on both paths.
+        assert_eq!(
+            app.open_md_url("https://ex.com/x", None),
+            "open it yourself: https://ex.com/x",
         );
     }
 
@@ -14551,7 +14617,7 @@ mod tests {
             .borrow()
             .iter()
             .find(|r| {
-                matches!(&r.action, crate::markdown::MdAction::Open(u) if u.contains("example.org"))
+                matches!(&r.action, crate::markdown::MdAction::Open { url, .. } if url.contains("example.org"))
             })
             .cloned()
             .expect("a conversation body link region");
@@ -14645,7 +14711,7 @@ mod tests {
         let link = app.comment_block_regions[0]
             .iter()
             .find(|r| {
-                matches!(&r.action, crate::markdown::MdAction::Open(u) if u.contains("inline.example"))
+                matches!(&r.action, crate::markdown::MdAction::Open { url, .. } if url.contains("inline.example"))
             })
             .cloned()
             .expect("an inline link region");
