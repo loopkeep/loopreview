@@ -115,10 +115,15 @@ files from a working-tree review.
 | `Ctrl-R` | Refresh from GitHub (pull requests) |
 | `Ctrl-S` | Open the submit modal (pull requests) |
 
-The footer shows only the handful of keys most used in the current context,
-ending with `? all` — press `?` for everything else. Type to fuzzy-filter,
-`↑`/`↓` (or `Ctrl-N`/`Ctrl-P`) to move, `Enter` to run the selected action (an
-inapplicable one reports why), `Esc` to close.
+**Finding your way.** Two things share the work, so you never have to memorize
+keys. The footer shows just the few actions worth reaching for at the cursor's
+exact spot — it changes as you move (`r reply` appears over a thread, `s suggest`
+over a changed line) — and always ends with `? all`. That `?` opens the command
+palette: a searchable, runnable list of *every* action with its current key, the
+ones that apply here listed first and the rest greyed with the reason. So you can
+just press `?`, type what you want, and run it. In the palette, type to
+fuzzy-filter, `↑`/`↓` (or `Ctrl-N`/`Ctrl-P`) to move, `Enter` to run the selected
+action (an inapplicable one reports why), `Esc` to close.
 
 **Files (diff) view**
 
@@ -135,7 +140,8 @@ inapplicable one reports why), `Esc` to close.
 | `<` / `>` | Scroll the diff content left / right (also Shift+wheel or a trackpad swipe; the gutter stays fixed) |
 | `v` | Toggle unified / side-by-side |
 | `c` | Comment on the cursor line (or the selected range) |
-| `V` | Start / cancel a line-range selection (`j` / `k` to extend, then `c`) |
+| `s` | Suggest a change to the line (or range) — opens the composer with a `suggestion` code block pre-filled from the current new-side lines |
+| `V` | Start / cancel a line-range selection (`j` / `k` to extend, then `c` or `s`) |
 | `r` | Reply to the thread on the cursor line |
 | `x` | Resolve / reopen that thread |
 | `e` | Edit your own comment (the thread's root; opens the composer pre-filled — a published edit syncs to GitHub) |
@@ -197,6 +203,14 @@ resolves or reopens it. Once a review has any threads, `Tab` opens a
 Conversation view — every thread as a root comment with its nested replies and
 relative timestamps, GitHub-style — where `r` and `x` also work and `X` closes
 (deletes) the review. Comments are authored as your `git config user.name`.
+
+**Suggesting a change.** `s` — on a line, or over a `V` / drag range — opens the
+composer already holding a `suggestion` code block filled with those lines'
+current new-side text. Rewrite the block into the code you want (add prose above
+or below if you like) and save it like any other comment. On a pull request a
+submitted suggestion shows up on GitHub as an **Apply suggestion** the author can
+commit in one click; in a local review it is kept as a plain fenced code block.
+Suggestions replace the new side, so a line that was only deleted can't take one.
 
 A local review is stored per repository under your config directory and shared
 across that repo's worktrees (thread anchors carry the commit, so they stay
@@ -304,9 +318,9 @@ reserved by the UI and cannot be reassigned to an action: `q` / `Esc` / `Ctrl-C`
 composer likewise keep their own keys while open. Action names:
 `cursor_down`, `cursor_up`, `half_page_down`, `half_page_up`, `top`, `bottom`,
 `next_file`, `prev_file`, `next_hunk`, `prev_hunk`, `nav_in`, `nav_out`,
-`scroll_left`, `scroll_right`, `layout_toggle`, `comment`, `reply`, `resolve`,
-`fold`, `select`, `close_review`, `delete`, `edit`, `toggle_kind`, `sidebar`,
-`file_finder`, `refresh`, `submit`, `palette`, `open_github`.
+`scroll_left`, `scroll_right`, `layout_toggle`, `comment`, `suggest`, `reply`,
+`resolve`, `fold`, `select`, `close_review`, `delete`, `edit`, `toggle_kind`,
+`sidebar`, `file_finder`, `refresh`, `submit`, `palette`, `open_github`.
 
 ```toml
 split_min_width = 160
@@ -315,7 +329,7 @@ sidebar = "auto"
 [keys]
 comment = "m"
 file_finder = "ctrl+t"
-layout_toggle = "s"
+layout_toggle = "w"
 ```
 
 Data is stored under the same directory: local reviews in `reviews/`, live

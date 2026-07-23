@@ -504,6 +504,10 @@ struct Compose {
     target: String,
     /// True after Esc on non-empty text, awaiting a discard confirmation.
     confirming_discard: bool,
+    /// True when this composes a GitHub *suggested change* — the body is
+    /// pre-seeded with a ```suggestion block. Only the header wording differs;
+    /// it saves through the same kind/submit flow as any other comment.
+    suggestion: bool,
 }
 
 /// A relocatable cursor position: a file path and a line number on one side.
@@ -1633,7 +1637,8 @@ impl App {
         if in_sidebar {
             return matches!(action, MoveDown | MoveUp | Top | Bottom | NavIn | Fold);
         }
-        // Body movement and navigation always apply.
+        // Body movement always applies. (`NavIn` is handled per-view below — in
+        // Files it does something only on a header.)
         if matches!(
             action,
             MoveDown
@@ -1644,7 +1649,6 @@ impl App {
                 | PageUp
                 | Top
                 | Bottom
-                | NavIn
                 | NavOut
         ) {
             return true;
@@ -1671,6 +1675,7 @@ impl App {
         };
         match self.view {
             View::Conversation => match action {
+                NavIn => true,
                 Fold => !self.review.threads.is_empty(),
                 CloseReview => self.has_review(),
                 _ => common(action),
@@ -1678,7 +1683,11 @@ impl App {
             View::Files => match action {
                 NextFile | PrevFile | NextHunk | PrevHunk | ScrollLeft | ScrollRight
                 | ToggleLayout | Fold => !self.diff.files.is_empty(),
+                // `l` (go in) only acts on a header — expand or step into the file.
+                NavIn => !self.diff.files.is_empty() && self.cursor_is_header(),
                 Comment | Select => !self.clines.is_empty() && !self.cursor_is_header(),
+                // A suggestion replaces new-side lines, so it needs a new-side target.
+                Suggest => self.cursor_targets_new_side(),
                 _ => common(action),
             },
         }
@@ -1722,6 +1731,7 @@ impl App {
             Action::PrevHunk => self.goto_hunk(-1),
             Action::ToggleLayout => self.toggle_mode(),
             Action::Comment => self.start_compose(),
+            Action::Suggest => self.start_suggest(),
             Action::Reply => self.start_reply(),
             Action::Resolve => self.toggle_resolve(),
             Action::Fold => self.toggle_fold(),
@@ -1999,6 +2009,7 @@ impl App {
             },
             target: "edit comment".to_string(),
             confirming_discard: false,
+            suggestion: false,
         });
     }
 
@@ -2087,9 +2098,83 @@ impl App {
             kind: ComposeKind::New(anchor),
             target,
             confirming_discard: false,
+            suggestion: false,
         });
         // The range is captured in the anchor; drop the visual selection.
         self.clear_selection();
+    }
+
+    /// Begin composing a GitHub suggested change on the cursor's line or the
+    /// active selection. The composer opens with a ```suggestion block holding
+    /// the lines' current new-side text, ready to be rewritten; from there it is
+    /// an ordinary comment (same kind and submit flow). Suggestions replace the
+    /// *new* side, so a pure-deletion (old-side) range is refused.
+    fn start_suggest(&mut self) {
+        if self.store.is_none() && self.pr.is_none() {
+            self.status = Some("comments need a git repository or a pull request".to_string());
+            return;
+        }
+        let Some((anchor, target)) = self.compose_target() else {
+            return;
+        };
+        if !matches!(
+            &anchor,
+            Anchor::Line {
+                side: Side::New,
+                ..
+            }
+        ) {
+            self.status = Some("suggestions apply to the new side".to_string());
+            return;
+        }
+        let body = self.suggestion_body();
+        self.input = Some(Compose {
+            area: TextArea::from_text(&body),
+            kind: ComposeKind::New(anchor),
+            target,
+            confirming_discard: false,
+            suggestion: true,
+        });
+        self.clear_selection();
+    }
+
+    /// The pre-seeded body for a suggested change: a ```suggestion block holding
+    /// the current new-side text of the cursor line or the selected range, which
+    /// the reviewer rewrites into the change they want applied.
+    fn suggestion_body(&self) -> String {
+        let mut lines = Vec::new();
+        if !self.clines.is_empty() {
+            let (lo, hi) = self.selection_range().unwrap_or((self.cursor, self.cursor));
+            let afile = self.clines[lo].0;
+            for idx in lo..=hi {
+                let (file, flat) = self.clines[idx];
+                if file != afile || flat == HEADER {
+                    continue;
+                }
+                let (h, l) = self.flats[file][flat];
+                let line = &self.diff.files[file].hunks[h].lines[l];
+                if line.new_lineno.is_some() {
+                    lines.push(line.content.clone());
+                }
+            }
+        }
+        format!("```suggestion\n{}\n```\n", lines.join("\n"))
+    }
+
+    /// Whether the cursor (or active selection) points at new-side lines — where
+    /// a suggestion can apply. Mirrors [`Self::compose_target`] choosing
+    /// [`Side::New`], so the `s` affordance and the compose guard agree.
+    fn cursor_targets_new_side(&self) -> bool {
+        matches!(
+            self.compose_target(),
+            Some((
+                Anchor::Line {
+                    side: Side::New,
+                    ..
+                },
+                _
+            ))
+        )
     }
 
     /// The anchor and label for a new comment: a line range when a selection is
@@ -2181,7 +2266,8 @@ impl App {
             return;
         }
         self.selection = Some(self.cursor);
-        self.status = Some("visual line — j/k extend · c comment · Esc cancel".to_string());
+        self.status =
+            Some("visual line — j/k extend · c comment · s suggest · Esc cancel".to_string());
     }
 
     /// Clear any line-range selection.
@@ -2236,6 +2322,7 @@ impl App {
             kind: ComposeKind::Reply(thread.id.clone()),
             target: format!("reply to {who}"),
             confirming_discard: false,
+            suggestion: false,
         });
     }
 
@@ -4792,6 +4879,7 @@ impl App {
         f.render_widget(Clear, area);
         let title = match &compose.kind {
             ComposeKind::Edit { .. } => " Edit comment ".to_string(),
+            _ if compose.suggestion => format!(" Suggest change — {} ", compose.target),
             _ => format!(" Comment on {} ", compose.target),
         };
         let block = Block::default()
@@ -4922,6 +5010,19 @@ impl App {
         let key = |a: Action| self.keymap.key_for(a).unwrap_or("?").to_string();
         let in_sidebar =
             self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some();
+        // A visual line selection has its own sub-mode: extend the range, comment
+        // or suggest over it, or cancel.
+        if !in_sidebar && self.view == View::Files && self.selection.is_some() {
+            let mut parts = vec![
+                format!("{}/{} extend", key(MoveDown), key(MoveUp)),
+                format!("{} range-comment", key(Comment)),
+            ];
+            if self.action_available(Suggest) {
+                parts.push(format!("{} suggest", key(Suggest)));
+            }
+            parts.push("esc cancel".to_string());
+            return parts.join(" · ");
+        }
         // j/k steps comments in the Conversation body, files/lines otherwise.
         let move_label = if !in_sidebar && self.view == View::Conversation {
             "comment"
@@ -4929,29 +5030,33 @@ impl App {
             "move"
         };
         let mut parts = vec![format!("{}/{} {move_label}", key(MoveDown), key(MoveUp))];
-        // Priority-ordered candidates per context; only the available ones show,
-        // capped so the bar stays readable. `reply` and `kind` rank high so they
-        // are never crowded out when they apply (the two the FB calls out).
+        // Priority-ordered candidates per context, in "what you'd do next here"
+        // order; only the available ones show, capped so the bar stays readable.
+        // On a diff line the act-on-this-line trio (comment / suggest / select)
+        // leads; `reply` and `kind` are kept high enough never to be crowded out
+        // when they apply; destructive `del` sits low.
         let candidates: &[(Action, &str)] = if in_sidebar {
             &[(NavIn, "open"), (Fold, "fold")]
         } else if self.view == View::Conversation {
             &[
                 (Reply, "reply"),
-                (ToggleKind, "kind"),
                 (Edit, "edit"),
-                (Delete, "del"),
+                (ToggleKind, "kind"),
                 (Resolve, "resolve"),
+                (Delete, "del"),
                 (Fold, "fold"),
             ]
         } else {
             &[
                 (NavIn, "open"),
                 (Comment, "comment"),
+                (Suggest, "suggest"),
+                (Select, "select"),
                 (Reply, "reply"),
-                (ToggleKind, "kind"),
-                (Edit, "edit"),
-                (Delete, "del"),
                 (Resolve, "resolve"),
+                (Edit, "edit"),
+                (ToggleKind, "kind"),
+                (Delete, "del"),
                 (Fold, "fold"),
             ]
         };
@@ -7251,6 +7356,59 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static C: AtomicU32 = AtomicU32::new(0);
         C.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// An app whose diff ends in a pure deletion — a line present only on the old
+    /// side. clines: [header, context "keep" (new 1), deletion "gone" (old 2)].
+    fn deletion_app() -> App {
+        let file = FileDiff {
+            old_path: Some("a.rs".into()),
+            new_path: Some("a.rs".into()),
+            status: ChangeStatus::Modified,
+            binary: false,
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_lines: 2,
+                new_start: 1,
+                new_lines: 1,
+                section: None,
+                lines: vec![
+                    Line {
+                        kind: LineKind::Context,
+                        content: "keep".into(),
+                        old_lineno: Some(1),
+                        new_lineno: Some(1),
+                    },
+                    Line {
+                        kind: LineKind::Deletion,
+                        content: "gone".into(),
+                        old_lineno: Some(2),
+                        new_lineno: None,
+                    },
+                ],
+            }],
+        };
+        let diff = Diff {
+            files: vec![file],
+            provenance: Provenance {
+                base: Some("base".into()),
+                head: None,
+            },
+        };
+        let path = std::env::temp_dir().join(format!(
+            "lr-ui-{}-{}/review.json",
+            std::process::id(),
+            app_counter()
+        ));
+        App::new(
+            "working tree".into(),
+            diff,
+            Review::default(),
+            Some(Store::at(path, "test-repo")),
+            "tester".into(),
+            Highlighter::new(),
+            None,
+        )
     }
 
     #[test]
@@ -9926,7 +10084,9 @@ mod tests {
         assert!(f.contains("comment"), "a bare line can be commented: {f}");
         assert!(!f.contains("reply"), "no thread here to reply to: {f}");
 
-        // A thread of my own on line 2: over it, `reply` and `edit` appear.
+        // A thread of my own on line 2: over it, `reply` joins the act-on-this-
+        // line ops. (Editing your own comment lives in the palette — it is a
+        // lower-priority Files action, crowded out of the slim bar here.)
         app.add_thread(
             Anchor::line("a.rs", Side::New, 2),
             "tester",
@@ -9937,7 +10097,7 @@ mod tests {
         app.cursor = 2; // the addition line, where the thread is anchored
         let f = app.footer_ops();
         assert!(f.contains("reply"), "a thread here can be replied to: {f}");
-        assert!(f.contains("edit"), "and my own comment edited: {f}");
+        assert!(f.contains("suggest"), "and a change suggested: {f}");
 
         // Conversation, my draft comment on a PR: `kind` and `edit` show.
         let mut draft = pr_app(); // viewer "tester"
@@ -9992,6 +10152,124 @@ mod tests {
     }
 
     #[test]
+    fn footer_offers_select_and_suggest_then_switches_in_selection() {
+        let mut app = sample_app(); // author "tester"
+        app.mode = Mode::Unified;
+        app.view = View::Files;
+        app.cursor = 1; // a new-side content line
+        assert!(app.cursor_targets_new_side());
+        let f = app.footer_ops();
+        assert!(
+            f.contains("select"),
+            "a diff line can start a selection: {f}"
+        );
+        assert!(f.contains("suggest"), "and offer a suggestion: {f}");
+
+        // In a visual selection the bar becomes the range sub-mode.
+        app.start_selection();
+        let f = app.footer_ops();
+        assert!(f.contains("extend"), "j/k extends the range: {f}");
+        assert!(f.contains("range-comment"), "c comments on the range: {f}");
+        assert!(f.contains("esc cancel"), "esc leaves the selection: {f}");
+        assert!(
+            !f.contains("move"),
+            "the move label is replaced by extend: {f}"
+        );
+
+        // On a pure deletion (old side) `suggest` is not offered.
+        let mut del = deletion_app();
+        del.mode = Mode::Unified;
+        del.view = View::Files;
+        del.cursor = 2; // the deletion line
+        let f = del.footer_ops();
+        assert!(
+            !f.contains("suggest"),
+            "no suggestion on an old-side line: {f}"
+        );
+        assert!(f.contains("comment"), "but a comment still applies: {f}");
+    }
+
+    #[test]
+    fn suggest_prefills_the_new_side_and_refuses_the_old() {
+        // A single line: the block holds that line's current new-side text.
+        let mut app = sample_app();
+        app.mode = Mode::Unified;
+        app.view = View::Files;
+        app.cursor = 2; // the addition "added"
+        app.start_suggest();
+        let compose = app.input.as_ref().expect("the suggest composer opens");
+        assert!(compose.suggestion);
+        assert_eq!(compose.area.text(), "```suggestion\nadded\n```\n");
+        assert_eq!(compose.target, "a.rs:2");
+
+        // A range: every selected new-side line is prefilled, in order.
+        let mut app = sample_app();
+        app.mode = Mode::Unified;
+        app.view = View::Files;
+        app.cursor = 1;
+        app.start_selection();
+        app.move_cursor(1); // extend over lines 1..2
+        app.start_suggest();
+        let compose = app
+            .input
+            .as_ref()
+            .expect("the range suggest composer opens");
+        assert_eq!(compose.area.text(), "```suggestion\nkeep\nadded\n```\n");
+        assert_eq!(compose.target, "a.rs:1-2");
+        assert!(
+            app.selection.is_none(),
+            "opening the composer clears the selection"
+        );
+
+        // A pure deletion (old side only) is refused with guidance.
+        let mut app = deletion_app();
+        app.mode = Mode::Unified;
+        app.view = View::Files;
+        app.cursor = 2; // the deletion line
+        assert!(!app.cursor_targets_new_side());
+        app.start_suggest();
+        assert!(
+            app.input.is_none(),
+            "no composer opens for an old-side target"
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some("suggestions apply to the new side")
+        );
+    }
+
+    #[test]
+    fn suggest_titles_itself_and_saves_the_block_as_the_body() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // The composer names itself a suggestion and shows the target.
+        let mut app = sample_app();
+        app.mode = Mode::Unified;
+        app.view = View::Files;
+        app.cursor = 2;
+        app.start_suggest();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(
+            screen.contains("Suggest change"),
+            "the composer titles itself a suggestion:\n{screen}"
+        );
+        assert!(screen.contains("a.rs:2"), "and shows the target line");
+
+        // Saving keeps the ```suggestion block verbatim as the comment body.
+        app.submit_compose();
+        let thread = app.review.threads.last().expect("a thread is created");
+        let body = &thread.root().expect("the thread has a root").body;
+        assert!(
+            body.starts_with("```suggestion\n"),
+            "the saved body is a suggestion block: {body:?}"
+        );
+        assert!(body.contains("added"), "holding the line's new-side text");
+    }
+
+    #[test]
     fn drawing_the_palette_does_not_panic() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -10042,12 +10320,12 @@ mod tests {
     #[test]
     fn a_remapped_key_triggers_its_action() {
         let mut over = std::collections::HashMap::new();
-        over.insert("cursor_down".to_string(), "s".to_string());
+        over.insert("cursor_down".to_string(), "z".to_string());
         let mut app = multi_file_app(&["a.rs"]);
         app.keymap = crate::keys::Keymap::from_overrides(&over).unwrap();
         app.cursor = 0;
-        // `s` now moves the cursor down.
-        app.on_key(KeyCode::Char('s'), KeyModifiers::NONE);
+        // `z` now moves the cursor down.
+        app.on_key(KeyCode::Char('z'), KeyModifiers::NONE);
         assert_eq!(app.cursor, 1);
         // The old default `j` is unbound after the remap.
         app.on_key(KeyCode::Char('j'), KeyModifiers::NONE);
