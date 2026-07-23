@@ -458,6 +458,7 @@ enum ComposeKind {
 }
 
 /// A pending removal awaiting `d` confirmation.
+#[derive(Debug)]
 struct DeleteTarget {
     /// The thread's id — resolved to a fresh index at confirm time, since the
     /// review can shift between arming `d` and pressing `y`.
@@ -1871,11 +1872,12 @@ impl App {
         }
     }
 
-    /// Arm the delete confirmation for the comment the selection points at.
+    /// Arm the delete confirmation for the comment the cursor points at, or, when
+    /// it can't be removed, say exactly why (rather than a silent no-op).
     fn request_delete(&mut self) {
-        match self.selected_delete_target() {
-            Some(target) => self.confirming_delete = Some(target),
-            None => self.status = Some("nothing of yours to remove here".to_string()),
+        match self.delete_target() {
+            Ok(target) => self.confirming_delete = Some(target),
+            Err(reason) => self.status = Some(reason),
         }
     }
 
@@ -1944,37 +1946,65 @@ impl App {
         }
     }
 
-    /// What `d` removes: in the Conversation view the selected comment (a reply
-    /// removes just itself; a draft root takes its whole thread); in Files the
-    /// thread at the cursor. An unpublished draft/local is removed locally; your
-    /// own published comment is deleted from GitHub (single comment). Another
-    /// author's comment, published or not, is never a target.
+    /// Whether `d` has something to remove here — the availability gate. See
+    /// [`Self::delete_target`] for the reasons behind a refusal.
     fn selected_delete_target(&self) -> Option<DeleteTarget> {
+        self.delete_target().ok()
+    }
+
+    /// What `d` removes, or a reason it can't. In the Conversation view the
+    /// selected comment (a reply removes just itself; a draft root takes its whole
+    /// thread); in Files the thread at the cursor. An unpublished draft/local is
+    /// removed locally; your own published comment is deleted from GitHub (a single
+    /// comment). Refusals name their cause so the key press is never a silent
+    /// no-op: someone else's published comment, a review summary (no GitHub delete
+    /// API), or a comment whose real id has not synced yet (a just-submitted one,
+    /// recoverable by refreshing).
+    fn delete_target(&self) -> Result<DeleteTarget, String> {
         let (ti, ci) = if self.view == View::Conversation {
-            self.selected_comment()?
+            self.selected_comment().ok_or("no comment selected")?
         } else {
-            (self.thread_at_cursor()?, 0)
+            (
+                self.thread_at_cursor()
+                    .ok_or("no comment on this line to remove")?,
+                0,
+            )
         };
         let thread_id = self.review.threads[ti].id.clone();
-        let comment = self.review.threads[ti].comments.get(ci)?;
+        let comment = self.review.threads[ti]
+            .comments
+            .get(ci)
+            .ok_or("no comment here")?;
         let comment_id = comment.id.clone();
-        if comment.is_published() {
-            if !self.comment_is_mine(comment) {
-                return None;
+        let published = comment.is_published();
+        let mine = self.comment_is_mine(comment);
+        if published {
+            // A published comment's owner is the GitHub viewer login; if that is
+            // unknown (gh unreachable at load) say so rather than "not yours".
+            if self.pr.is_some() && self.pr.as_deref().and_then(|p| p.viewer()).is_none() {
+                return Err(
+                    "can't confirm your GitHub identity — check `gh auth login`".to_string()
+                );
             }
-            let endpoint = self.published_endpoint(&thread_id, &comment_id)?;
-            // A submitted review's summary has no GitHub delete — don't offer it.
+            if !mine {
+                return Err("you can only delete your own published comment".to_string());
+            }
+            let Some(endpoint) = self.published_endpoint(&thread_id, &comment_id) else {
+                return Err(
+                    "this comment hasn't synced an id yet — refresh the PR (Ctrl-R)".to_string(),
+                );
+            };
+            // A submitted review's summary has no GitHub delete.
             if !endpoint.is_deletable() {
-                return None;
+                return Err("review summaries can't be deleted on GitHub".to_string());
             }
-            // A published delete removes just that one comment.
-            Some(DeleteTarget {
+            Ok(DeleteTarget {
                 thread_id,
                 comment_id: Some(comment_id),
                 published: Some(endpoint),
             })
         } else {
-            Some(DeleteTarget {
+            Ok(DeleteTarget {
                 // A draft root takes its whole thread; a reply removes itself.
                 comment_id: (ci != 0).then_some(comment_id),
                 thread_id,
@@ -3609,18 +3639,20 @@ impl App {
     }
 
     /// If `(thread_id, comment_id)` names a published comment with a numeric
-    /// remote id, the GitHub endpoint to edit/delete it through. The three routes
-    /// are told apart by the pulled thread id: `review:` is a submitted review's
-    /// summary, `issuecomment:` a PR conversation comment, and anything else an
-    /// inline review comment (line- or file-anchored). Routing a review summary
-    /// through the issue-comment endpoint is a 404.
+    /// remote id, the GitHub endpoint to edit/delete it through. A pulled thread
+    /// id carries its kind as a prefix: `review:` is a submitted review's summary,
+    /// `issuecomment:` a PR conversation comment. A **locally-created**
+    /// conversation comment (from `c`) has a plain generated id but a
+    /// [`Anchor::Review`] anchor, so it too routes to the issue-comment endpoint
+    /// once published — without this it would wrongly hit `/pulls/comments` and
+    /// 404. Everything else is an inline review comment (`/pulls/comments`).
     fn published_endpoint(&self, thread_id: &str, comment_id: &str) -> Option<CommentEndpoint> {
         let thread = self.review.thread(thread_id)?;
         let comment = thread.comments.iter().find(|c| c.id == comment_id)?;
         let remote_id = comment.remote_id.as_deref()?.parse::<u64>().ok()?;
         Some(if thread_id.starts_with("review:") {
             CommentEndpoint::ReviewSummary(remote_id)
-        } else if thread_id.starts_with("issuecomment:") {
+        } else if thread_id.starts_with("issuecomment:") || thread.anchor == Anchor::Review {
             CommentEndpoint::IssueComment(remote_id)
         } else {
             CommentEndpoint::ReviewComment(remote_id)
@@ -5296,6 +5328,21 @@ impl App {
         let title = match &compose.kind {
             ComposeKind::Edit { .. } => " Edit comment ".to_string(),
             ComposeKind::New(Anchor::Review) => " Comment — conversation ".to_string(),
+            ComposeKind::Reply(thread_id) => {
+                let thread = self.review.thread(thread_id);
+                let who = thread
+                    .and_then(|t| t.root())
+                    .map(|c| c.author.as_str())
+                    .unwrap_or("thread");
+                // A conversation reply is structurally local — say so in the
+                // title, matching the footer's `r local reply`, so the reader
+                // knows it will not reach GitHub before typing.
+                if thread.is_some_and(|t| t.anchor == Anchor::Review) {
+                    format!(" Local reply to @{who} ")
+                } else {
+                    format!(" Reply to @{who} ")
+                }
+            }
             _ if compose.suggestion => format!(" Suggest change — {} ", compose.target),
             _ => format!(" Comment on {} ", compose.target),
         };
@@ -9526,6 +9573,150 @@ mod tests {
         assert!(
             f.contains("reply") && !f.contains("local reply"),
             "an inline reply is plain: {f}"
+        );
+    }
+
+    #[test]
+    fn reply_composer_title_marks_a_conversation_reply_local() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // A conversation reply is titled "Local reply to @<user>".
+        let mut app = pr_app();
+        app.add_thread(Anchor::Review, "alice", "root", CommentKind::Draft);
+        app.relayout();
+        app.view = View::Conversation;
+        app.open_reply(0);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(
+            screen.contains("Local reply to @alice"),
+            "conversation reply title says local:\n{screen}"
+        );
+
+        // An inline reply is the plain "Reply to @<user>".
+        let mut inline = pr_app();
+        inline.add_thread(
+            Anchor::line("a.rs", Side::New, 2),
+            "bob",
+            "root",
+            CommentKind::Draft,
+        );
+        inline.relayout();
+        inline.open_reply(0);
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| inline.draw(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(
+            screen.contains("Reply to @bob") && !screen.contains("Local reply"),
+            "an inline reply title is plain:\n{screen}"
+        );
+    }
+
+    /// A conversation thread with a published root — `id` sets whether it looks
+    /// pulled (an `issuecomment:`/`review:` prefix) or locally created.
+    fn published_review_thread(id: &str, author: &str, remote: Option<&str>) -> Thread {
+        Thread {
+            id: id.into(),
+            anchor: Anchor::Review,
+            state: ThreadState::Open,
+            comments: vec![Comment {
+                id: "c".into(),
+                author: author.into(),
+                body: "x".into(),
+                created_at: 0,
+                remote_id: remote.map(Into::into),
+                kind: CommentKind::Draft,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_local_conversation_comment_routes_to_the_issue_endpoint() {
+        // A conversation comment created locally with `c` keeps a plain generated
+        // thread id (no `issuecomment:` prefix) but an Anchor::Review anchor. Once
+        // published it must edit/delete via /issues/comments, not /pulls/comments.
+        let mut app = pr_app();
+        app.review
+            .threads
+            .push(published_review_thread("local-xyz", "tester", Some("777")));
+        let endpoint = app
+            .published_endpoint("local-xyz", "c")
+            .expect("an endpoint");
+        assert!(
+            matches!(endpoint, CommentEndpoint::IssueComment(777)),
+            "a local conversation comment routes to the issue endpoint: {endpoint:?}"
+        );
+    }
+
+    #[test]
+    fn delete_refusals_name_their_reason() {
+        // Your own published review summary — GitHub has no delete for it.
+        let mut app = pr_app(); // viewer "tester"
+        app.review
+            .threads
+            .push(published_review_thread("review:42", "tester", Some("42")));
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        assert!(
+            app.delete_target()
+                .unwrap_err()
+                .contains("review summaries can't be deleted"),
+            "reason: {:?}",
+            app.delete_target()
+        );
+
+        // Your own published comment whose real id has not synced (a sentinel id
+        // from a just-submitted comment) — recoverable by a refresh.
+        let mut app = pr_app();
+        app.review.threads.push(published_review_thread(
+            "issuecomment:x",
+            "tester",
+            Some(crate::prsync::PENDING_REMOTE_ID),
+        ));
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        assert!(
+            app.delete_target()
+                .unwrap_err()
+                .contains("hasn't synced an id yet"),
+            "reason: {:?}",
+            app.delete_target()
+        );
+
+        // Someone else's published comment.
+        let mut app = pr_app();
+        app.review.threads.push(published_review_thread(
+            "issuecomment:9",
+            "someone-else",
+            Some("9"),
+        ));
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        assert!(
+            app.delete_target()
+                .unwrap_err()
+                .contains("your own published comment"),
+            "reason: {:?}",
+            app.delete_target()
+        );
+
+        // Your own published conversation comment with a real id — deletable.
+        let mut app = pr_app();
+        app.review.threads.push(published_review_thread(
+            "issuecomment:5",
+            "tester",
+            Some("5"),
+        ));
+        app.relayout();
+        app.view = View::Conversation;
+        app.conv_cursor = 0;
+        assert!(
+            app.delete_target().is_ok(),
+            "a real published id is deletable"
         );
     }
 
