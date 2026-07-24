@@ -19,7 +19,9 @@ It ships as a single static binary (`loopreview`, with the short alias `lr`) for
 macOS, Linux, and Windows. Reading diffs needs only `git`; the pull-request
 features use the `gh` CLI.
 
-<!-- TODO: screenshot — unified review with an inline comment thread -->
+<p align="center">
+  <img width="680" alt="loopreview" src="https://github.com/user-attachments/assets/8efa8c6e-accb-41ba-a47d-20d8dc4dbc0a" />
+</p>
 
 ## Features
 
