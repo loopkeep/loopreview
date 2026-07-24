@@ -41,13 +41,25 @@ test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"   # local == origi
 
 ## 1. Decide the version
 
-- If the invocation carried one (`/release 0.1.1`), use it.
-- Otherwise propose `X.Y.Z` from the `[Unreleased]` groups and **confirm with the
-  human before proceeding**:
-  - a **Breaking** entry → minor (pre-1.0, a breaking change is a minor bump —
-    but ask first, it may warrant more);
-  - any **Added** → minor;
-  - only **Fixed** / **Performance** → patch.
+An explicit argument wins: `/release 0.2.0` uses `0.2.0`. Otherwise derive it
+from the `[Unreleased]` groups by this deterministic rule — no prompt here (the
+one confirmation is step 5, before the tag). The project is pre-1.0, so use the
+left column; the ≥1.0 column is written down so reaching it needs no new ruling.
+
+| `[Unreleased]` contains | pre-1.0 (`0.y.z`) | ≥1.0 |
+| --- | --- | --- |
+| a **Breaking** entry (`!`) | minor (`0.1→0.2`) | major |
+| any **Added** (`feat`) | minor | minor |
+| only **Fixed** / **Performance** (and/or docs) | patch | patch |
+| **docs** only | patch — and warn "docs-only release — proceed?" | patch (warn) |
+
+Why: under Cargo/semver's `0.y.z` convention the `y` is the compatibility
+boundary, so a pre-1.0 breaking change is a minor bump. `feat` → minor (not
+patch) deliberately, to signal the size of the change — loopreview is an
+application, and a new capability is worth a minor.
+
+Steps 2–4 are local and reversible, so run them without stopping; the single
+human checkpoint is step 5.
 
 ## 2. Bump the version
 
@@ -79,9 +91,18 @@ Only the bump and the changelog — never fold other changes into it:
 git commit -am "chore(release): vX.Y.Z"
 ```
 
-## 5. Tag and push — the irreversible step
+## 5. Tag and push — the one human checkpoint
 
-**Get the human's explicit go-ahead before pushing the tag.** Then:
+Everything so far is local. Pushing the tag is irreversible (it publishes a
+Release and mirrors the skill), so stop here and get the human's explicit
+go-ahead with a one-line summary of what will ship — the version, the breakdown
+that chose it, and that the local work is done. For example:
+
+> `v0.2.0` (3 fix, 2 feat → minor) — bump, CHANGELOG, and `chore(release)`
+> commit are done locally. Push the tag?
+
+Add the "docs-only release — proceed?" note here if the version came from a
+docs-only `[Unreleased]`. On a yes:
 
 ```sh
 git tag -a vX.Y.Z -m "vX.Y.Z"     # annotated

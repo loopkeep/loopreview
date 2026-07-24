@@ -29,13 +29,18 @@ range — that boundary keeps the hand-written entry safe. Between releases,
 
 ## By hand (without the skill)
 
+Choose `X.Y.Z` from the `[Unreleased]` groups: pre-1.0, a **Breaking** entry or a
+`feat` is a **minor** bump (`0.1→0.2`), and `fix` / `perf` / docs only is a
+**patch** (the skill has the full table). Then:
+
 1. Clean tree on an up-to-date `main`, with green CI and green gates
    (`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`).
 2. Bump `version` under `[workspace.package]` in `Cargo.toml`; `cargo check` to
    update the lockfile.
 3. `git cliff v0.1.0..HEAD --tag vX.Y.Z -o CHANGELOG.md`, then skim it.
 4. `git commit -am "chore(release): vX.Y.Z"` — the bump and changelog only.
-5. `git tag -a vX.Y.Z -m vX.Y.Z && git push origin main vX.Y.Z`.
+5. Review what will ship, then the irreversible step:
+   `git tag -a vX.Y.Z -m vX.Y.Z && git push origin main vX.Y.Z`.
 
 Never force-push and never move a tag; a failed release goes forward as a new
 version, not a retag.
