@@ -477,6 +477,12 @@ cargo fmt --check
 cargo build --release          # optimized binaries in target/release/
 ```
 
+Commits follow [Conventional Commits](https://www.conventionalcommits.org)
+(`type(scope): subject`, imperative and lowercase). The subject is user-facing:
+git-cliff turns each `feat` / `fix` / `perf` / `docs` subject into a
+`CHANGELOG.md` and GitHub Release line, so write it as a sentence a user will
+read. [CLAUDE.md](CLAUDE.md) documents the full working conventions.
+
 Releases are cut from a version tag and the changelog is kept from the commit
 history with [git-cliff](https://git-cliff.org) — see [RELEASING.md](RELEASING.md)
 and [CHANGELOG.md](CHANGELOG.md).
