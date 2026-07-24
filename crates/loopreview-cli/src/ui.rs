@@ -735,7 +735,21 @@ struct App {
     cursor: usize,
     scroll: usize,
     body_height: Cell<usize>,
+    /// The content pane's width — the diff/conversation area, i.e. the body *after*
+    /// the sidebar (when shown) is split off. For content layout (wrapping, the
+    /// diff viewport); never for the sidebar-visibility decision, which reads the
+    /// recorded [`Self::sidebar_drawn`] instead.
     body_width: Cell<usize>,
+    /// The full body width the last layout measured, *before* splitting off the
+    /// sidebar. The input to [`Self::sidebar_width`] for predicting whether the
+    /// sidebar fits (toggle, resize) — using the post-split [`Self::body_width`]
+    /// here is the double-count bug that hid the sidebar from `h`.
+    body_full_width: Cell<usize>,
+    /// Whether the last draw (or resize) actually rendered the sidebar. The single
+    /// source of truth for "is the sidebar on screen" — focus gates read this
+    /// rather than re-deriving it from a width, so a shown sidebar can never be
+    /// judged hidden.
+    sidebar_drawn: Cell<bool>,
     /// True while a watcher is active (shown as a header indicator).
     watching: bool,
     /// A watch-setup error to surface, when auto-refresh could not start.
@@ -974,6 +988,8 @@ impl App {
             scroll: 0,
             body_height: Cell::new(20),
             body_width: Cell::new(80),
+            body_full_width: Cell::new(80),
+            sidebar_drawn: Cell::new(false),
             watching: false,
             watch_error: None,
             review,
@@ -2022,8 +2038,7 @@ impl App {
             }
             return;
         }
-        let in_sidebar =
-            self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some();
+        let in_sidebar = self.focus == Focus::Sidebar && self.sidebar_visible();
         // Esc cancels a selection, or leaves the sidebar, before it can quit.
         if code == KeyCode::Esc {
             if self.selection.is_some() {
@@ -2098,8 +2113,7 @@ impl App {
             Action::OpenGithub => return self.open_github(),
             _ => {}
         }
-        let in_sidebar =
-            self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some();
+        let in_sidebar = self.focus == Focus::Sidebar && self.sidebar_visible();
         if in_sidebar {
             self.sidebar_action(action);
         } else {
@@ -2160,8 +2174,7 @@ impl App {
             Submit => return self.has_subject(),
             _ => {}
         }
-        let in_sidebar =
-            self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some();
+        let in_sidebar = self.focus == Focus::Sidebar && self.sidebar_visible();
         if in_sidebar {
             // The Conversation index also offers `d` — delete the selected thread
             // via its root — when that root is actually removable (yours to delete,
@@ -3254,7 +3267,7 @@ impl App {
             }
             return;
         }
-        if self.sidebar_width(self.body_width.get()).is_some() {
+        if self.sidebar_visible() {
             self.focus_sidebar();
         }
     }
@@ -3374,15 +3387,20 @@ impl App {
     /// `b`: hidden → show and focus; visible & body-focused → focus it; visible &
     /// focused → hide. The override is temporary — a resize re-evaluates the mode.
     fn toggle_sidebar(&mut self) {
-        let visible = self.sidebar_width(self.body_width.get()).is_some();
+        let visible = self.sidebar_visible();
         if visible && self.focus == Focus::Sidebar {
             self.sidebar_override = Some(false);
+            self.sidebar_drawn.set(false);
             self.focus = Focus::Body;
         } else if visible {
             self.focus_sidebar();
         } else {
             self.sidebar_override = Some(true);
-            if self.sidebar_width(self.body_width.get()).is_some() {
+            // Now wanted — show and focus it if it fits at the full body width (the
+            // next draw records the same outcome; set it here so focus is coherent
+            // before then).
+            if self.sidebar_fits() {
+                self.sidebar_drawn.set(true);
                 self.focus_sidebar();
             }
         }
@@ -3794,7 +3812,7 @@ impl App {
             // h: step straight out to the thread index — pure movement, no
             // folding (Enter and `o` fold now), mirroring the Files view's
             // line/header → sidebar cascade.
-            Action::NavOut if self.sidebar_width(self.body_width.get()).is_some() => {
+            Action::NavOut if self.sidebar_visible() => {
                 self.focus_sidebar();
             }
             _ => {}
@@ -5051,11 +5069,19 @@ impl App {
     /// left unclamped, the side-by-side renderer would try to allocate a row for
     /// every position from a stale scroll to the end and panic.
     fn on_resize(&mut self, cols: u16) {
+        // `cols` is the full body width; body_width is refined to the post-split
+        // content width by the next draw, but is approximated here so the clamps
+        // below have a current size to work from.
+        self.body_full_width.set(cols as usize);
         self.body_width.set(cols as usize);
-        // A resize re-evaluates the sidebar mode (drops any `b` override); if the
-        // sidebar auto-hides, focus falls back to the body.
+        // A resize re-evaluates the sidebar mode (drops any `b` override); record
+        // whether the sidebar will still fit, and if it auto-hides, focus falls
+        // back to the body. Recording it now keeps `sidebar_visible` correct for
+        // any event that arrives before the next draw.
         self.sidebar_override = None;
-        if self.focus == Focus::Sidebar && self.sidebar_width(cols as usize).is_none() {
+        let fits = self.sidebar_fits();
+        self.sidebar_drawn.set(fits);
+        if self.focus == Focus::Sidebar && !fits {
             self.focus = Focus::Body;
         }
         if !self.clines.is_empty() {
@@ -5573,10 +5599,16 @@ impl App {
         let mut content = body;
         let mut sidebar_x0 = 0u16;
         let mut sidebar_cols = 0u16;
+        // Record the full body width and whether the sidebar is actually drawn, so
+        // the focus gates read this decision instead of re-deriving it from the
+        // (post-split) content width.
+        self.body_full_width.set(body.width as usize);
+        let mut sidebar_drawn = false;
         // The Overview tab is a single full-width pane — no file/thread sidebar.
         if self.view != View::Overview
             && let Some(sidebar_w) = self.sidebar_width(body.width as usize)
         {
+            sidebar_drawn = true;
             let sidebar_focused = self.focus == Focus::Sidebar;
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
@@ -5605,6 +5637,7 @@ impl App {
             sidebar_x0 = sb_inner.x;
             sidebar_cols = sb_inner.width;
         }
+        self.sidebar_drawn.set(sidebar_drawn);
         self.body_width.set(content.width as usize);
         self.body_height.set(content.height as usize);
 
@@ -6563,8 +6596,7 @@ impl App {
                 key(OpenGithub),
             );
         }
-        let in_sidebar =
-            self.focus == Focus::Sidebar && self.sidebar_width(self.body_width.get()).is_some();
+        let in_sidebar = self.focus == Focus::Sidebar && self.sidebar_visible();
         // A visual line selection has its own sub-mode: extend the range (a
         // context-specific move worth naming), comment or suggest over it, cancel.
         if !in_sidebar && self.view == View::Files && self.selection.is_some() {
@@ -6976,6 +7008,32 @@ impl App {
         // Framing overhead beside the diff: the sidebar's two borders, a 1-col
         // gap, and the diff pane's two borders — five columns before content.
         (total >= desired + 5 + self.sidebar_min_content).then_some(desired)
+    }
+
+    /// Whether the sidebar is currently on screen — the single source of truth,
+    /// recorded by the last draw/resize. Focus gates read this instead of
+    /// re-deriving visibility from a width (re-deriving from the post-split
+    /// [`Self::body_width`] is what once judged a shown sidebar hidden).
+    fn sidebar_visible(&self) -> bool {
+        self.sidebar_drawn.get()
+    }
+
+    /// Whether the sidebar *would* fit at the last measured full body width, given
+    /// the current mode/override — the predictive check for a toggle or a resize,
+    /// before the next draw records the outcome. Uses [`Self::body_full_width`]
+    /// (pre-split), never the shrunk content width.
+    fn sidebar_fits(&self) -> bool {
+        self.sidebar_width(self.body_full_width.get()).is_some()
+    }
+
+    /// Test seam: record the sidebar-shown state a draw at the current width would
+    /// produce, so focus gates (which read the recorded state) behave as on screen
+    /// without rendering a frame. `full_width` is the pre-split body width.
+    #[cfg(test)]
+    fn record_layout(&self, full_width: usize) {
+        self.body_full_width.set(full_width);
+        self.sidebar_drawn
+            .set(self.sidebar_width(full_width).is_some());
     }
 
     /// Whether the sidebar should be shown before the width check: a `b` override
@@ -11624,6 +11682,7 @@ mod tests {
             comments: vec![comment_of("root", "tester", None, CommentKind::Local)],
         });
         app.relayout();
+        app.record_layout(120); // stand in for a draw: the thread index is shown
         app.set_view(View::Conversation);
         app.focus = Focus::Sidebar;
         app.conv_cursor = 0;
@@ -12333,11 +12392,102 @@ mod tests {
         let mut app = multi_file_app(&["a.rs", "b.rs"]);
         app.sidebar_override = Some(true);
         app.body_width.set(120);
+        app.record_layout(120); // stand in for a draw: the sidebar is shown
         app.collapsed_files.insert("a.rs".to_string());
         app.relayout();
         app.cursor = 0; // a's collapsed header
         app.nav_out();
         assert_eq!(app.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn h_reaches_a_drawn_sidebar_even_at_a_narrow_width() {
+        // The bug: a draw stored the *post-split* diff-pane width in body_width, and
+        // the `h` gate re-derived sidebar visibility from it — at a narrow terminal
+        // the sidebar is drawn, but that reduced width fails the fit check, so `h`
+        // did nothing. The gate now reads the recorded draw-state instead.
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        app.sidebar_width_cfg = Some(SIDEBAR_MAX); // a wide (44-col) sidebar
+        app.collapsed_files.insert("a.rs".to_string());
+        app.relayout();
+
+        // A draw at the full width 120 renders the sidebar (120 ≥ 44 + 5 + 44).
+        app.record_layout(120);
+        assert!(
+            app.sidebar_visible(),
+            "the sidebar is on screen at full width 120"
+        );
+
+        // Draw then leaves the diff pane the post-split width — narrow enough that
+        // re-deriving visibility from it alone (the old bug) reports hidden.
+        app.body_width.set(120 - SIDEBAR_MAX - 5);
+        assert!(
+            app.sidebar_width(app.body_width.get()).is_none(),
+            "re-deriving from the post-split content width would judge it hidden"
+        );
+
+        // `h` from the collapsed header still reaches the sidebar.
+        app.cursor = 0; // a's collapsed header
+        app.nav_out();
+        assert_eq!(
+            app.focus,
+            Focus::Sidebar,
+            "h reaches the drawn sidebar despite the narrow content width"
+        );
+    }
+
+    #[test]
+    fn h_is_a_no_op_when_the_sidebar_is_hidden() {
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        app.collapsed_files.insert("a.rs".to_string());
+        app.relayout();
+        app.cursor = 0; // a's collapsed header
+        app.focus = Focus::Body;
+
+        // Closed by `b`: the sidebar is not drawn, so h stays put.
+        app.sidebar_override = Some(false);
+        app.record_layout(120);
+        assert!(!app.sidebar_visible(), "b closed the sidebar");
+        app.nav_out();
+        assert_eq!(app.focus, Focus::Body, "h does not focus a closed sidebar");
+
+        // Too narrow to fit: also not drawn, also a no-op.
+        app.sidebar_override = None;
+        app.record_layout(50);
+        assert!(
+            !app.sidebar_visible(),
+            "the sidebar does not fit at width 50"
+        );
+        app.nav_out();
+        assert_eq!(
+            app.focus,
+            Focus::Body,
+            "h does not focus a too-narrow sidebar"
+        );
+    }
+
+    #[test]
+    fn a_resize_that_hides_the_sidebar_drops_focus_to_the_body() {
+        let mut app = multi_file_app(&["a.rs", "b.rs"]);
+        app.record_layout(120);
+        app.focus = Focus::Sidebar;
+        assert!(app.sidebar_visible(), "the sidebar is shown at width 120");
+
+        // Shrinking past the fit threshold auto-hides it and drops focus to the body.
+        app.on_resize(50);
+        assert!(
+            !app.sidebar_visible(),
+            "the sidebar no longer fits at width 50"
+        );
+        assert_eq!(app.focus, Focus::Body, "focus fell back to the body");
+
+        // Growing back re-admits the sidebar (focus stays where it landed).
+        app.on_resize(120);
+        assert!(
+            app.sidebar_visible(),
+            "the sidebar fits again after growing back"
+        );
+        assert_eq!(app.focus, Focus::Body);
     }
 
     #[test]
@@ -12693,6 +12843,7 @@ mod tests {
         let mut app = multi_file_app(&["a.rs"]);
         app.sidebar_override = Some(true);
         app.body_width.set(120);
+        app.record_layout(120); // stand in for a draw: the thread index is shown
         app.review
             .threads
             .push(thread_state("t", Anchor::Review, ThreadState::Open));
@@ -13196,6 +13347,7 @@ mod tests {
 
         // h steps straight out to the thread index — pure movement, no fold.
         app.body_width.set(120);
+        app.record_layout(120); // stand in for a draw: the thread index is shown
         app.conversation_action(Action::NavOut);
         assert_eq!(app.focus, Focus::Sidebar, "h goes to the thread index");
         assert!(!app.selected_collapsed(), "h did not fold on the way out");
