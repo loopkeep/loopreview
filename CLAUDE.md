@@ -65,11 +65,18 @@ number (`#N`), a README / SKILL / CHANGELOG section, or a past commit hash.
 
 Before writing one, all five must hold; if any is "no", don't write it:
 
-1. Can you name the specific change this comment forbids?
-2. Is the fact absent from the code itself (not restating what the line does)?
-3. Is it one of the five kinds above?
-4. Would a capable colleague get it wrong without the comment?
-5. Is this the only place the fact is stated?
+1. Can you name one specific change this comment forbids? If the types, a test,
+   or clippy would already stop that change, don't write it.
+2. Is the fact unexpressed in the code? Anything readable from the definitions,
+   naming, or structure — don't write it, even to add the "why". When in doubt,
+   lean to "readable".
+3. Is it a constraint on this file's code? Don't explain another layer's behavior
+   or a particular use case here — though a contract every caller must keep may
+   live on the definition side.
+4. Is it a constraint in effect on the code as it is now? Don't write for a
+   future that hasn't arrived or a feature not yet built (YAGNI).
+5. Will it stay true as long as this code doesn't change? Don't write what goes
+   stale on its own — in-progress work, planned changes, a provisional situation.
 
 Write it as the sentence you'd say to the colleague beside you — one or two
 sentences, no preamble.
