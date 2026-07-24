@@ -20,7 +20,7 @@ macOS, Linux, and Windows. Reading diffs needs only `git`; the pull-request
 features use the `gh` CLI.
 
 <p align="center">
-  <img width="680" alt="loopreview" src="https://github.com/user-attachments/assets/8efa8c6e-accb-41ba-a47d-20d8dc4dbc0a" />
+  <img width="680" alt="loopreview" src="https://github.com/user-attachments/assets/9edc69b9-eb5b-4bdb-b3b4-26369a3da2b7" />
 </p>
 
 ## Features
