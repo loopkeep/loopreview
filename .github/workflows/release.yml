@@ -119,6 +119,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Full history + tags so git-cliff can scope the changelog to this release.
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -129,18 +134,31 @@ jobs:
         run: |
           sha256sum loopreview-*.tar.gz loopreview-*.zip | sort -k2 > checksums.txt
           cat checksums.txt
+      # The release body is this version's CHANGELOG section, extracted from the
+      # Conventional Commit history — the same content committed to CHANGELOG.md.
+      # `--latest` scopes to the tag just pushed (the commits since the previous
+      # tag); `--strip all` drops the file header/footer, leaving the section.
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip all
+        env:
+          OUTPUT: RELEASE_NOTES.md
       - name: Publish release with gh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version="${{ needs.verify.outputs.version }}"
-          # Idempotent: create the release, or upload/clobber onto an existing
-          # one if this tag is re-run.
+          # Idempotent: create the release with the generated notes, or update the
+          # notes and re-upload assets if this tag is re-run.
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "v${version}" --notes-file RELEASE_NOTES.md
             gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber \
               dist/loopreview-*.tar.gz dist/loopreview-*.zip dist/checksums.txt
           else
             gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
-              --title "v${version}" --generate-notes \
+              --title "v${version}" --notes-file RELEASE_NOTES.md \
               dist/loopreview-*.tar.gz dist/loopreview-*.zip dist/checksums.txt
           fi

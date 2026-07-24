@@ -477,6 +477,10 @@ cargo fmt --check
 cargo build --release          # optimized binaries in target/release/
 ```
 
+Releases are cut from a version tag and the changelog is kept from the commit
+history with [git-cliff](https://git-cliff.org) — see [RELEASING.md](RELEASING.md)
+and [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

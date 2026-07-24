@@ -1,0 +1,93 @@
+# git-cliff ~ configuration
+# https://git-cliff.org/docs/configuration
+#
+# loopreview keeps a Keep a Changelog–style CHANGELOG.md from its Conventional
+# Commit history. Grouping: feat → Added, fix → Fixed, perf → Performance,
+# docs → Documentation; refactor/test/chore/ci/build/style are hidden. Only the
+# commit summary is used, so trailers (e.g. `Claude-Session:`) never leak in.
+#
+# The first release (0.1.0) is a hand-written backfill kept in `footer` below, so
+# regenerating the file never clobbers it — see RELEASING.md. Generate over the
+# range *after* 0.1.0 (`git cliff v0.1.0..HEAD ...`) so 0.1.0 is only ever the
+# footer, never auto-derived from commits.
+
+[changelog]
+header = """
+# Changelog\n
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n
+"""
+body = """
+{% if version -%}
+    ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+    ## [Unreleased]
+{% endif -%}
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | split(pat="-->") | last | upper_first }}
+    {% for commit in commits %}
+        - {% if commit.breaking %}**Breaking:** {% endif %}\
+            {{ commit.message | split(pat="\n") | first | upper_first | trim }}\
+    {% endfor %}
+{% endfor %}\n
+"""
+# The footer is the constant tail: the hand-written 0.1.0 backfill (oldest release,
+# so the bottom is where it belongs), then the Keep a Changelog link references.
+footer = """
+## [0.1.0] - 2026-07-24
+
+Initial release — a review-first diff TUI.
+
+- Review any diff in an interactive terminal UI: unified or side-by-side layout (auto by width), syntax highlighting, a file sidebar, and a finder.
+- Sources: the working tree, staged changes, a `git diff <target>` range, one commit's own changes (`lr show`), or a unified-diff patch from a file or stdin.
+- Local review that persists across sessions: line, range, and file comments, plus suggestions — kept in a per-repository store.
+- GitHub pull requests, reviewed without a checkout, with two-way sync: pull the diff and every comment thread; push drafts, replies, resolutions, and reviews.
+- A bare `lr <ref>` (a number, `#N`, `owner/repo#N`, or a URL) opens a pull request or an issue — the type is resolved from the API, not the reference.
+- An Overview tab with the subject's title, facts, and rendered description; markdown renders faithfully with clickable links, images, and `#N` references.
+- An agent control plane (`lr session …`) to inspect and steer a live review.
+- Built-in self-update (`lr update`) from GitHub releases.
+
+{% for release in releases -%}
+    {% if release.version -%}
+        {% if release.previous.version -%}
+            [{{ release.version | trim_start_matches(pat="v") }}]: https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/compare/{{ release.previous.version }}..{{ release.version }}
+        {% endif -%}
+    {% else -%}
+        [unreleased]: https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/compare/{{ release.previous.version }}..HEAD
+    {% endif -%}
+{% endfor -%}
+[0.1.0]: https://github.com/loopkeep/loopreview/releases/tag/v0.1.0
+"""
+trim = true
+
+# Pin the remote so link references are deterministic (not dependent on how the
+# origin URL is spelled in CI vs locally).
+[remote.github]
+owner = "loopkeep"
+repo = "loopreview"
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+# The `<!-- N -->` prefixes force the group order (the body template strips them);
+# without them git-cliff would sort the headings alphabetically.
+commit_parsers = [
+    { message = "^feat", group = "<!-- 0 -->Added" },
+    { message = "^fix", group = "<!-- 1 -->Fixed" },
+    { message = "^perf", group = "<!-- 2 -->Performance" },
+    { message = "^docs", group = "<!-- 3 -->Documentation" },
+    { message = "^refactor", skip = true },
+    { message = "^test", skip = true },
+    { message = "^chore", skip = true },
+    { message = "^ci", skip = true },
+    { message = "^build", skip = true },
+    { message = "^style", skip = true },
+    # Anything else conventional (e.g. revert) stays visible rather than silently
+    # dropped, so the maintainer notices and can classify it.
+    { message = ".*", group = "<!-- 4 -->Changed" },
+]
+filter_commits = false
+topo_order = false
+sort_commits = "oldest"
