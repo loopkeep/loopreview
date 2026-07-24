@@ -64,8 +64,10 @@ human checkpoint is step 5.
 ## 2. Bump the version
 
 Set `version` under `[workspace.package]` in the top-level `Cargo.toml` to
-`X.Y.Z` (the only literal version; the crates use `version.workspace = true`).
-The release workflow refuses a tag that disagrees with it. Then update the lock:
+`X.Y.Z` — the workspace's single source of version. The crates inherit it with
+`version.workspace = true`, and internal dependencies are declared path-only
+(`{ path = "..." }`, no `version`), so there is nothing else to bump. The release
+workflow refuses a tag that disagrees with it. Then update the lockfile:
 
 ```sh
 cargo check

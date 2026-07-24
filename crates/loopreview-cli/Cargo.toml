@@ -23,9 +23,9 @@ clap = { version = "4.6.4", features = ["derive"] }
 crossterm = "0.29.0"
 fd-lock = "4.0.4"
 flate2 = "1.1.9"
-loopreview-control = { version = "0.2.0", path = "../loopreview-control" }
+loopreview-control = { path = "../loopreview-control" }
 loopreview-core = { path = "../loopreview-core" }
-loopreview-github = { version = "0.2.0", path = "../loopreview-github" }
+loopreview-github = { path = "../loopreview-github" }
 notify = "8.2.0"
 nucleo-matcher = "0.3.1"
 pulldown-cmark = { version = "0.13.4", default-features = false }
