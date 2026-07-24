@@ -8,8 +8,11 @@ features.
 ## Language
 
 Everything committed here is in English: commit messages, code comments, docs,
-issue and PR text, release notes, and UI strings. This is a public repository —
-do not add Japanese (or any other language) to anything that lands in the repo.
+issue and PR text, release notes, and UI strings. Do not add content in another
+language — user-facing strings especially, since the English strings are the
+extraction source if localization ever lands. Deliberate localization work (an
+i18n catalog, translated docs) is the one exception, and is decided before it
+starts.
 
 ## Commits
 
